@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "organograph"
+version = "0.1.0"
+description = "Organoid mesh-to-graph preprocessing and analysis tools"
+readme = "README.md"
+requires-python = ">=3.10"
+# No dependencies for now:
+dependencies = []
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

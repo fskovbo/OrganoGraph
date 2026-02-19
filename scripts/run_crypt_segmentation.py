@@ -66,14 +66,11 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Project root = parent of the "scripts" folder
 PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 
-# MESH_DATA_DIR = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "fractal_output")
-# CELLS_CSV = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "cell_features_class.csv") 
-
 # Where the graph preprocessing wrote graphs + per-timepoint index.csv
-GRAPHS_DIR = "../NicoleData/graphs_preprocessed"
+GRAPHS_DIR  = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "graphs_preprocessed")
 
 # Where to write segmentation outputs (.npz)
-SEG_DIR = "../NicoleData/segmentations"
+SEG_DIR  = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "crypt_segmentations")
 
 # Optional: where to write compact per-organoid arrays (.npz). Set to None to disable.
 FEATURES_DIR = None
@@ -86,13 +83,16 @@ BLACKLIST = []
 
 # Required: canonical axis used for circumference curves + rescaling
 # (Fill in with your downstream canonical axis.)
-BIN_CENTERS = None  # e.g. np.linspace(0, 1, 101)
+S = 1.5
+n_bins = 80
+bin_edges   = np.linspace(0.0, S, n_bins + 1)
+BIN_CENTERS = 0.5 * (bin_edges[:-1] + bin_edges[1:])
 
 # Required: indices into node attribute "vocab_encoding" used for crypt seeding
-CRYPT_VOCAB_IDX = None  # e.g. [3, 7, 12]
+CRYPT_VOCAB_IDX = [1, 2, 7]
 
 # Optional: indices used for neck seeding (or None)
-NECK_VOCAB_IDX = None
+NECK_VOCAB_IDX = [0, 3, 4]
 
 # Extra kwargs forwarded to segment_crypts_organoid(...)
 SEGMENT_KWARGS = dict(
@@ -104,7 +104,7 @@ SEGMENT_KWARGS = dict(
 )
 
 # Save compact features alongside segmentations?
-SAVE_FEATURES = True
+SAVE_FEATURES = False
 
 # Include extra debug info inside the segmentation npz? (Can be large.)
 DEBUG = False
@@ -217,12 +217,33 @@ def run_segmentation_dataset():
         gpath = rec["graph_path"]
 
         # 1) load graph
+        # 1) load graph (with fallback if index path is stale)
+        G = None
+
         try:
             G = load_cell_graph(gpath)
         except Exception as e:
             if VERBOSE:
-                print(f"[{tp}] graph load failed: {gpath} ({e})")
-            continue
+                print(f"[{tp}] graph load failed via index: {gpath} ({e})")
+
+            # --- fallback: try to reconstruct path from GRAPHS_DIR ---
+            label_uid = rec.get("label_uid", None)
+            if label_uid is not None:
+                fallback_path = os.path.join(GRAPHS_DIR, tp, f"{label_uid}.gpickle")
+
+                if os.path.exists(fallback_path):
+                    if VERBOSE:
+                        print(f"[{tp}] retrying via fallback path: {fallback_path}")
+                    try:
+                        G = load_cell_graph(fallback_path)
+                        gpath = fallback_path  # update for downstream saving
+                    except Exception as e2:
+                        if VERBOSE:
+                            print(f"[{tp}] fallback load failed: {fallback_path} ({e2})")
+
+            if G is None:
+                continue
+
 
         label_uid = G.graph.get("label_uid", None) or rec.get("label_uid", None)
         if label_uid is None:
@@ -296,9 +317,9 @@ def run_segmentation_dataset():
             continue
 
         if DEBUG:
-            crypts, villi, dnorm_v, L_crypt, Circ, dbg = out
+            crypts, villi, d_norm, L_crypt, Circ, dbg = out
         else:
-            crypts, villi, dnorm_v, L_crypt, Circ = out
+            crypts, villi, d_norm, L_crypt, Circ = out
             dbg = None
 
         # 6) save segmentation
@@ -309,7 +330,7 @@ def run_segmentation_dataset():
             crypts_ll=patches_to_ll(crypts),
             villi_ll=patches_to_ll(villi),
             bin_centers=bin_centers,
-            dnorm_v=dnorm_v,
+            d_norm=d_norm,
             L_crypt=L_crypt,
             Circ=Circ,
             extra={"debug": dbg, "graph_path": gpath, "mesh_path": mesh_path} if dbg is not None else

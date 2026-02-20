@@ -90,7 +90,7 @@ VOCAB_PATH = "./sim/vocab.npz"
 REQUIRED_VOCAB_KEYS = []
 
 # Dev/UX options
-DRY_RUN = True       # If True: do not load meshes, do not write outputs; just print what would happen
+DRY_RUN = False       # If True: do not load meshes, do not write outputs; just print what would happen
 MAX_MESHES = None     # e.g. 10 for quick testing; None means no limit
 
 

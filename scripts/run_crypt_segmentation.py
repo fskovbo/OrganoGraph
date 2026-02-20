@@ -45,7 +45,6 @@ import csv
 import numpy as np
 from tqdm import tqdm
 
-import organograph
 from organograph.mesh.OrganoidMesh import OrganoidMesh
 from organograph.mesh.transform import ensure_mesh_graph_aligned
 from organograph.graph.io import load_cell_graph

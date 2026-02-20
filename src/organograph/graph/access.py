@@ -67,6 +67,60 @@ def graph_get_meta(G, key):
     return G.graph[key]
 
 
+def graph_marker_index(G, marker):
+    """
+    Resolve a marker name to its column index using G.graph["marker_names"].
+
+    Parameters
+    ----------
+    marker : str
+
+    Returns
+    -------
+    int
+    """
+    names = G.graph.get("marker_names", None)
+    if names is None:
+        raise KeyError('Graph has no "marker_names" in G.graph metadata.')
+
+    # Normalize: case-insensitive exact match after stripping
+    target = str(marker).strip().lower()
+    norm = [str(x).strip().lower() for x in list(names)]
+
+    if target not in norm:
+        raise KeyError(
+            f"Marker '{marker}' not found in G.graph['marker_names']. "
+            f"Available: {list(names)}"
+        )
+    return int(norm.index(target))
+
+
+def graph_get_marker_bin(G, marker, nodes=None, dtype=np.int64):
+    """
+    Return the binary marker vector for a marker specified by name or index.
+
+    If marker is str: uses G.graph["marker_names"] to find the index.
+    If marker is int: uses it directly.
+
+    Returns
+    -------
+    (N,) numpy array
+    """
+    # get (N,M) markers_bin
+    markers_bin = graph_get(G, "markers_bin", nodes=nodes, dtype=dtype)
+
+    if isinstance(marker, str):
+        idx = graph_marker_index(G, marker)
+    else:
+        idx = int(marker)
+
+    if markers_bin.ndim != 2:
+        raise ValueError('"markers_bin" should be (N, M).')
+    if idx < 0 or idx >= markers_bin.shape[1]:
+        raise IndexError(f"marker index {idx} out of range (M={markers_bin.shape[1]}).")
+
+    return markers_bin[:, idx]
+
 
 def graph_inspect(G):
     """

@@ -40,6 +40,62 @@ from organograph.mesh.hks import compute_hks
 from organograph.crypts.vocab import compute_vocabulary_encoding
 
 
+# # =============================================================================
+# # DATASET CONFIG
+# # =============================================================================
+
+# # Absolute path to this script file
+# _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# # Project root = parent of the "scripts" folder
+# PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
+
+# MESH_DATA_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "fractal_output")
+# CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "cell_features_class.csv") 
+# OUT_GRAPHS_DIR  = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "graphs_preprocessed")
+
+# timepoints = ["day4p5"]
+# zarr_names = {tp: "251130R0.zarr" for tp in timepoints}
+# rounds     = {tp: "2_zillum_registered" for tp in timepoints}
+# meshes     = {tp: "nnorg_corrected_annotated_by_projection" for tp in timepoints}
+
+# wells = {
+#     "day4p5": ["B02", "B03", "B04", "B05"],
+# }
+
+
+# COORD_COLS = ("0.x_pos_pix", "0.y_pos_pix", "0.z_pos_pix_scaled")
+
+# MARKER_COLS = [
+#     "0.C02.percentile99_class",  # LGR5
+#     "0.C03.percentile99_class",  # chroma
+#     "0.C04.percentile99_class",  # aldoB
+#     "1.C02.percentile99_class",  # Sero
+#     "1.C03.percentile99_class",  # Lyz
+#     "1.C04.percentile99_class",  # Agr2
+#     "2.C04.percentile99_class",  # ki67
+# ]
+
+# LGR5_MARKER = "0.C02.percentile99_class"
+# COEXP_MARKERS = (
+#     "1.C03.percentile99_class",  # Lyz
+#     "1.C04.percentile99_class",  # Agr2
+#     "1.C02.percentile99_class",  # Sero
+#     "0.C03.percentile99_class",  # chroma
+# )
+
+# HKS_TIMES = [1.0, 2.0, 4.0, 8.0, 25.0]
+# VOCAB_PATH = "./sim/vocab.npz"
+# # If you know specific arrays that MUST be present in vocab.npz, list them here.
+# REQUIRED_VOCAB_KEYS = []
+
+# # Dev/UX options
+# DRY_RUN = False       # If True: do not load meshes, do not write outputs; just print what would happen
+# MAX_MESHES = None     # e.g. 10 for quick testing; None means no limit
+
+
+
+
 # =============================================================================
 # DATASET CONFIG
 # =============================================================================
@@ -50,38 +106,46 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # Project root = parent of the "scripts" folder
 PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 
-MESH_DATA_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "fractal_output")
-CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "cell_features_class.csv") 
-OUT_GRAPHS_DIR  = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "graphs_preprocessed")
+MESH_DATA_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20250929", "fractal_output")
+CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20250929", "cell_types_class.csv") 
+OUT_GRAPHS_DIR  = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20250929", "graphs_preprocessed")
 
-timepoints = ["day4p5"]
-zarr_names = {tp: "251130R0.zarr" for tp in timepoints}
-rounds     = {tp: "2_zillum_registered" for tp in timepoints}
-meshes     = {tp: "nnorg_corrected_annotated_by_projection" for tp in timepoints}
+# timepoints = ['day2', 'day2p5', 'day3', 'day3p5', 'day4', 'day4p5', 'day4p5-more']   # extend as needed: ['day3', 'day3p5', ...]
+timepoints = ['day3p5',  'day4p5']   # extend as needed: ['day3', 'day3p5', ...]
+
+zarr_names = {tp: 'r0.zarr' for tp in timepoints}
+rounds     = {tp: '0_fused_zillum_registered' for tp in timepoints}
+meshes     = {tp: 'nnorg_linked_multi_annotated_class' for tp in timepoints}
 
 wells = {
-    "day4p5": ["B02", "B03", "B04", "B05"],
+    'day1p5': ['A01', 'A02', 'A03', 'A04', 'A05', 'A06'],
+    'day2': ['A01', 'A02', 'A03', 'A04', 'A05', 'A06'],
+    'day2p5': ['A01', 'A02', 'A03', 'A04', 'A05', 'A06'],
+    'day3': ['A01', 'A02', 'A03', 'A04', 'A05', 'A06', 'B02', 'B03'],
+    'day3p5': ['A01', 'A02', 'A03', 'A04', 'B03'],
+    'day4': ['A02', 'A03', 'A04', 'A05', 'A06', 'B01', 'B02'],
+    'day4p5': ['A06', 'B06'],
+    'day4p5-more': ['C01', 'C02', 'C03', 'C04', 'C05', 'C06'],
 }
+
+
 
 
 COORD_COLS = ("0.x_pos_pix", "0.y_pos_pix", "0.z_pos_pix_scaled")
 
 MARKER_COLS = [
-    "0.C02.percentile99_class",  # LGR5
-    "0.C03.percentile99_class",  # chroma
-    "0.C04.percentile99_class",  # aldoB
-    "1.C02.percentile99_class",  # Sero
-    "1.C03.percentile99_class",  # Lyz
-    "1.C04.percentile99_class",  # Agr2
-    "2.C04.percentile99_class",  # ki67
+"LGR.bin", "CHROMA.bin", "CYCD.bin", "MUC.bin", "ALDOB.bin",
+    "GLUC.bin", "CYCA.bin", "AGR.bin", "SERO.bin", "LYZ.bin",
 ]
 
-LGR5_MARKER = "0.C02.percentile99_class"
+LGR5_MARKER = "LGR.bin"
 COEXP_MARKERS = (
-    "1.C03.percentile99_class",  # Lyz
-    "1.C04.percentile99_class",  # Agr2
-    "1.C02.percentile99_class",  # Sero
-    "0.C03.percentile99_class",  # chroma
+    "LYZ.bin",     # Lysozyme → Paneth
+    "MUC.bin",     # Mucin 2 → Goblet
+    "AGR.bin",     # Agr2 → Goblet/Paneth
+    "SERO.bin",    # Serotonin → Enterochromaffin
+    "GLUC.bin",    # Glucagon → Enteroendocrine
+    "CHROMA.bin",  # Chromogranin A → Enteroendocrine
 )
 
 HKS_TIMES = [1.0, 2.0, 4.0, 8.0, 25.0]

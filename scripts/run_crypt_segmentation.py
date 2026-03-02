@@ -66,16 +66,16 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 
 # Where the graph preprocessing wrote graphs + per-timepoint index.csv
-GRAPHS_DIR  = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "graphs_preprocessed")
+GRAPHS_DIR  = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20250929", "graphs_preprocessed")
 
 # Where to write segmentation outputs (.npz)
-SEG_DIR  = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "crypt_segmentations")
+SEG_DIR  = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20250929", "crypt_segmentations")
 
 # Optional: where to write compact per-organoid arrays (.npz). Set to None to disable.
 FEATURES_DIR = None
 
 # Which timepoints to process. If None, auto-discover subfolders under GRAPHS_DIR.
-TIMEPOINTS = ["day4p5"]
+TIMEPOINTS = ["day3p5", "day4p5"]
 
 # Skip these label_uids
 BLACKLIST = []
@@ -97,7 +97,7 @@ NECK_VOCAB_IDX = [0, 3, 4]
 SEGMENT_KWARGS = dict(
     # Example knobs (uncomment/tune as needed):
     # crypt_seed_thresh=0.2,
-    # neck_seed_thresh=0.5,
+    # neck_seed_thresh=0.2,
     # min_crypt_seed_size=10,
     # grow_steps=2,
 )
@@ -109,7 +109,7 @@ SAVE_FEATURES = False
 DEBUG = False
 
 # Behavior knobs
-OVERWRITE = False
+OVERWRITE = True
 VERBOSE = True
 DRY_RUN = False
 MAX_GRAPHS = None  # e.g. 10

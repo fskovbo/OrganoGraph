@@ -4,6 +4,7 @@ import networkx as nx
 from organograph.projection.project import project_nuclei_to_mesh
 from organograph.projection.voronoi import voronoi_on_mesh_dijkstra
 from organograph.mesh.transform import transform_is_applied, apply_transform_to_points
+from organograph.graph.access import graph_get
 
 
 def build_organoid_graph(
@@ -157,3 +158,115 @@ def _build_graph_from_voronoi(
                 G.add_edge(u, v)
 
     return G
+
+
+def assign_mesh_patches_to_graph(
+    G,
+    crypt_patches_mesh,
+    *,
+    proj_field: str = "proj_vertex",
+    nodes=None,
+    drop_empty: bool = True,
+    return_node_ids: bool = False,
+):
+    """
+    Assign mesh-vertex crypt patches to a cell graph using each node's projected mesh vertex.
+
+    A graph node belongs to crypt patch k iff its node attribute `proj_field` is contained
+    in the corresponding mesh patch (a set / list / array of mesh vertex indices).
+
+    Parameters
+    ----------
+    G
+        Graph (e.g. networkx.Graph) whose nodes contain an integer node attribute `proj_field`.
+    crypt_patches_mesh
+        Iterable of patches on the mesh. Each patch is an iterable (commonly set[int])
+        of mesh vertex indices.
+    proj_field
+        Name of the node attribute containing the projected mesh vertex index (default: "proj_vertex").
+    nodes
+        Optional iterable of node ids to consider. If None, uses nodes 0..N-1
+        (same convention as graph_get).
+    drop_empty
+        If True, patches that receive no graph nodes are omitted from the returned list.
+        If False, returns an entry for every mesh patch (possibly empty).
+    return_node_ids
+        If False (default), returned patches contain indices 0..(len(nodes)-1) in the
+        order used for assignment.
+        If True, returned patches contain the actual node ids from G.
+
+    Returns
+    -------
+    graph_patches
+        List[set[int]] of graph patches. Each set contains node indices (or node ids if
+        return_node_ids=True).
+    info
+        Dict with debug metadata:
+          - "nodes_used": array of node ids in the order used
+          - "proj_vertex": array of projected mesh vertices for those nodes
+          - "mesh_patch_sizes": list of sizes of input mesh patches
+          - "graph_patch_sizes": list of sizes of output graph patches (after drop_empty policy)
+          - "mesh_to_graph_index": list mapping mesh patch index -> output index (or -1 if dropped)
+    """
+    # get node ids (order) consistent with graph_get convention
+    n_total = G.number_of_nodes()
+    if n_total == 0:
+        raise ValueError("Graph has no nodes")
+
+    if nodes is None:
+        node_ids = np.arange(n_total, dtype=np.int64)
+    else:
+        if isinstance(nodes, (int, np.integer)):
+            node_ids = np.array([int(nodes)], dtype=np.int64)
+        else:
+            node_ids = np.array(list(nodes), dtype=np.int64)
+
+    # fetch projected vertices in the same order
+    proj_v = graph_get(G, proj_field, nodes=node_ids, dtype=np.int64)  # (Nnodes,)
+
+    # build mapping mesh_vertex -> list of positions in node_ids (or node ids)
+    # This makes patch assignment O(sum |patch|) rather than O(#patches * #nodes).
+    vert_to_nodes = {}
+    if return_node_ids:
+        for pos, u in enumerate(node_ids):
+            v = int(proj_v[pos])
+            vert_to_nodes.setdefault(v, []).append(int(u))
+    else:
+        # store indices into node_ids array (0..len(node_ids)-1)
+        for pos in range(node_ids.size):
+            v = int(proj_v[pos])
+            vert_to_nodes.setdefault(v, []).append(int(pos))
+
+    graph_patches = []
+    mesh_to_graph_index = []
+    mesh_patch_sizes = []
+    graph_patch_sizes = []
+
+    for k, patch in enumerate(crypt_patches_mesh):
+        # iterate patch vertices and collect nodes whose proj_vertex hits this patch
+        patch_set = patch if isinstance(patch, set) else set(patch)
+        mesh_patch_sizes.append(len(patch_set))
+
+        nodes_in_patch = set()
+        for v in patch_set:
+            lst = vert_to_nodes.get(int(v))
+            if lst:
+                # add all graph nodes that project to this mesh vertex
+                nodes_in_patch.update(lst)
+
+        if drop_empty and len(nodes_in_patch) == 0:
+            mesh_to_graph_index.append(-1)
+            continue
+
+        mesh_to_graph_index.append(len(graph_patches))
+        graph_patches.append(nodes_in_patch)
+        graph_patch_sizes.append(len(nodes_in_patch))
+
+    info = {
+        "nodes_used": node_ids,
+        "proj_vertex": proj_v,
+        "mesh_patch_sizes": mesh_patch_sizes,
+        "graph_patch_sizes": graph_patch_sizes,
+        "mesh_to_graph_index": mesh_to_graph_index,
+    }
+    return graph_patches, info

@@ -337,8 +337,7 @@ def subdivide_crypts_by_encoding(
     threshold: float = 0.0,            # vertex score threshold used during subdivision
     min_patch_verts: int = 20,         # minimum vertex count for refined patches
     min_patch_area=None,               # optional minimum surface area for refined patches
-    refine_only_if_verts_at_least: int = 0,      # skip refinement if patch smaller than this
-    refine_only_if_area_at_least=None,           # skip refinement if patch area below this
+    refine_only_if_area_at_least=None, # skip refinement if patch area below this
     return_intermediates=False,        # if True return encoding and scores
 ):
     """
@@ -384,7 +383,7 @@ def subdivide_crypts_by_encoding(
     for p in patches:
         if not _keep_patch(
             p,
-            min_verts=int(max(1, refine_only_if_verts_at_least)),
+            min_verts=1,
             vertex_areas=vertex_areas,
             min_area=refine_only_if_area_at_least,
         ):

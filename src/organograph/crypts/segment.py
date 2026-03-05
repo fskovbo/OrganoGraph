@@ -7,15 +7,15 @@ from organograph.crypts.vocab import (
 from organograph.crypts.axis import (
     compute_crypt_axis,
     normalize_crypt_axis_to_neckline,
+    assign_features_by_distance
 )
-from organograph.crypts.features import assign_features_by_distance
 
 
 def apply_filters(patches, *, filters, mesh, seg_vars):
     infos = []
     out = patches
     for f in (filters or []):
-        out, info = f(out, mesh=mesh, seg_vars=seg_vars)
+        out, info = f(out, mesh=mesh, seg_vars=seg_vars, return_info=True)
         infos.append(info)
     return out, infos
 
@@ -33,7 +33,6 @@ def segment_crypts_organoid(
     # Crypt refinement/subdivision variables
     refine_crypts=True,                 # if False, skip refinement and use round-1 patches as final patches
     refine_threshold=0.0,               # threshold used during subdivision step
-    refine_only_if_verts_at_least=0,    # skip refinement if patch has fewer verts
     refine_only_if_area_at_least=5.0,   # skip refinement if patch area smaller than this (None disables)
     # Neck search variables
     geodesic_fn=None,                   # callable to compute distances (e.g. compute_geodesics_dijkstra)
@@ -88,7 +87,6 @@ def segment_crypts_organoid(
             threshold=refine_threshold,
             min_patch_verts=min_patch_verts,     
             min_patch_area=min_patch_area,
-            refine_only_if_verts_at_least=refine_only_if_verts_at_least,
             refine_only_if_area_at_least=refine_only_if_area_at_least,
         )
     else:

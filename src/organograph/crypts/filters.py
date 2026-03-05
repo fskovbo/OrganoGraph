@@ -1,7 +1,9 @@
 import numpy as np 
 from organograph.mesh.hks import compute_hks
 
-def filter_crypt_by_hks_percent(
+
+
+def filter_crypts_by_hks_percent(
     patches,                      # list[set[int]] candidate patches
     *,
     mesh,                         # mesh (used if HKS not provided)
@@ -9,15 +11,21 @@ def filter_crypt_by_hks_percent(
     min_percent_greater: float,   # keep patch if mean(HKS_patch) >= (1 + X%) * mean(HKS_background)
     t_min=None,                   # optional min time (in ts_mesh units); None => no lower bound
     t_max=None,                   # optional max time (in ts_mesh units); None => no upper bound
+    return_info=False,            # if True return (patches, info), otherwise only patches
 ):
     """
     Filter patches using *raw* HKS mean compared to background, restricted to a time range.
 
     Returns
     -------
-    kept_patches : list[set[int]]
-    info : dict with percent_greater, bg_mean, patch_means, time_mask summary, etc.
+    If return_info=False:
+        kept_patches : list[set[int]]
+
+    If return_info=True:
+        kept_patches : list[set[int]]
+        info : dict with percent_greater, bg_mean, patch_means, time_mask summary, etc.
     """
+
     # --- get HKS and ts_mesh ---
     hks = seg_vars.get("hks", None)
     ts_mesh = seg_vars.get("ts_mesh", None)
@@ -33,32 +41,37 @@ def filter_crypt_by_hks_percent(
         ts_mesh = np.linspace(t0, t1, 5, dtype=float)
         hks = compute_hks(mesh, ts_mesh, coeffs=False)
 
-
     ts_mesh = np.asarray(ts_mesh, float)
     V, T = hks.shape
+
     if ts_mesh.shape != (T,):
         raise ValueError(f"ts_mesh must have shape (T,), got {ts_mesh.shape} for HKS with T={T}")
 
-    # --- build time mask from [t_min, t_max] ---
+    # --- build time mask ---
     time_mask = np.ones(T, dtype=bool)
+
     if t_min is not None:
         time_mask &= (ts_mesh >= float(t_min))
+
     if t_max is not None:
         time_mask &= (ts_mesh <= float(t_max))
 
     if not np.any(time_mask):
-        raise ValueError("Time range selects no HKS times (empty mask). Check t_min/t_max vs ts_mesh.")
+        raise ValueError("Time range selects no HKS times (empty mask).")
 
-    # --- union of crypt vertices to define background ---
+    # --- build union of crypt vertices ---
     crypt_union = np.zeros(V, dtype=bool)
+
     for p in patches:
         if p:
             crypt_union[np.fromiter(p, dtype=np.int64)] = True
 
     noncrypt_idx = np.where(~crypt_union)[0]
+
     if noncrypt_idx.size == 0:
         bg_mean = float(np.mean(hks[:, time_mask])) if V > 0 else 0.0
-        return list(patches), {
+
+        info = {
             "name": "mean_hks_percent_timerange",
             "kept": len(patches),
             "removed": 0,
@@ -70,6 +83,8 @@ def filter_crypt_by_hks_percent(
             "n_times_used": int(np.sum(time_mask)),
         }
 
+        return (list(patches), info) if return_info else list(patches)
+
     bg_mean = float(np.mean(hks[noncrypt_idx][:, time_mask]))
 
     kept = []
@@ -78,6 +93,7 @@ def filter_crypt_by_hks_percent(
 
     for p in patches:
         idx = np.fromiter(p, dtype=np.int64)
+
         pm = float(np.mean(hks[idx][:, time_mask])) if idx.size else 0.0
         patch_means.append(pm)
 
@@ -98,7 +114,8 @@ def filter_crypt_by_hks_percent(
         "t_max": t_max,
         "n_times_used": int(np.sum(time_mask)),
     }
-    return kept, info
+
+    return (kept, info) if return_info else kept
 
 
 

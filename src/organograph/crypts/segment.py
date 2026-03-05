@@ -38,6 +38,7 @@ def segment_crypts_organoid(
     geodesic_fn=None,                   # callable to compute distances (e.g. compute_geodesics_dijkstra)
     geodesic_kwargs=None,               # kwargs forwarded to geodesic_fn
     extend_max=2.5,                     # max normalized axis for neck search
+    disc_resolution=100,                # discretization of crypt axis for circumference calculation
     # Filters
     filter_fn_list=None,                # list of filter callables to apply 
     return_vars=False,                  # if True, also return intermediates for debugging/plotting
@@ -73,7 +74,7 @@ def segment_crypts_organoid(
     crypts, filt_info = apply_filters(
         crypts, filters=filter_fn_list, mesh=mesh, seg_vars=seg_vars,
     )
-    seg_vars["filterer_info"] = filt_info
+    seg_vars["filter_info"] = filt_info
 
 
     # --- Optional refinement ---
@@ -98,13 +99,11 @@ def segment_crypts_organoid(
         mesh, sub_crypts, geodesic_fn, geodesic_kwargs=geodesic_kwargs
     )
 
-    n_bins = 100
-    bin_edges = np.linspace(0.0, float(extend_max), int(n_bins) + 1)
-    bin_centers = 0.5 * (bin_edges[:-1] + bin_edges[1:])
-    search_interval = (0.8, bin_centers[-1])
+    d_discretized = np.linspace(0.01, float(extend_max), int(disc_resolution))
+    search_interval = (0.8, d_discretized[-1])
 
     CC_all, dnorm_all, L_crypt_all = normalize_crypt_axis_to_neckline(
-        mesh, dnorm_all, bin_centers, search_interval=search_interval, L_crypt=L_crypt_all
+        mesh, dnorm_all, d_discretized, search_interval=search_interval, L_crypt=L_crypt_all
     )
 
     crypts_extended, best_feature, best_dist = assign_features_by_distance(dnorm_all)
@@ -117,7 +116,7 @@ def segment_crypts_organoid(
         "d_crypts": dnorm_all,
         "L_crypts": L_crypt_all,
         "circumference_crypts": CC_all,
-        "bin_centers": bin_centers,
+        "d_discretized": d_discretized,
         "best_feature": best_feature,
         "best_dist": best_dist,
     })

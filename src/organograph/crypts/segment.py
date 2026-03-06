@@ -9,16 +9,7 @@ from organograph.crypts.axis import (
     normalize_crypt_axis_to_neckline,
     assign_features_by_distance
 )
-
-
-def apply_filters(patches, *, filters, mesh, seg_vars):
-    infos = []
-    out = patches
-    for f in (filters or []):
-        out, info = f(out, mesh=mesh, seg_vars=seg_vars, return_info=True)
-        infos.append(info)
-    return out, infos
-
+from organograph.crypts.filters import apply_filters, subset_per_crypt_vars
 
 def segment_crypts_organoid(
     mesh,                               # organoid surface mesh (mesh.v, mesh.f, mesh.vertex_areas())
@@ -28,19 +19,19 @@ def segment_crypts_organoid(
     L_ref=None,                         # OPTIONAL override (vocab may already store a default)
     crypt_vocab_idx=None,               # OPTIONAL override (vocab functions may already have defaults)
     threshold=0.5,                      # vertex-score threshold for crypt detection
-    min_patch_verts=25,                 # min vertices for detected (and refined) patches
-    min_patch_area=None,                # optional area filter for detection/refinement
     # Crypt refinement/subdivision variables
     refine_crypts=True,                 # if False, skip refinement and use round-1 patches as final patches
     refine_threshold=0.0,               # threshold used during subdivision step
     refine_only_if_area_at_least=5.0,   # skip refinement if patch area smaller than this (None disables)
+    min_refined_frac_of_parent=0.1,     # keep only refined patches with number of verts above a fraction of its parent
     # Neck search variables
     geodesic_fn=None,                   # callable to compute distances (e.g. compute_geodesics_dijkstra)
     geodesic_kwargs=None,               # kwargs forwarded to geodesic_fn
     extend_max=2.5,                     # max normalized axis for neck search
     disc_resolution=100,                # discretization of crypt axis for circumference calculation
+    remove_nested_features=True,        # removes crypts nested inside other crypts
     # Filters
-    filter_fn_list=None,                # list of filter callables to apply 
+    filter_fn_list=None,                # list of filter callables to apply
     return_vars=False,                  # if True, also return intermediates for debugging/plotting
 ):
     if geodesic_fn is None:
@@ -50,17 +41,17 @@ def segment_crypts_organoid(
 
     seg_vars = {}
 
+    # Cache vertex areas for filters
+    seg_vars["vertex_areas"] = np.asarray(mesh.vertex_areas(), float)
 
     # --- Round 1 detection ---
     crypts, enc_vars = detect_crypts_by_encoding(
-        vocab, 
+        vocab,
         mesh,
-        L_ref=L_ref, 
+        L_ref=L_ref,
         crypt_vocab_idx=crypt_vocab_idx,
-        threshold=threshold, 
-        min_patch_verts=min_patch_verts, 
-        min_patch_area=min_patch_area, 
-        return_intermediates=True
+        threshold=threshold,
+        return_intermediates=True,
     )
 
     seg_vars["encoding"] = enc_vars["encoding"]
@@ -69,30 +60,29 @@ def segment_crypts_organoid(
     seg_vars["hks"] = enc_vars["hks"]
     seg_vars["normalised_hks"] = enc_vars["norm_hks"]
 
-
     # --- Filters after detection ---
-    crypts, filt_info = apply_filters(
-        crypts, filters=filter_fn_list, mesh=mesh, seg_vars=seg_vars,
+    crypts, filt_info_initial, _keep_idx_initial = apply_filters(
+        crypts,
+        filters=filter_fn_list,
+        mesh=mesh,
+        seg_vars=seg_vars,
     )
-    seg_vars["filter_info"] = filt_info
-
+    seg_vars["filter_info_initial"] = filt_info_initial
 
     # --- Optional refinement ---
     if refine_crypts:
         sub_crypts = subdivide_crypts_by_encoding(
-            vocab, 
+            vocab,
             mesh,
             L_ref=L_ref,
             crypt_vocab_idx=crypt_vocab_idx,
             patches=crypts,
             threshold=refine_threshold,
-            min_patch_verts=min_patch_verts,     
-            min_patch_area=min_patch_area,
             refine_only_if_area_at_least=refine_only_if_area_at_least,
+            min_refined_frac_of_parent=min_refined_frac_of_parent,
         )
     else:
         sub_crypts = crypts
-
 
     # --- Axis + neckline normalize + extend ---
     dnorm_all, L_crypt_all, bottom_vertex_ids = compute_crypt_axis(
@@ -103,24 +93,53 @@ def segment_crypts_organoid(
     search_interval = (0.8, d_discretized[-1])
 
     CC_all, dnorm_all, L_crypt_all = normalize_crypt_axis_to_neckline(
-        mesh, dnorm_all, d_discretized, search_interval=search_interval, L_crypt=L_crypt_all
+        mesh,
+        dnorm_all,
+        d_discretized,
+        search_interval=search_interval,
+        L_crypt=L_crypt_all,
     )
 
-    crypts_extended, best_feature, best_dist = assign_features_by_distance(dnorm_all)
+    # --- Final crypt assignment / extension ---
+    # Small crypt candidates whose center lies within the extent of a larger
+    # crypt are removed before growing.
+    crypts_extended, best_feature, best_dist, keep_idx_merge = assign_features_by_distance(
+        dnorm_all,
+        remove_nested_features=remove_nested_features,
+    )
+
+    # keep_idx_global always refers to rows of the current per-crypt arrays
+    keep_idx_global = np.asarray(keep_idx_merge, dtype=np.int64)
+
+    # --- Filters after final growth ---
+    crypts_extended, filt_info_final, keep_idx_final = apply_filters(
+        crypts_extended,
+        filters=filter_fn_list,
+        mesh=mesh,
+        seg_vars=seg_vars,
+    )
+    seg_vars["filter_info_final"] = filt_info_final
+
+    keep_idx_global = keep_idx_global[np.asarray(keep_idx_final, dtype=np.int64)]
+
+    # --- Align all per-crypt arrays once, at the end ---
+    aligned = subset_per_crypt_vars(
+        keep_idx_global,
+        bottom_vertex_ids=bottom_vertex_ids,
+        dnorm_all=dnorm_all,
+        L_crypt_all=L_crypt_all,
+        CC_all=CC_all,
+    )
 
     if not return_vars:
         return crypts_extended
 
     seg_vars.update({
-        "bottom_vertex_ids": bottom_vertex_ids,
-        "d_crypts": dnorm_all,
-        "L_crypts": L_crypt_all,
-        "circumference_crypts": CC_all,
+        "bottom_vertex_ids": aligned["bottom_vertex_ids"],
+        "d_crypts": aligned["dnorm_all"],
+        "L_crypts": aligned["L_crypt_all"],
+        "circumference_crypts": aligned["CC_all"],
         "d_discretized": d_discretized,
-        "best_feature": best_feature,
-        "best_dist": best_dist,
+        "keep_idx_final": keep_idx_global,
     })
     return crypts_extended, seg_vars
-
-
-

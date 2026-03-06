@@ -494,64 +494,93 @@ def normalize_crypt_axis_to_neckline(
     return CC_rescaled, dv_rescaled, L_rescaled
 
 
-
-def assign_features_by_distance(dnorm_per_feature, s_thresh=1.0):
+def assign_features_by_distance(
+    dnorm_per_feature,
+    s_thresh=1.0,
+    remove_nested_features=True,
+):
     """
-    Assign each item (cell, vertex, etc.) to at most one feature using
-    a normalized-distance threshold and nearest-feature rule.
+    Assign each item to at most one feature using a normalized-distance
+    threshold and nearest-feature rule.
 
-    Rule
-    ----
-    An item i is eligible for feature k if:
-        dnorm_per_feature[k, i] < s_thresh
-
-    If multiple features qualify, the item is assigned to the feature
-    with the smallest distance.
-
-    This works identically whether “items” are:
-      - cells  → distances at cell centers
-      - vertices → distances at mesh vertices
-      - any other indexed objects
+    Optional preprocessing removes features whose center lies within the
+    thresholded extent of a larger feature.
 
     Parameters
     ----------
     dnorm_per_feature : array, shape (K, N_items)
         Normalized distances from each feature k to each item i.
-        Example:
-            K = number of crypts/features
-            N_items = number of cells OR vertices
-        Distances should already include any axis rescaling (e.g. / s_star).
     s_thresh : float
-        Threshold for membership (default 1.0).
+        Threshold for membership.
+    remove_nested_features : bool
+        If True (default), remove features whose center lies inside the
+        s_thresh-extent of a larger feature before assignment.
 
     Returns
     -------
     feature_patches : list[set[int]]
-        Disjoint sets of assigned item indices, one set per feature (length K).
+        Disjoint sets of assigned item indices, one set per surviving feature.
     best_feature : (N_items,) int
-        Assigned feature index per item, or -1 if unassigned.
+        Assigned surviving-feature index per item, or -1 if unassigned.
     best_dist : (N_items,) float
         Winning (smallest) distance per item, or +inf if unassigned.
+    surviving_idx : (N_surviving,) ndarray
+        Indices of the original input features that survived.
     """
     D = np.asarray(dnorm_per_feature, dtype=float)
     if D.ndim != 2:
         raise ValueError("dnorm_per_feature must have shape (K, N_items)")
 
     K, N_items = D.shape
+    s_thresh = float(s_thresh)
+
+    active = np.ones(K, dtype=bool)
+
+    if remove_nested_features:
+        center_idx = np.full(K, -1, dtype=np.int64)
+        extent_size = np.zeros(K, dtype=np.int64)
+
+        for k in range(K):
+            dk = D[k]
+            finite = np.isfinite(dk)
+            if np.any(finite):
+                center_idx[k] = int(np.argmin(np.where(finite, dk, np.inf)))
+                extent_size[k] = int(np.sum(finite & (dk < s_thresh)))
+            else:
+                active[k] = False
+
+        for k in range(K):
+            if not active[k]:
+                continue
+
+            ck = center_idx[k]
+            if ck < 0:
+                active[k] = False
+                continue
+
+            for j in range(K):
+                if j == k or not active[j]:
+                    continue
+                if extent_size[j] <= extent_size[k]:
+                    continue
+                if np.isfinite(D[j, ck]) and D[j, ck] < s_thresh:
+                    active[k] = False
+                    break
+
+    surviving_idx = np.where(active)[0]
+    D_surv = D[surviving_idx]
 
     best_dist = np.full(N_items, np.inf, dtype=float)
     best_feature = np.full(N_items, -1, dtype=int)
 
-    for k in range(K):
-        dk = D[k]
-        mask = np.isfinite(dk) & (dk < float(s_thresh)) & (dk < best_dist)
+    for k_new, dk in enumerate(D_surv):
+        mask = np.isfinite(dk) & (dk < s_thresh) & (dk < best_dist)
         best_dist[mask] = dk[mask]
-        best_feature[mask] = k
+        best_feature[mask] = k_new
 
     feature_patches = [
-        set(np.where(best_feature == k)[0].tolist())
-        for k in range(K)
+        set(np.where(best_feature == k_new)[0].tolist())
+        for k_new in range(len(surviving_idx))
     ]
 
-    return feature_patches, best_feature, best_dist
-
+    return feature_patches, best_feature, best_dist, surviving_idx

@@ -208,9 +208,7 @@ def patches_from_score(
     faces: np.ndarray,             # (F,3) mesh triangle indices
     *,
     threshold: float,              # minimum vertex score to be considered part of a crypt
-    min_patch_verts: int,          # minimum number of vertices required for a patch
     vertex_areas=None,             # (V,) optional vertex areas for area-based filtering
-    min_patch_area=None,           # minimum surface area required for a patch
 ):
     """
     Extract connected crypt patches from a vertex score field.
@@ -235,11 +233,6 @@ def patches_from_score(
     mask = s >= float(threshold)
     patches = _connected_components_from_mask(adj, mask)
 
-    patches = [
-        p for p in patches
-        if _keep_patch(p, min_verts=int(min_patch_verts), vertex_areas=vertex_areas, min_area=min_patch_area)
-    ]
-
     patch_scores = []
     for p in patches:
         idx = np.fromiter(p, dtype=np.int64)
@@ -260,8 +253,6 @@ def detect_crypts_by_encoding(
     L_ref: float = None,           # reference length scale used for HKS time normalization (optional override)
     crypt_vocab_idx = None,        # indices of vocabulary features representing crypt shapes (optional override)
     threshold: float,              # vertex crypt score threshold for patch detection
-    min_patch_verts: int = 25,     # minimum number of vertices required for a crypt patch
-    min_patch_area=None,           # optional minimum surface area for a patch
     return_intermediates=False,    # if True, also return intermediate data
 ):
     """
@@ -306,9 +297,7 @@ def detect_crypts_by_encoding(
     patches, patch_scores, adj = patches_from_score(
         vscore, mesh.f,
         threshold=float(threshold),
-        min_patch_verts=int(min_patch_verts),
         vertex_areas=vertex_areas,
-        min_patch_area=min_patch_area,
     )
 
     if return_intermediates:
@@ -335,9 +324,8 @@ def subdivide_crypts_by_encoding(
     L_ref: float = None,               # reference length scale for HKS normalization
     crypt_vocab_idx = None,            # vocabulary indices corresponding to crypt features
     threshold: float = 0.0,            # vertex score threshold used during subdivision
-    min_patch_verts: int = 20,         # minimum vertex count for refined patches
-    min_patch_area=None,               # optional minimum surface area for refined patches
     refine_only_if_area_at_least=None, # skip refinement if patch area below this
+    min_refined_frac_of_parent=0.05,    # keep refined patches with above fraction of vertices
     return_intermediates=False,        # if True return encoding and scores
 ):
     """
@@ -404,15 +392,34 @@ def subdivide_crypts_by_encoding(
         mask &= (s >= float(threshold))
 
         refined = _connected_components_from_mask(adj, mask)
-        refined = [
-            rp for rp in refined
-            if _keep_patch(rp, min_verts=int(min_patch_verts), vertex_areas=vertex_areas, min_area=min_patch_area)
-        ]
 
-        if len(refined) <= 1:
+        parent_n = len(p)
+        parent_area = float(np.sum(vertex_areas[np.fromiter(p, dtype=np.int64)]))
+
+        refined_kept = []
+        for rp in refined:
+            idx_r = np.fromiter(rp, dtype=np.int64)
+            n_r = len(rp)
+            area_r = float(np.sum(vertex_areas[idx_r]))
+
+            keep = True
+
+            # if min_refined_patch_verts is not None:
+            #     keep &= (n_r >= min_refined_patch_verts)
+
+            # if min_refined_patch_area is not None:
+            #     keep &= (area_r >= min_refined_patch_area)
+
+            if min_refined_frac_of_parent is not None:
+                keep &= (n_r >= min_refined_frac_of_parent * parent_n)
+
+            if keep:
+                refined_kept.append(rp)
+
+        if len(refined_kept) <= 1:
             final_patches.append(p)
         else:
-            final_patches.extend(refined)
+            final_patches.extend(refined_kept)
 
     s_final = crypt_vertex_score(encoding, crypt_vocab_idx, noncrypt_vocab_idx)
 

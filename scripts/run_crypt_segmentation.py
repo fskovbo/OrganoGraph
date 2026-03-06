@@ -72,7 +72,7 @@ from organograph.mesh.OrganoidMesh import OrganoidMesh
 from organograph.io_utils.path_parsing import discover_mesh_paths, parse_mesh_path
 
 from organograph.crypts.segment import segment_crypts_organoid
-from organograph.crypts.filters import filter_crypts_by_hks_percent
+from organograph.crypts.filters import filter_crypts_by_hks_percent, filter_crypts_by_size
 
 # =============================================================================
 # CONFIG: paths + dataset layout (EDIT THESE)
@@ -87,7 +87,7 @@ VOCAB_PATH    = os.path.join(PROJECT_ROOT, "sim", "vocab_with_meta.npz")
 
 # Optional: blacklist of organoid label_uid that should NOT be processed.
 # Supported formats: .txt, .csv, .json, .npy, .npz
-BLACKLIST_PATH = os.path.join(PROJECT_ROOT, "blacklist.txt")  # or None
+BLACKLIST_PATH = None # os.path.join(PROJECT_ROOT, "..", "blacklist.txt")  # or None
 
 
 TIMEPOINTS = ["day4p5"] 
@@ -118,6 +118,12 @@ FILTERS = [
         t_max=10,
         **kw
     ),
+    lambda patches, **kw: filter_crypts_by_size(
+        patches,
+        min_patch_verts=25,
+        min_patch_area=5,
+        **kw
+    ),
 ]
 
 # =============================================================================
@@ -131,17 +137,17 @@ SEGMENT_KWARGS = dict(
 
     # --- detection ---
     threshold=0.5,
-    min_patch_verts=25,
-    min_patch_area=None,
 
     # --- refinement ---
     refine_crypts=True,
     refine_threshold=0.0,
     refine_only_if_area_at_least=5.0,
+    min_refined_frac_of_parent=0.05,
 
     # --- neck extension ---
     extend_max=2.5,
     disc_resolution=100,
+    remove_nested_features=True,
 )
 
 # =============================================================================

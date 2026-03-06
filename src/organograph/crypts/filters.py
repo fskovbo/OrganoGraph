@@ -1,8 +1,134 @@
 import numpy as np 
+import inspect
 from organograph.mesh.hks import compute_hks
 
 
+# =============================================================================
+# Filter templating and application
+# =============================================================================
 
+
+def crypt_filter(fn):
+    """
+    Decorator enforcing the crypt filter interface.
+
+    Required function signature:
+
+        filter(patches, *, mesh, seg_vars, return_info=False, ...)
+
+    Return value must be either:
+        keep_mask
+    or
+        (keep_mask, info)
+    """
+
+    sig = inspect.signature(fn)
+
+    required = ["patches", "mesh", "seg_vars", "return_info"]
+
+    for name in required:
+        if name not in sig.parameters:
+            raise TypeError(
+                f"{fn.__name__} must define parameter '{name}'"
+            )
+
+    def wrapper(patches, *, mesh, seg_vars, return_info=False, **kwargs):
+
+        out = fn(
+            patches,
+            mesh=mesh,
+            seg_vars=seg_vars,
+            return_info=return_info,
+            **kwargs,
+        )
+
+        if return_info:
+            keep_mask, info = out
+        else:
+            keep_mask = out
+            info = None
+
+        if len(keep_mask) != len(patches):
+            raise ValueError(
+                f"{fn.__name__} returned keep_mask of length {len(keep_mask)} "
+                f"but there are {len(patches)} patches"
+            )
+
+        keep_mask = [bool(x) for x in keep_mask]
+
+        return (keep_mask, info) if return_info else keep_mask
+
+    wrapper.__name__ = fn.__name__
+    wrapper.__doc__ = fn.__doc__
+
+    return wrapper
+
+
+def apply_filters(patches, *, filters, mesh, seg_vars):
+    """
+    Apply filters sequentially.
+
+    Returns
+    -------
+    out : list[set[int]]
+        Filtered patches
+    infos : list[dict]
+        Per-filter diagnostic info
+    keep_idx : ndarray
+        Indices of the input patches that passes all filters
+    """
+    infos = []
+    out = list(patches)
+    keep_idx = np.arange(len(out), dtype=np.int64)
+
+    for f in (filters or []):
+        keep_mask, info = f(out, mesh=mesh, seg_vars=seg_vars, return_info=True)
+        keep_mask = np.asarray(keep_mask, dtype=bool)
+
+        if keep_mask.shape != (len(out),):
+            raise ValueError(
+                f"Filter returned keep_mask with shape {keep_mask.shape}, "
+                f"expected ({len(out)},)"
+            )
+
+        out = [p for p, keep in zip(out, keep_mask) if keep]
+        keep_idx = keep_idx[keep_mask]
+
+        if info is None:
+            info = {}
+        info = dict(info)
+        info["keep_mask"] = keep_mask.tolist()
+        info["keep_idx"] = keep_idx.tolist()
+        infos.append(info)
+
+    return out, infos, keep_idx
+
+
+def subset_per_crypt_vars(idx, **arrays):
+    """
+    Subset aligned per-crypt arrays/lists using the same keep indices.
+
+    Returns a dict with the same keys.
+    """
+    idx = np.asarray(idx, dtype=np.int64)
+    out = {}
+
+    for name, arr in arrays.items():
+        if arr is None:
+            out[name] = None
+        elif isinstance(arr, list):
+            out[name] = [arr[i] for i in idx]
+        else:
+            out[name] = np.asarray(arr)[idx]
+
+    return out
+
+
+# =============================================================================
+# Filter implementations
+# =============================================================================
+
+@crypt_filter
 def filter_crypts_by_hks_percent(
     patches,                      # list[set[int]] candidate patches
     *,
@@ -11,18 +137,18 @@ def filter_crypts_by_hks_percent(
     min_percent_greater: float,   # keep patch if mean(HKS_patch) >= (1 + X%) * mean(HKS_background)
     t_min=None,                   # optional min time (in ts_mesh units); None => no lower bound
     t_max=None,                   # optional max time (in ts_mesh units); None => no upper bound
-    return_info=False,            # if True return (patches, info), otherwise only patches
+    return_info=False,            # if True return (keep_mask, info), otherwise only keep_mask
 ):
     """
-    Filter patches using *raw* HKS mean compared to background, restricted to a time range.
+    Filter patches using raw HKS mean compared to background, restricted to a time range.
 
     Returns
     -------
     If return_info=False:
-        kept_patches : list[set[int]]
+        keep_mask : list[bool]
 
     If return_info=True:
-        kept_patches : list[set[int]]
+        keep_mask : list[bool]
         info : dict with percent_greater, bg_mean, patch_means, time_mask summary, etc.
     """
 
@@ -41,6 +167,7 @@ def filter_crypts_by_hks_percent(
         ts_mesh = np.linspace(t0, t1, 5, dtype=float)
         hks = compute_hks(mesh, ts_mesh, coeffs=False)
 
+    hks = np.asarray(hks, float)
     ts_mesh = np.asarray(ts_mesh, float)
     V, T = hks.shape
 
@@ -61,7 +188,6 @@ def filter_crypts_by_hks_percent(
 
     # --- build union of crypt vertices ---
     crypt_union = np.zeros(V, dtype=bool)
-
     for p in patches:
         if p:
             crypt_union[np.fromiter(p, dtype=np.int64)] = True
@@ -70,6 +196,7 @@ def filter_crypts_by_hks_percent(
 
     if noncrypt_idx.size == 0:
         bg_mean = float(np.mean(hks[:, time_mask])) if V > 0 else 0.0
+        keep_mask = [True] * len(patches)
 
         info = {
             "name": "mean_hks_percent_timerange",
@@ -83,11 +210,11 @@ def filter_crypts_by_hks_percent(
             "n_times_used": int(np.sum(time_mask)),
         }
 
-        return (list(patches), info) if return_info else list(patches)
+        return (keep_mask, info) if return_info else keep_mask
 
     bg_mean = float(np.mean(hks[noncrypt_idx][:, time_mask]))
 
-    kept = []
+    keep_mask = []
     percent_greater = []
     patch_means = []
 
@@ -100,13 +227,12 @@ def filter_crypts_by_hks_percent(
         pct = 100.0 * (pm / (bg_mean + 1e-12) - 1.0)
         percent_greater.append(float(pct))
 
-        if pct >= float(min_percent_greater):
-            kept.append(p)
+        keep_mask.append(pct >= float(min_percent_greater))
 
     info = {
         "name": "mean_hks_percent_timerange",
-        "kept": int(len(kept)),
-        "removed": int(len(patches) - len(kept)),
+        "kept": int(sum(keep_mask)),
+        "removed": int(len(patches) - sum(keep_mask)),
         "bg_mean": float(bg_mean),
         "percent_greater": percent_greater,
         "patch_means": patch_means,
@@ -115,7 +241,79 @@ def filter_crypts_by_hks_percent(
         "n_times_used": int(np.sum(time_mask)),
     }
 
-    return (kept, info) if return_info else kept
+    return (keep_mask, info) if return_info else keep_mask
+
+
+@crypt_filter
+def filter_crypts_by_size(
+    patches,
+    *,
+    mesh,
+    seg_vars,
+    min_patch_verts=0,
+    min_patch_area=None,
+    return_info=False,
+):
+    """
+    Keep patches that satisfy minimum vertex count and optional minimum area.
+
+    Parameters
+    ----------
+    patches : list[set[int]]
+        Candidate crypt patches.
+    mesh
+        Mesh object.
+    seg_vars : dict
+        Segmentation variables. If "vertex_areas" is present it is reused,
+        otherwise it is computed from the mesh.
+    min_patch_verts : int
+        Minimum number of vertices required for a patch to be kept.
+    min_patch_area : float or None
+        Optional minimum patch area (sum of vertex areas).
+    return_info : bool
+        If True, return (keep_mask, info), otherwise only keep_mask.
+
+    Returns
+    -------
+    keep_mask : list[bool]
+        One boolean per patch.
+    info : dict, optional
+        Diagnostic information.
+    """
+    vertex_areas = seg_vars.get("vertex_areas", None)
+    if vertex_areas is None:
+        vertex_areas = np.asarray(mesh.vertex_areas(), float)
+        seg_vars["vertex_areas"] = vertex_areas
+
+    patch_n_verts = []
+    patch_areas = []
+    keep_mask = []
+
+    for p in patches:
+        idx = np.fromiter(p, dtype=np.int64) if len(p) > 0 else np.empty((0,), dtype=np.int64)
+
+        n_verts = int(idx.size)
+        area = float(np.sum(vertex_areas[idx])) if idx.size > 0 else 0.0
+
+        keep = (n_verts >= int(min_patch_verts))
+        if min_patch_area is not None:
+            keep = keep and (area >= float(min_patch_area))
+
+        patch_n_verts.append(n_verts)
+        patch_areas.append(area)
+        keep_mask.append(bool(keep))
+
+    info = {
+        "name": "size_filter",
+        "min_patch_verts": int(min_patch_verts),
+        "min_patch_area": None if min_patch_area is None else float(min_patch_area),
+        "patch_n_verts": patch_n_verts,
+        "patch_areas": patch_areas,
+        "kept": int(sum(keep_mask)),
+        "removed": int(len(keep_mask) - sum(keep_mask)),
+    }
+
+    return (keep_mask, info) if return_info else keep_mask
 
 
 

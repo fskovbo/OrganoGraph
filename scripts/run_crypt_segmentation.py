@@ -1,6 +1,67 @@
 #!/usr/bin/env python3
 """
-Run crypt segmentation directly on meshes (no graphs required).
+Run crypt segmentation on organoid meshes.
+
+This script performs automated segmentation of intestinal crypts on a dataset
+of organoid surface meshes. It iterates over all meshes discovered in the
+specified data directory, runs the crypt segmentation pipeline on each mesh,
+and saves the resulting segmentation outputs to disk.
+
+Pipeline overview
+-----------------
+For each mesh:
+1. The mesh is loaded and normalized (centered and rescaled).
+2. The Laplace–Beltrami operator is diagonalized to enable spectral
+   computations used by the Heat Kernel Signature (HKS).
+3. The mesh is encoded using a precomputed vocabulary of HKS features
+   (the "bag of features").
+4. Candidate crypt regions are detected based on similarity of the
+   encoded HKS to crypt-like vocabulary features.
+5. Optional filtering steps are applied to remove false positives
+   (for example using raw HKS statistics).
+6. Detected regions can optionally be refined by subdividing large patches.
+7. A geodesic distance field is computed from each crypt bottom to
+   estimate the crypt axis and characteristic crypt length.
+8. Crypt regions may be extended along this axis to obtain the final
+   segmentation.
+
+Outputs
+-------
+For each processed organoid, the script saves a compressed `.npz` file
+containing the segmentation results, including:
+
+    - crypts_ll              : list of vertex indices for each crypt
+    - bottom_vertex_ids      : vertex index of the crypt bottom
+    - L_crypts               : estimated crypt lengths
+    - circumference_crypts   : circumference profile along the crypt axis
+    - d_discretized          : discretized distance coordinate along the axis
+
+Optional intermediate variables from the segmentation pipeline can also
+be stored depending on the configuration.
+
+Customization
+-------------
+Users can easily customize the behavior of the pipeline by editing the
+configuration section at the top of this file, including:
+
+    - dataset paths
+    - timepoints and wells to process
+    - segmentation parameters
+    - geodesic distance algorithm
+    - filtering functions applied to candidate crypts
+    - which intermediate variables are saved
+
+The script also supports a DRY_RUN mode, which prints the meshes that
+would be processed without actually running the segmentation.
+
+Typical usage
+-------------
+Run the script directly from the command line:
+
+    python run_crypt_segmentation.py
+
+The script will discover meshes, process them sequentially, and write the
+segmentation results to the configured output directory.
 """
 
 import os
@@ -23,6 +84,11 @@ PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 MESH_DATA_DIR = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "fractal_output")
 SEG_DIR       = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "crypt_segmentations_mesh")
 VOCAB_PATH    = os.path.join(PROJECT_ROOT, "sim", "vocab_with_meta.npz")
+
+# Optional: blacklist of organoid label_uid that should NOT be processed.
+# Supported formats: .txt, .csv, .json, .npy, .npz
+BLACKLIST_PATH = os.path.join(PROJECT_ROOT, "blacklist.txt")  # or None
+
 
 TIMEPOINTS = ["day4p5"] 
 
@@ -112,6 +178,44 @@ def normalize_save_spec(spec):
         return [k for k, v in spec.items() if bool(v)]
     return list(spec)
 
+def load_blacklist(path):
+    """
+    Load a blacklist of label_uid from various file formats.
+    Returns a set of strings.
+    """
+    if path is None:
+        return set()
+
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Blacklist file not found: {path}")
+
+    ext = os.path.splitext(path)[1].lower()
+
+    if ext == ".txt":
+        with open(path) as f:
+            return {line.strip() for line in f if line.strip()}
+
+    if ext == ".csv":
+        import pandas as pd
+        df = pd.read_csv(path)
+        return set(df.iloc[:, 0].astype(str))
+
+    if ext == ".json":
+        import json
+        with open(path) as f:
+            data = json.load(f)
+        return {str(x) for x in data}
+
+    if ext == ".npy":
+        arr = np.load(path, allow_pickle=True)
+        return {str(x) for x in arr}
+
+    if ext == ".npz":
+        arr = np.load(path, allow_pickle=True)
+        key = list(arr.keys())[0]
+        return {str(x) for x in arr[key]}
+
+    raise ValueError(f"Unsupported blacklist format: {ext}")
 
 # =============================================================================
 # Main
@@ -123,6 +227,10 @@ def main():
     if not os.path.exists(VOCAB_PATH):
         raise FileNotFoundError(f"VOCAB_PATH not found: {VOCAB_PATH}")
     vocab = np.load(VOCAB_PATH, allow_pickle=True)
+
+    blacklist = load_blacklist(BLACKLIST_PATH)
+    if VERBOSE and blacklist:
+        print(f"[mesh-seg] loaded blacklist with {len(blacklist)} entries")
 
     # discover mesh files
     timepoints = list(TIMEPOINTS)
@@ -153,6 +261,10 @@ def main():
 
         tp = rec.get("timepoint", None)
         label_uid = rec.get("label_uid", None)
+        if label_uid in blacklist:
+            if VERBOSE:
+                print(f"[skip] {label_uid} is blacklisted")
+            continue
         if not tp or not label_uid:
             if VERBOSE:
                 print(f"[skip] missing timepoint/label_uid for: {mesh_path}")

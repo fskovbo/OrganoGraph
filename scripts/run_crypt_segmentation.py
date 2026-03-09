@@ -70,6 +70,8 @@ import numpy as np
 
 from organograph.mesh.OrganoidMesh import OrganoidMesh
 from organograph.io_utils.path_parsing import discover_mesh_paths, parse_mesh_path
+from organograph.io_utils.blacklist import load_blacklist
+from organograph.io_utils.dataset_config import load_mesh_dataset_config
 
 from organograph.crypts.segment import segment_crypts_organoid
 from organograph.crypts.filters import filter_crypts_by_hks_percent, filter_crypts_by_size
@@ -78,30 +80,55 @@ from organograph.crypts.filters import filter_crypts_by_hks_percent, filter_cryp
 # CONFIG: paths + dataset layout (EDIT THESE)
 # =============================================================================
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
+DATASET         = "20250929"
 
-MESH_DATA_DIR = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "fractal_output")
-SEG_DIR       = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "crypt_segmentations_mesh")
-VOCAB_PATH    = os.path.join(PROJECT_ROOT, "sim", "vocab_with_meta.npz")
+_SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT    = os.path.dirname(_SCRIPT_DIR)
 
-# Optional: blacklist of organoid label_uid that should NOT be processed.
-# Supported formats: .txt, .csv, .json, .npy, .npz
-BLACKLIST_PATH = None # os.path.join(PROJECT_ROOT, "..", "blacklist.txt")  # or None
+MESH_DATA_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "fractal_output")
+SEG_DIR         = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_mesh")
+VOCAB_PATH      = os.path.join(PROJECT_ROOT, "sim", "vocab_with_meta.npz")
+MESH_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "mesh_config.json")
+BLACKLIST_PATH  = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "combined_labels_to_discard.npy")
 
+# Optional override. If None, use all timepoints from mesh_config.json
+TIMEPOINTS      = ['day3p5', 'day4', 'day4p5', 'day4p5-more']   
 
-TIMEPOINTS = ["day4p5"] 
+ZARR_NAME_BY_TP = {tp: 'r0.zarr' for tp in TIMEPOINTS}
+ROUND_BY_TP     = {tp: '0_fused_zillum_registered' for tp in TIMEPOINTS}
+MESHNAME_BY_TP  = {tp: 'nnorg_linked_multi_annotated_class' for tp in TIMEPOINTS}
 
-ZARR_NAME_BY_TP = {tp: "251130R0.zarr" for tp in TIMEPOINTS}
-ROUND_BY_TP     = {tp: "2_zillum_registered" for tp in TIMEPOINTS}
-MESHNAME_BY_TP  = {tp: "nnorg_corrected_annotated_by_projection" for tp in TIMEPOINTS}
+WELLS_BY_TP = {
+    'day1p5': ['A01', 'A02', 'A03', 'A04', 'A05', 'A06'],
+    'day2': ['A01', 'A02', 'A03', 'A04', 'A05', 'A06'],
+    'day2p5': ['A01', 'A02', 'A03', 'A04', 'A05', 'A06'],
+    'day3': ['A01', 'A02', 'A03', 'A04', 'A05', 'A06', 'B02', 'B03'],
+    'day3p5': ['A01', 'A02', 'A03', 'A04', 'B03'],
+    'day4': ['A02', 'A03', 'A04', 'A05', 'A06', 'B01', 'B02'],
+    'day4p5': ['A06', 'B06'],
+    'day4p5-more': ['C01', 'C02', 'C03', 'C04', 'C05', 'C06'],
+}
 
-WELLS_BY_TP = {"day4p5": ["B02", "B03", "B04", "B05"],}
 
 OVERWRITE = True
 VERBOSE = True
 MAX_MESHES = None
 DRY_RUN = False  
+
+
+# =============================================================================
+# LOAD DATA STRUCTURE
+# =============================================================================
+
+mesh_cfg = load_mesh_dataset_config(MESH_CONFIG_PATH)
+ALL_TIMEPOINTS = list(mesh_cfg["timepoints"])
+TIMEPOINTS_TO_RUN = list(ALL_TIMEPOINTS if TIMEPOINTS is None else TIMEPOINTS)
+ZARR_NAME_BY_TP = mesh_cfg["zarr_name_by_tp"]
+ROUND_BY_TP = mesh_cfg["round_by_tp"]
+MESHNAME_BY_TP = mesh_cfg["meshname_by_tp"]
+WELLS_BY_TP = mesh_cfg.get("wells_by_tp", {})
+
+
 
 # =============================================================================
 # USER-EDITABLE: choose geodesic function + filters (CUSTOMIZE THESE IF NEEDED)
@@ -184,44 +211,6 @@ def normalize_save_spec(spec):
         return [k for k, v in spec.items() if bool(v)]
     return list(spec)
 
-def load_blacklist(path):
-    """
-    Load a blacklist of label_uid from various file formats.
-    Returns a set of strings.
-    """
-    if path is None:
-        return set()
-
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"Blacklist file not found: {path}")
-
-    ext = os.path.splitext(path)[1].lower()
-
-    if ext == ".txt":
-        with open(path) as f:
-            return {line.strip() for line in f if line.strip()}
-
-    if ext == ".csv":
-        import pandas as pd
-        df = pd.read_csv(path)
-        return set(df.iloc[:, 0].astype(str))
-
-    if ext == ".json":
-        import json
-        with open(path) as f:
-            data = json.load(f)
-        return {str(x) for x in data}
-
-    if ext == ".npy":
-        arr = np.load(path, allow_pickle=True)
-        return {str(x) for x in arr}
-
-    if ext == ".npz":
-        arr = np.load(path, allow_pickle=True)
-        key = list(arr.keys())[0]
-        return {str(x) for x in arr[key]}
-
-    raise ValueError(f"Unsupported blacklist format: {ext}")
 
 # =============================================================================
 # Main
@@ -234,7 +223,7 @@ def main():
         raise FileNotFoundError(f"VOCAB_PATH not found: {VOCAB_PATH}")
     vocab = np.load(VOCAB_PATH, allow_pickle=True)
 
-    blacklist = load_blacklist(BLACKLIST_PATH)
+    blacklist = load_blacklist(BLACKLIST_PATH) if BLACKLIST_PATH else set()
     if VERBOSE and blacklist:
         print(f"[mesh-seg] loaded blacklist with {len(blacklist)} entries")
 

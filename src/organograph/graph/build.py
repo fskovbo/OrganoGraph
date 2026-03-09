@@ -13,6 +13,7 @@ def build_organoid_graph(
     *,
     precomputed=None,        # dict or None: {"proj_vertex_ids":..., "vertex_owner":..., "proj_points":...}
     resolve_duplicates=True,
+    max_dist=None,           # (optional) max accepted distance between nucleus and mesh 
     project_fn=project_nuclei_to_mesh,
     voronoi_fn=voronoi_on_mesh_dijkstra,
 ):
@@ -48,7 +49,7 @@ def build_organoid_graph(
             raise ValueError("project_fn and voronoi_fn are required when precomputed is None")
 
         proj_vertex_ids, proj_points = project_fn(
-            nuclei_xyz, mesh, resolve_duplicates=resolve_duplicates
+            nuclei_xyz, mesh, resolve_duplicates=resolve_duplicates, max_dist=max_dist,
         )
         vertex_owner, dist_mat = voronoi_fn(mesh, proj_vertex_ids)
 

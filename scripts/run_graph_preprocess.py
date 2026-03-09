@@ -23,6 +23,7 @@ Index:
 
 import os
 import csv
+import time
 
 import numpy as np
 import pandas as pd
@@ -33,6 +34,8 @@ from organograph.mesh.OrganoidMesh import OrganoidMesh
 
 from organograph.io_utils.cells_table import prepare_cells_table, make_nuclei_extractor, suppress_marker_if_coexpressed
 from organograph.io_utils.path_parsing import parse_mesh_path, discover_mesh_paths
+from organograph.io_utils.dataset_config import load_mesh_dataset_config, load_cell_table_config
+from organograph.io_utils.blacklist import load_blacklist
 from organograph.graph.build import build_organoid_graph, add_vertex_field_to_graph
 from organograph.graph.io import save_cell_graph
 
@@ -40,123 +43,63 @@ from organograph.mesh.hks import compute_hks
 from organograph.crypts.vocab import compute_vocabulary_encoding
 
 
-# # =============================================================================
-# # DATASET CONFIG
-# # =============================================================================
-
-# # Absolute path to this script file
-# _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# # Project root = parent of the "scripts" folder
-# PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
-
-# MESH_DATA_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "fractal_output")
-# CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "cell_features_class.csv") 
-# OUT_GRAPHS_DIR  = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "graphs_preprocessed")
-
-# timepoints = ["day4p5"]
-# zarr_names = {tp: "251130R0.zarr" for tp in timepoints}
-# rounds     = {tp: "2_zillum_registered" for tp in timepoints}
-# meshes     = {tp: "nnorg_corrected_annotated_by_projection" for tp in timepoints}
-
-# wells = {
-#     "day4p5": ["B02", "B03", "B04", "B05"],
-# }
-
-
-# COORD_COLS = ("0.x_pos_pix", "0.y_pos_pix", "0.z_pos_pix_scaled")
-
-# MARKER_COLS = [
-#     "0.C02.percentile99_class",  # LGR5
-#     "0.C03.percentile99_class",  # chroma
-#     "0.C04.percentile99_class",  # aldoB
-#     "1.C02.percentile99_class",  # Sero
-#     "1.C03.percentile99_class",  # Lyz
-#     "1.C04.percentile99_class",  # Agr2
-#     "2.C04.percentile99_class",  # ki67
-# ]
-
-# LGR5_MARKER = "0.C02.percentile99_class"
-# COEXP_MARKERS = (
-#     "1.C03.percentile99_class",  # Lyz
-#     "1.C04.percentile99_class",  # Agr2
-#     "1.C02.percentile99_class",  # Sero
-#     "0.C03.percentile99_class",  # chroma
-# )
-
-# HKS_TIMES = [1.0, 2.0, 4.0, 8.0, 25.0]
-# VOCAB_PATH = "./sim/vocab.npz"
-# # If you know specific arrays that MUST be present in vocab.npz, list them here.
-# REQUIRED_VOCAB_KEYS = []
-
-# # Dev/UX options
-# DRY_RUN = False       # If True: do not load meshes, do not write outputs; just print what would happen
-# MAX_MESHES = None     # e.g. 10 for quick testing; None means no limit
-
-
-
-
 # =============================================================================
 # DATASET CONFIG
 # =============================================================================
 
+DATASET         = "20251201" # "20250929"
+
 # Absolute path to this script file
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
 
 # Project root = parent of the "scripts" folder
-PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
+PROJECT_ROOT    = os.path.dirname(_SCRIPT_DIR)
 
-MESH_DATA_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20250929", "fractal_output")
-CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20250929", "cell_types_class.csv") 
-OUT_GRAPHS_DIR  = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20250929", "graphs_preprocessed")
+MESH_DATA_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "fractal_output")
+CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_features_class.csv") # cell_types_class
+OUT_GRAPHS_DIR  = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "graphs_preprocessed")
 
-# timepoints = ['day2', 'day2p5', 'day3', 'day3p5', 'day4', 'day4p5', 'day4p5-more']   # extend as needed: ['day3', 'day3p5', ...]
-timepoints = ['day3p5',  'day4p5']   # extend as needed: ['day3', 'day3p5', ...]
-
-zarr_names = {tp: 'r0.zarr' for tp in timepoints}
-rounds     = {tp: '0_fused_zillum_registered' for tp in timepoints}
-meshes     = {tp: 'nnorg_linked_multi_annotated_class' for tp in timepoints}
-
-wells = {
-    'day1p5': ['A01', 'A02', 'A03', 'A04', 'A05', 'A06'],
-    'day2': ['A01', 'A02', 'A03', 'A04', 'A05', 'A06'],
-    'day2p5': ['A01', 'A02', 'A03', 'A04', 'A05', 'A06'],
-    'day3': ['A01', 'A02', 'A03', 'A04', 'A05', 'A06', 'B02', 'B03'],
-    'day3p5': ['A01', 'A02', 'A03', 'A04', 'B03'],
-    'day4': ['A02', 'A03', 'A04', 'A05', 'A06', 'B01', 'B02'],
-    'day4p5': ['A06', 'B06'],
-    'day4p5-more': ['C01', 'C02', 'C03', 'C04', 'C05', 'C06'],
-}
+MESH_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "mesh_config.json")
+CELL_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_table_config.json")
+BLACKLIST_PATH  = None # os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "combined_labels_to_discard.npy")
 
 
+# Optional override. If None, use all timepoints from mesh_config.json
+timepoints = ['day4p5'] # ['day3p5', 'day4', 'day4p5', 'day4p5-more']   
 
-
-COORD_COLS = ("0.x_pos_pix", "0.y_pos_pix", "0.z_pos_pix_scaled")
-
-MARKER_COLS = [
-"LGR.bin", "CHROMA.bin", "CYCD.bin", "MUC.bin", "ALDOB.bin",
-    "GLUC.bin", "CYCA.bin", "AGR.bin", "SERO.bin", "LYZ.bin",
-]
-
-LGR5_MARKER = "LGR.bin"
-COEXP_MARKERS = (
-    "LYZ.bin",     # Lysozyme → Paneth
-    "MUC.bin",     # Mucin 2 → Goblet
-    "AGR.bin",     # Agr2 → Goblet/Paneth
-    "SERO.bin",    # Serotonin → Enterochromaffin
-    "GLUC.bin",    # Glucagon → Enteroendocrine
-    "CHROMA.bin",  # Chromogranin A → Enteroendocrine
-)
 
 HKS_TIMES = [1.0, 2.0, 4.0, 8.0, 25.0]
-VOCAB_PATH = "./sim/vocab.npz"
+MAX_PROJ_DIST = 2.5  # max accepted distance between nuclei and membrane for projection. If None, use all distances
+
+
+VOCAB_PATH = "./sim/vocab_with_meta.npz"
 # If you know specific arrays that MUST be present in vocab.npz, list them here.
 REQUIRED_VOCAB_KEYS = []
 
 # Dev/UX options
+OVERWRITE = False
+VERBOSE = True
 DRY_RUN = False       # If True: do not load meshes, do not write outputs; just print what would happen
 MAX_MESHES = None     # e.g. 10 for quick testing; None means no limit
 
+
+# =============================================================================
+# LOAD DATA STRUCTURE 
+# =============================================================================
+
+mesh_cfg    = load_mesh_dataset_config(MESH_CONFIG_PATH)
+zarr_names  = mesh_cfg["zarr_name_by_tp"]
+rounds      = mesh_cfg["round_by_tp"]
+meshes      = mesh_cfg["meshname_by_tp"]
+wells       = mesh_cfg["wells_by_tp"]
+
+
+
+cell_cfg    = load_cell_table_config(CELL_CONFIG_PATH)
+COORD_COLS  = tuple(cell_cfg["coord_cols"])
+MARKER_COLS = list(cell_cfg["marker_cols"])
+LGR5_MARKER = cell_cfg["lgr5_marker"]
+COEXP_MARKERS = tuple(cell_cfg["coexp_markers"])
 
 # =============================================================================
 # MARKER POSTPROCESS
@@ -195,15 +138,19 @@ def validate_vocab_npz(vocab):
 # =============================================================================
 
 def main():
+    t_start = time.perf_counter()
     build_graphs_for_dataset(
-        overwrite=False,
-        verbose=True,
-        blacklist=[],
+        overwrite=OVERWRITE,
+        verbose=VERBOSE,
+        blacklist_path=BLACKLIST_PATH,
     )
+    elapsed_s = time.perf_counter() - t_start
+    if VERBOSE:
+        print(f"[graphs] done. DRY_RUN={DRY_RUN} elapsed={elapsed_s:.2f}s ({elapsed_s/60.0:.2f} min)")
 
 
-def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist=None):
-    blacklist = set([] if blacklist is None else blacklist)
+def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist_path=None):
+    blacklist = load_blacklist(blacklist_path) if blacklist_path else set()
     tp_allow = set(timepoints) if timepoints else None
 
     # --- load & index cells table once ---
@@ -275,6 +222,8 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist=None):
             continue
 
         if label_uid in blacklist:
+            if verbose:
+                print(f"[skip] {label_uid} is blacklisted")
             continue
 
         out_dir = os.path.join(OUT_GRAPHS_DIR, tp)
@@ -282,6 +231,8 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist=None):
         out_path = os.path.join(out_dir, f"{label_uid}.gpickle")
 
         if (not overwrite) and os.path.exists(out_path):
+            if verbose:
+                print(f"[skip] exists: {out_path}")
             continue
 
         # DRY_RUN / MAX_MESHES logic (after all filters)
@@ -307,7 +258,7 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist=None):
 
         # --- build graph (extractor does the table lookup) ---
         try:
-            G, aux = build_organoid_graph(mesh=mesh, extract_fn=extractor)
+            G, aux = build_organoid_graph(mesh=mesh, extract_fn=extractor, max_dist=MAX_PROJ_DIST)
         except Exception as e:
             if verbose:
                 print(f"[{tp}] graph build failed for {label_uid}: {e}")
@@ -327,7 +278,7 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist=None):
 
         # --- compute + attach vocab encoding ---
         try:
-            encoding, _, _, _ = compute_vocabulary_encoding(vocab, mesh)
+            encoding = compute_vocabulary_encoding(vocab, mesh)[0]
             add_vertex_field_to_graph(G, encoding, "vocab_encoding")
             G.graph["vocab_path"] = VOCAB_PATH
         except Exception as e:
@@ -346,6 +297,7 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist=None):
                 "N_cells": int(G.number_of_nodes()),
                 "N_edges": int(G.number_of_edges()),
                 "has_hks": True,
+                "max_proj_dist": MAX_PROJ_DIST,
                 "has_vocab_encoding": ("vocab_encoding" in next(iter(G.nodes(data=True)))[1]) if G.number_of_nodes() > 0 else False,
             }
         )

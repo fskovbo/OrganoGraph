@@ -30,37 +30,37 @@ def as_patch_list(x):
     return []
 
 
-def save_segmentation_npz(
-    path,
-    *,
-    label_uid,
-    crypts_ll,
-    villi_ll,
-    bin_centers=None,
-    d_norm=None,
-    L_crypt=None,
-    Circ=None,
-    extra=None,
-):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    payload = {
-        "label_uid": np.array([label_uid], dtype=object),
-        "crypts": np.array(crypts_ll, dtype=object),
-        "villi":  np.array(villi_ll,  dtype=object),
-    }
-    if bin_centers is not None: payload["bin_centers"] = np.asarray(bin_centers, dtype=np.float32)
-    if d_norm is not None:      payload["dnorm_v"]     = np.asarray(d_norm, dtype=np.float32)
-    if L_crypt is not None:     payload["L_crypt"]     = np.asarray(L_crypt, dtype=np.float32)
-    if Circ is not None:        payload["Circ"]        = np.asarray(Circ,    dtype=np.float32)
-    if extra:
-        for k, v in extra.items():
-            payload[k] = v
-    np.savez_compressed(path, **payload)
+def load_mesh_crypt_segmentation(seg_path):
+    """
+    Load one mesh-based crypt segmentation .npz.
 
-def load_segmentation_npz(path):
-    d = np.load(path, allow_pickle=True)
-    out = {k: d[k] for k in d.files}
-    out["label_uid"] = str(out["label_uid"][0])
-    out["crypts_ll"] = out["crypts"].tolist() if "crypts" in out else []
-    out["villi_ll"]  = out["villi"].tolist()  if "villi" in out else []
+    Expects at least:
+      - label_uid
+      - timepoint
+      - mesh_path
+      - crypts_ll
+    """
+    z = np.load(seg_path, allow_pickle=True)
+
+    if "crypts_ll" not in z:
+        raise KeyError(f"{seg_path} does not contain 'crypts_ll'")
+
+    label_uid = str(z["label_uid"]) if "label_uid" in z else None
+    timepoint = str(z["timepoint"]) if "timepoint" in z else None
+    mesh_path = str(z["mesh_path"]) if "mesh_path" in z else None
+
+    crypts_mesh = [set(map(int, p)) for p in z["crypts_ll"]]
+
+    out = {
+        "label_uid": label_uid,
+        "timepoint": timepoint,
+        "mesh_path": mesh_path,
+        "crypts_mesh": crypts_mesh,
+    }
+
+    # carry through optional fields if they exist
+    for k in ("bottom_vertex_ids", "L_crypts", "circumference_crypts", "d_discretized"):
+        if k in z:
+            out[k] = z[k]
+
     return out

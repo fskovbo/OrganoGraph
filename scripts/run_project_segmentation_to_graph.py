@@ -33,6 +33,7 @@ more convenient primary representation for retrieving whole crypts.
 
 import os
 import glob
+import time
 import numpy as np
 import pandas as pd
 
@@ -43,8 +44,10 @@ from organograph.io_utils.cells_table import (
     make_nuclei_extractor,
     suppress_marker_if_coexpressed,
 )
+from organograph.io_utils.dataset_config import load_mesh_dataset_config, load_cell_table_config
+from organograph.io_utils.blacklist import load_blacklist
 from organograph.graph.build import build_organoid_graph, assign_mesh_patches_to_graph
-from organograph.io_utils.path_parsing import parse_mesh_path
+from organograph.io_utils.segmentation_io import load_mesh_crypt_segmentation
 from organograph.graph.io import load_cell_graph, save_cell_graph
 
 
@@ -52,53 +55,34 @@ from organograph.graph.io import load_cell_graph, save_cell_graph
 # DATASET PATHS (EDIT THESE)
 # =============================================================================
 
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
+DATASET         = "20250929"
+
+_SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
+PROJECT_ROOT    = os.path.dirname(_SCRIPT_DIR)
 
 # Input: mesh-based segmentation results
-SEG_MESH_DIR = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "crypt_segmentations_mesh")
+SEG_MESH_DIR    = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_mesh")
 
 # Input: nuclei/cell table used to build graphs if needed
-CELLS_CSV = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "cell_features_class.csv")
+CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_types_class.csv")
 
 # Optional existing graph directory; if graph missing here, it will be built on the fly
-GRAPHS_DIR = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "graphs_preprocessed")
+GRAPHS_DIR      = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "graphs_preprocessed")
 
 # Output: graph-based crypt projections
-GRAPH_SEG_DIR = os.path.join(PROJECT_ROOT, "..", "NicoleData", "20251201", "crypt_segmentations_graph")
+GRAPH_SEG_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_graph")
 
+# config files with data structure
+MESH_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "mesh_config.json")
+CELL_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_table_config.json")
 
-# =============================================================================
-# GRAPH-BUILDING CONFIG (EDIT THESE TO MATCH COLS IN CSV FILE)
-# =============================================================================
-
-# Cols for loading
-COORD_COLS = ("0.x_pos_pix", "0.y_pos_pix", "0.z_pos_pix_scaled")
-MARKER_COLS = [
-    "0.C02.percentile99_class",  # LGR5
-    "0.C03.percentile99_class",  # chroma
-    "0.C04.percentile99_class",  # aldoB
-    "1.C02.percentile99_class",  # Sero
-    "1.C03.percentile99_class",  # Lyz
-    "1.C04.percentile99_class",  # Agr2
-    "2.C04.percentile99_class",  # ki67
-]
-
-# Cols for marker filtering
-LGR5_MARKER = "0.C02.percentile99_class"
-COEXP_MARKERS = (
-    "1.C03.percentile99_class",  # Lyz
-    "1.C04.percentile99_class",  # Agr2
-    "1.C02.percentile99_class",  # Sero
-    "0.C03.percentile99_class",  # chroma
-)
 
 
 # =============================================================================
 # OPTIONAL FILTERING / BEHAVIOR
 # =============================================================================
 
-TIMEPOINTS = ["day4p5"]   # or None for all timepoints found under SEG_MESH_DIR
+TIMEPOINTS = None   # or None for all timepoints found under SEG_MESH_DIR
 OVERWRITE = True
 VERBOSE = True
 DRY_RUN = False
@@ -112,6 +96,20 @@ SAVE_CRYPT_INDEX_VECTOR = False
 
 # If a graph is missing and we build it on the fly, save it to GRAPHS_DIR
 SAVE_BUILT_GRAPHS = True
+
+
+# =============================================================================
+# LOAD CONFIG
+# =============================================================================
+
+mesh_cfg = load_mesh_dataset_config(MESH_CONFIG_PATH)
+cell_cfg = load_cell_table_config(CELL_CONFIG_PATH)
+
+
+COORD_COLS = tuple(cell_cfg["coord_cols"])
+MARKER_COLS = list(cell_cfg["marker_cols"])
+LGR5_MARKER = cell_cfg["lgr5_marker"]
+COEXP_MARKERS = tuple(cell_cfg["coexp_markers"])
 
 
 # =============================================================================
@@ -132,42 +130,6 @@ def marker_postprocess(markers_bin, marker_names):
 def patches_to_ll(patches):
     """list[set[int]] -> list[list[int]] for npz saving."""
     return [sorted(list(p)) for p in (patches or [])]
-
-
-def load_mesh_crypt_segmentation(seg_path):
-    """
-    Load one mesh-based crypt segmentation .npz.
-
-    Expects at least:
-      - label_uid
-      - timepoint
-      - mesh_path
-      - crypts_ll
-    """
-    z = np.load(seg_path, allow_pickle=True)
-
-    if "crypts_ll" not in z:
-        raise KeyError(f"{seg_path} does not contain 'crypts_ll'")
-
-    label_uid = str(z["label_uid"]) if "label_uid" in z else None
-    timepoint = str(z["timepoint"]) if "timepoint" in z else None
-    mesh_path = str(z["mesh_path"]) if "mesh_path" in z else None
-
-    crypts_mesh = [set(map(int, p)) for p in z["crypts_ll"]]
-
-    out = {
-        "label_uid": label_uid,
-        "timepoint": timepoint,
-        "mesh_path": mesh_path,
-        "crypts_mesh": crypts_mesh,
-    }
-
-    # carry through optional fields if they exist
-    for k in ("bottom_vertex_ids", "L_crypts", "circumference_crypts", "d_discretized"):
-        if k in z:
-            out[k] = z[k]
-
-    return out
 
 
 def graph_path_for(tp, label_uid):
@@ -214,6 +176,8 @@ def build_graph_for_organoid(mesh_path, label_uid, extractor):
 # =============================================================================
 
 def main():
+    t_start = time.perf_counter()
+
     if not os.path.exists(CELLS_CSV):
         raise FileNotFoundError(f"CELLS_CSV not found: {CELLS_CSV}")
 
@@ -359,8 +323,10 @@ def main():
         if MAX_ORGANOIDS is not None and n_done >= int(MAX_ORGANOIDS):
             break
 
+    elapsed_s = time.perf_counter() - t_start
     if VERBOSE:
-        print(f"[graph-proj] done. processed={n_done}")
+        print(f"[graph-proj] done. processed={n_done} DRY_RUN={DRY_RUN} elapsed={elapsed_s:.2f}s ({elapsed_s/60.0:.2f} min)")
+
 
 
 if __name__ == "__main__":

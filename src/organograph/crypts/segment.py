@@ -10,6 +10,7 @@ from organograph.crypts.axis import (
     assign_features_by_distance
 )
 from organograph.crypts.filters import apply_filters, subset_per_crypt_vars
+from organograph.crypts.analysis import calc_crypt_constriction, calc_crypt_elongation
 
 def segment_crypts_organoid(
     mesh,                               # organoid surface mesh (mesh.v, mesh.f, mesh.vertex_areas())
@@ -27,8 +28,8 @@ def segment_crypts_organoid(
     # Neck search variables
     geodesic_fn=None,                   # callable to compute distances (e.g. compute_geodesics_dijkstra)
     geodesic_kwargs=None,               # kwargs forwarded to geodesic_fn
-    extend_max=2.5,                     # max normalized axis for neck search
-    disc_resolution=100,                # discretization of crypt axis for circumference calculation
+    extend_max=2.0,                     # max normalized axis for neck search
+    disc_resolution=200,                # discretization of crypt axis for circumference calculation
     remove_nested_features=True,        # removes crypts nested inside other crypts
     # Filters
     filter_fn_list=None,                # list of filter callables to apply
@@ -108,6 +109,10 @@ def segment_crypts_organoid(
         remove_nested_features=remove_nested_features,
     )
 
+    # --- Coompute some lightweight descriptors of crypt shape
+    constrictions = calc_crypt_constriction(d_discretized, CC_all)
+    elongations = calc_crypt_elongation(d_discretized, CC_all, L_crypt_all)
+
     # keep_idx_global always refers to rows of the current per-crypt arrays
     keep_idx_global = np.asarray(keep_idx_merge, dtype=np.int64)
 
@@ -129,6 +134,8 @@ def segment_crypts_organoid(
         dnorm_all=dnorm_all,
         L_crypt_all=L_crypt_all,
         CC_all=CC_all,
+        constrictions=constrictions,
+        elongations=elongations,
     )
 
     if not return_vars:
@@ -141,5 +148,7 @@ def segment_crypts_organoid(
         "circumference_crypts": aligned["CC_all"],
         "d_discretized": d_discretized,
         "keep_idx_final": keep_idx_global,
+        "crypt_constrictions": aligned["constrictions"],
+        "crypt_elongations": aligned["elongations"],
     })
     return crypts_extended, seg_vars

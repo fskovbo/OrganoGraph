@@ -80,7 +80,7 @@ from organograph.crypts.filters import filter_crypts_by_hks_percent, filter_cryp
 # CONFIG: paths + dataset layout (EDIT THESE)
 # =============================================================================
 
-DATASET         = "20250929"
+DATASET         = "20250929" # 20250929
 
 _SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT    = os.path.dirname(_SCRIPT_DIR)
@@ -89,25 +89,10 @@ MESH_DATA_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "fract
 SEG_DIR         = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_mesh")
 VOCAB_PATH      = os.path.join(PROJECT_ROOT, "sim", "vocab_with_meta.npz")
 MESH_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "mesh_config.json")
-BLACKLIST_PATH  = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "combined_labels_to_discard.npy")
+BLACKLIST_PATH  = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "blacklist_labels.csv")
 
 # Optional override. If None, use all timepoints from mesh_config.json
-TIMEPOINTS      = ['day3p5', 'day4', 'day4p5', 'day4p5-more']   
-
-ZARR_NAME_BY_TP = {tp: 'r0.zarr' for tp in TIMEPOINTS}
-ROUND_BY_TP     = {tp: '0_fused_zillum_registered' for tp in TIMEPOINTS}
-MESHNAME_BY_TP  = {tp: 'nnorg_linked_multi_annotated_class' for tp in TIMEPOINTS}
-
-WELLS_BY_TP = {
-    'day1p5': ['A01', 'A02', 'A03', 'A04', 'A05', 'A06'],
-    'day2': ['A01', 'A02', 'A03', 'A04', 'A05', 'A06'],
-    'day2p5': ['A01', 'A02', 'A03', 'A04', 'A05', 'A06'],
-    'day3': ['A01', 'A02', 'A03', 'A04', 'A05', 'A06', 'B02', 'B03'],
-    'day3p5': ['A01', 'A02', 'A03', 'A04', 'B03'],
-    'day4': ['A02', 'A03', 'A04', 'A05', 'A06', 'B01', 'B02'],
-    'day4p5': ['A06', 'B06'],
-    'day4p5-more': ['C01', 'C02', 'C03', 'C04', 'C05', 'C06'],
-}
+TIMEPOINTS      = ['day3p5'] # ['day3p5', 'day4', 'day4p5', 'day4p5-more']   
 
 
 OVERWRITE = True
@@ -121,8 +106,7 @@ DRY_RUN = False
 # =============================================================================
 
 mesh_cfg = load_mesh_dataset_config(MESH_CONFIG_PATH)
-ALL_TIMEPOINTS = list(mesh_cfg["timepoints"])
-TIMEPOINTS_TO_RUN = list(ALL_TIMEPOINTS if TIMEPOINTS is None else TIMEPOINTS)
+
 ZARR_NAME_BY_TP = mesh_cfg["zarr_name_by_tp"]
 ROUND_BY_TP = mesh_cfg["round_by_tp"]
 MESHNAME_BY_TP = mesh_cfg["meshname_by_tp"]
@@ -172,8 +156,8 @@ SEGMENT_KWARGS = dict(
     min_refined_frac_of_parent=0.05,
 
     # --- neck extension ---
-    extend_max=2.5,
-    disc_resolution=100,
+    extend_max=2.0,
+    disc_resolution=150,
     remove_nested_features=True,
 )
 
@@ -191,7 +175,6 @@ SAVE_SEG_VARS = [
     # "hks",
     # "normalised_hks",
     # "encoding",
-    "d_crypts",
     # "filter_info",
 ]
 
@@ -332,7 +315,7 @@ def main():
         }
 
         # Always store these key outputs if present
-        for k in ("bottom_vertex_ids", "L_crypts", "circumference_crypts", "d_discretized"):
+        for k in ("bottom_vertex_ids", "L_crypts", "d_crypts", "circumference_crypts", "d_discretized", "crypt_constrictions", "crypt_elongations"):
             if k in seg_vars:
                 save_dict[k] = seg_vars[k]
             else:

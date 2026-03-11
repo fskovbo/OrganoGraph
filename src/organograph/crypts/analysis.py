@@ -198,47 +198,151 @@ def field_stats_along_crypt(
     return mean, std, count
 
 
-def budding_index(
-    s,        # (B,) bin centers (or s-sampling)
-    C,        # (B,) circumference profile C(s)
+# ============================================================
+# Shape descriptors 
+# ============================================================
+
+def calc_crypt_constriction(
+    s,          # (B,) axis / bin centers
+    C,          # (K,B) circumference profiles, one row per crypt
     s_max=1.0,
     eps=1e-12,
 ):
     """
-    Compute budding index (BI) for a single crypt:
+    Compute crypt constriction for multiple crypts from circumference profiles.
 
-        BI = 1 - C(s=1) / max_{s<=1} C(s)
+    For each crypt k, this computes the same quantity as budding_index:
+
+        constriction_k = 1 - C_k(s=s_max) / max_{s<=s_max} C_k(s)
+
+    where C_k(s=s_max) is taken as the last valid value with s <= s_max.
+
+    Parameters
+    ----------
+    s : (B,) array_like
+        Axis / bin centers.
+    C : (K,B) array_like
+        Circumference profiles, one row per crypt.
+    s_max : float
+        Maximum axis value used for the calculation.
+    eps : float
+        Small number to avoid division by zero.
 
     Returns
     -------
-    BI : float in [0,1]
+    constriction : (K,) ndarray
+        Constriction / budding-like index for each crypt, clipped to [0,1].
 
     Notes
     -----
     - Uses only bins with s <= s_max and finite C.
-    - If s does not contain exactly 1.0, uses the last valid value
-      (same behavior as your current code).
-    - If profile is invalid, returns 0.
+    - If a crypt profile is invalid, its constriction is returned as 0.
     """
     s = np.asarray(s, dtype=float)
     C = np.asarray(C, dtype=float)
 
-    if s.ndim != 1 or C.ndim != 1 or len(s) != len(C):
-        raise ValueError("s and C must be 1D arrays of equal length.")
+    if s.ndim != 1:
+        raise ValueError("s must be a 1D array.")
+    if C.ndim != 2:
+        raise ValueError("C must be a 2D array with shape (K, B).")
+    if C.shape[1] != s.size:
+        raise ValueError(f"C must have shape (K, {s.size}), got {C.shape}.")
 
-    m = (s <= float(s_max)) & np.isfinite(C)
-    if np.sum(m) < 2:
-        return 0.0
+    K = C.shape[0]
+    out = np.zeros(K, dtype=float)
 
-    sC = s[m]
-    CC = C[m]
+    s_mask = (s <= float(s_max))
 
-    # circumference at s≈1 (use last valid bin ≤ s_max)
-    C1 = CC[-1]
-    Cmax = np.nanmax(CC)
+    for k in range(K):
+        Ck = C[k]
+        m = s_mask & np.isfinite(Ck)
 
-    if not (np.isfinite(C1) and np.isfinite(Cmax) and Cmax > eps):
-        return 0.0
+        if np.sum(m) < 2:
+            out[k] = 0.0
+            continue
 
-    BI = 1.0 - float(C1) / float(Cmax)
-    return float(np.clip(BI, 0.0, 1.0))
+        CC = Ck[m]
+
+        # circumference at s≈s_max: use last valid bin with s <= s_max
+        C_end = CC[-1]
+        C_max = np.nanmax(CC)
+
+        if not (np.isfinite(C_end) and np.isfinite(C_max) and C_max > eps):
+            out[k] = 0.0
+            continue
+
+        val = 1.0 - float(C_end) / float(C_max)
+        out[k] = float(np.clip(val, 0.0, 1.0))
+
+    return out
+
+
+def calc_crypt_elongation(
+    s,          # (B,) axis / bin centers
+    C,          # (K,B) circumference profiles
+    L,          # (K,) crypt lengths
+    s_max=1.0,
+    eps=1e-12,
+):
+    """
+    Compute crypt elongation = length / circumference for multiple crypts.
+
+    Parameters
+    ----------
+    s : (B,) array_like
+        Axis / bin centers.
+    C : (K,B) array_like
+        Circumference profiles, one row per crypt.
+    L : (K,) array_like
+        Crypt lengths.
+    s_max : float
+        Use only bins with s <= s_max when summarizing circumference.
+    eps : float
+        Small number to avoid division by zero.
+
+    Returns
+    -------
+    elongation : (K,) ndarray
+        Length-over-circumference value for each crypt.
+
+    Notes
+    -----
+    - Invalid profiles or nonpositive circumference summaries return 0.
+    - By default, uses the maximal circumference up to s_max.
+    """
+    s = np.asarray(s, dtype=float)
+    C = np.asarray(C, dtype=float)
+    L = np.asarray(L, dtype=float)
+
+    if s.ndim != 1:
+        raise ValueError("s must be a 1D array.")
+    if C.ndim != 2:
+        raise ValueError("C must be a 2D array with shape (K, B).")
+    if C.shape[1] != s.size:
+        raise ValueError(f"C must have shape (K, {s.size}), got {C.shape}.")
+    if L.ndim != 1 or L.size != C.shape[0]:
+        raise ValueError(f"L must have shape ({C.shape[0]},), got {L.shape}.")
+
+    K = C.shape[0]
+    out = np.zeros(K, dtype=float)
+
+    s_mask = (s <= float(s_max))
+
+    for k in range(K):
+        Ck = C[k]
+        m = s_mask & np.isfinite(Ck)
+
+        if np.sum(m) < 1 or not np.isfinite(L[k]):
+            out[k] = 0.0
+            continue
+
+        CC = Ck[m]
+        c_ref = float(CC[-1])
+
+        if not (np.isfinite(c_ref) and c_ref > eps):
+            out[k] = 0.0
+            continue
+
+        out[k] = float(L[k]) / c_ref
+
+    return out

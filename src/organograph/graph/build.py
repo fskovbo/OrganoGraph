@@ -128,35 +128,48 @@ def _build_graph_from_voronoi(
     proj_points,
 ):
     G = nx.Graph()
-    N_cells = len(nuclei_xyz)
 
-    # add nodes
-    for i in range(N_cells):
+    proj_vertex_ids = np.asarray(proj_vertex_ids, dtype=np.int64)
+    valid_cells = np.flatnonzero(proj_vertex_ids >= 0)
+
+    # Map original cell index -> contiguous graph node id
+    old_to_new = {int(old): int(new) for new, old in enumerate(valid_cells)}
+
+    # add only valid nodes
+    for new_i, old_i in enumerate(valid_cells):
         G.add_node(
-            i,
-            centroid=nuclei_xyz[i].tolist(),
-            markers_bin=markers_bin[i].tolist(),
-            proj_vertex=int(proj_vertex_ids[i]),
-            proj_point=(proj_points[i].tolist() if proj_points is not None else None),
+            new_i,
+            cell_index=int(old_i),   # original row / cell index
+            centroid=nuclei_xyz[old_i].tolist(),
+            markers_bin=markers_bin[old_i].tolist(),
+            proj_vertex=int(proj_vertex_ids[old_i]),
+            proj_point=(proj_points[old_i].tolist() if proj_points is not None else None),
         )
 
-    owners = vertex_owner
+    owners = np.asarray(vertex_owner)
     f = mesh.f
 
     # add edges from faces
     for tri in f:
         a, b, c = tri
-        ca, cb, cc = owners[a], owners[b], owners[c]
-        if ca < 0 or cb < 0 or cc < 0:
+        ca_old, cb_old, cc_old = owners[a], owners[b], owners[c]
+
+        if ca_old < 0 or cb_old < 0 or cc_old < 0:
+            continue
+
+        # map original cell ids -> graph node ids
+        try:
+            ca = old_to_new[int(ca_old)]
+            cb = old_to_new[int(cb_old)]
+            cc = old_to_new[int(cc_old)]
+        except KeyError:
+            # should not normally happen, but skip safely if it does
             continue
 
         for (ci, cj) in ((ca, cb), (cb, cc), (cc, ca)):
             if ci == cj:
                 continue
-            u = int(ci)
-            v = int(cj)
-            if u != v:
-                G.add_edge(u, v)
+            G.add_edge(int(ci), int(cj))
 
     return G
 

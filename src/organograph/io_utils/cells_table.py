@@ -8,26 +8,39 @@ def make_nuclei_extractor(
     label_col="label_uid",        # name of label_uid column (used if index not set)
     xyz_cols=("0.x_pos_pix", "0.y_pos_pix", "0.z_pos_pix_scaled"),
     marker_cols=None,             # list[str] of columns to extract as markers
+    marker_alias=None,            # optional list[str] returned instead of marker_cols
     marker_binarize_fn=None,      # callable(markers_raw)->markers_bin ; default: >0
     marker_postprocess_fn=None,   # callable(markers_bin, marker_names)->markers_bin
 ):
     """
     Build a callable extractor(label_uid) -> (nuclei_xyz_raw, markers_bin, marker_names).
 
-    Guarantees:
-      - nuclei_xyz are RAW coordinates from the table (no transforms here)
-      - fast lookup if cells_df is indexed by label_uid
-      - marker extraction is customizable and can include dataset-specific postprocessing
+    Guarantees
+    ----------
+    - nuclei_xyz are RAW coordinates from the table
+    - fast lookup if cells_df is indexed by label_uid
+    - marker extraction customizable
+    - marker_alias allows returning semantic names instead of dataframe column names
     """
+
     if marker_cols is None:
         marker_cols = []
     marker_cols = list(marker_cols)
+
+    if marker_alias is not None:
+        marker_alias = list(marker_alias)
+        if len(marker_alias) != len(marker_cols):
+            raise ValueError(
+                "marker_alias must have the same length as marker_cols"
+            )
+    else:
+        marker_alias = marker_cols
 
     if marker_binarize_fn is None:
         def marker_binarize_fn(x):
             return np.asarray(x) > 0.0
 
-    # --- validate columns once (fail early) ---
+    # --- validate columns once ---
     missing_xyz = [c for c in xyz_cols if c not in cells_df.columns]
     if missing_xyz:
         raise ValueError(f"Missing xyz_cols in cells_df: {missing_xyz}")
@@ -42,15 +55,14 @@ def make_nuclei_extractor(
     def _get_rows(label_uid):
         if use_index:
             df_org = cells_df.loc[label_uid]
-            # normalize Series -> DataFrame
             if not hasattr(df_org, "columns"):
                 df_org = df_org.to_frame().T
             return df_org
-        # fallback: boolean mask (slower)
         return cells_df[cells_df[label_col] == label_uid]
 
     def extract(label_uid):
         df_org = _get_rows(label_uid)
+
         if df_org is None or len(df_org) == 0:
             raise ValueError(f"No nuclei rows found for label_uid={label_uid}")
 
@@ -58,18 +70,20 @@ def make_nuclei_extractor(
 
         if marker_cols:
             markers_raw = df_org.loc[:, marker_cols].to_numpy(copy=False)
+
             markers_bin = np.asarray(marker_binarize_fn(markers_raw), dtype=np.int8)
+
             if markers_bin.shape[0] != nuclei_xyz.shape[0]:
                 raise ValueError("marker_binarize_fn returned wrong N (rows)")
 
             if marker_postprocess_fn is not None:
-                markers_bin = marker_postprocess_fn(markers_bin, marker_cols)
+                markers_bin = marker_postprocess_fn(markers_bin, marker_alias)
                 markers_bin = np.asarray(markers_bin, dtype=np.int8)
 
         else:
             markers_bin = np.zeros((nuclei_xyz.shape[0], 0), dtype=np.int8)
 
-        return nuclei_xyz, markers_bin, marker_cols
+        return nuclei_xyz, markers_bin, marker_alias
 
     return extract
 

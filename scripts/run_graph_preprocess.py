@@ -47,7 +47,7 @@ from organograph.crypts.vocab import compute_vocabulary_encoding
 # DATASET CONFIG
 # =============================================================================
 
-DATASET         = "20251201" # "20250929"
+DATASET         = "20250929" # "20251201"
 
 # Absolute path to this script file
 _SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
@@ -56,20 +56,22 @@ _SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT    = os.path.dirname(_SCRIPT_DIR)
 
 MESH_DATA_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "fractal_output")
-CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_features_class.csv") # cell_types_class
+CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_types_class.csv") # cell_types_class # cell_features_class
 OUT_GRAPHS_DIR  = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "graphs_preprocessed")
 
 MESH_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "mesh_config.json")
 CELL_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_table_config.json")
-BLACKLIST_PATH  = None # os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "combined_labels_to_discard.npy")
+BLACKLIST_PATH  = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "blacklist_labels.csv")
 
 
-# Optional override. If None, use all timepoints from mesh_config.json
-timepoints = ['day4p5'] # ['day3p5', 'day4', 'day4p5', 'day4p5-more']   
+# Optional override. 
+timepoints = ['day3p5'] # ['day3p5', 'day4', 'day4p5', 'day4p5-more']   
 
 
+MAX_PROJ_DIST = 2.0  # max accepted distance between nuclei and membrane for projection. If None, use all distances
+
+INCLUDE_HKS = False
 HKS_TIMES = [1.0, 2.0, 4.0, 8.0, 25.0]
-MAX_PROJ_DIST = 2.5  # max accepted distance between nuclei and membrane for projection. If None, use all distances
 
 
 VOCAB_PATH = "./sim/vocab_with_meta.npz"
@@ -77,7 +79,7 @@ VOCAB_PATH = "./sim/vocab_with_meta.npz"
 REQUIRED_VOCAB_KEYS = []
 
 # Dev/UX options
-OVERWRITE = False
+OVERWRITE = True
 VERBOSE = True
 DRY_RUN = False       # If True: do not load meshes, do not write outputs; just print what would happen
 MAX_MESHES = None     # e.g. 10 for quick testing; None means no limit
@@ -98,8 +100,10 @@ wells       = mesh_cfg["wells_by_tp"]
 cell_cfg    = load_cell_table_config(CELL_CONFIG_PATH)
 COORD_COLS  = tuple(cell_cfg["coord_cols"])
 MARKER_COLS = list(cell_cfg["marker_cols"])
+MARKER_ALIAS = list(cell_cfg["marker_names"])
 LGR5_MARKER = cell_cfg["lgr5_marker"]
 COEXP_MARKERS = tuple(cell_cfg["coexp_markers"])
+
 
 # =============================================================================
 # MARKER POSTPROCESS
@@ -166,6 +170,7 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist_path=None)
         label_col="label_uid",
         xyz_cols=COORD_COLS,
         marker_cols=MARKER_COLS,
+        marker_alias=MARKER_ALIAS,
         marker_postprocess_fn=marker_postprocess,
     )
 
@@ -264,27 +269,28 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist_path=None)
                 print(f"[{tp}] graph build failed for {label_uid}: {e}")
             continue
 
-        # --- compute + attach HKS (required) ---
-        try:
-            mesh._eig_decomp()  # Laplace eigenpairs (required for HKS)
-            hks = compute_hks(mesh, t=HKS_TIMES, coeffs=False)  # (V, T)
-            add_vertex_field_to_graph(G, hks, "hks")
-            G.graph["hks_times"] = np.asarray(HKS_TIMES, float)
-        except Exception as e:
-            if verbose:
-                print(f"[{tp}] HKS failed for {label_uid}: {e}")
-            # Requirement: do not save graphs without HKS
-            continue
+        # --- compute + attach HKS (optional) ---
+        if INCLUDE_HKS:
+            try:
+                mesh._eig_decomp()  # Laplace eigenpairs (required for HKS)
+                hks = compute_hks(mesh, t=HKS_TIMES, coeffs=False)  # (V, T)
+                add_vertex_field_to_graph(G, hks, "hks")
+                G.graph["hks_times"] = np.asarray(HKS_TIMES, float)
+            except Exception as e:
+                if verbose:
+                    print(f"[{tp}] HKS failed for {label_uid}: {e}")
+                # Requirement: do not save graphs without HKS
+                continue
 
-        # --- compute + attach vocab encoding ---
-        try:
-            encoding = compute_vocabulary_encoding(vocab, mesh)[0]
-            add_vertex_field_to_graph(G, encoding, "vocab_encoding")
-            G.graph["vocab_path"] = VOCAB_PATH
-        except Exception as e:
-            if verbose:
-                print(f"[{tp}] vocab encoding failed for {label_uid}: {e}")
-            # Keep going: you may still want graphs with HKS only
+            # --- compute + attach vocab encoding ---
+            try:
+                encoding = compute_vocabulary_encoding(vocab, mesh)[0]
+                add_vertex_field_to_graph(G, encoding, "vocab_encoding")
+                G.graph["vocab_path"] = VOCAB_PATH
+            except Exception as e:
+                if verbose:
+                    print(f"[{tp}] vocab encoding failed for {label_uid}: {e}")
+                # Keep going: you may still want graphs with HKS only
 
         # --- save graph + index ---
         save_cell_graph(out_path, G)

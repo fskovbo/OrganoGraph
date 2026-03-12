@@ -69,12 +69,16 @@ import time
 import numpy as np
 
 from organograph.mesh.OrganoidMesh import OrganoidMesh
+from organograph.mesh.hks import compute_hks
+from organograph.mesh.curvature import compute_gaussian_curvature
+
 from organograph.io_utils.path_parsing import discover_mesh_paths, parse_mesh_path
 from organograph.io_utils.blacklist import load_blacklist
 from organograph.io_utils.dataset_config import load_mesh_dataset_config
 
 from organograph.crypts.segment import segment_crypts_organoid
 from organograph.crypts.filters import filter_crypts_by_hks_percent, filter_crypts_by_size
+
 
 # =============================================================================
 # CONFIG: paths + dataset layout (EDIT THESE)
@@ -92,7 +96,7 @@ MESH_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "mesh_
 BLACKLIST_PATH  = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "blacklist_labels.csv")
 
 # Optional override. If None, use all timepoints from mesh_config.json
-TIMEPOINTS      = ['day3p5'] # ['day3p5', 'day4', 'day4p5', 'day4p5-more']   
+TIMEPOINTS      = ['day3p5', 'day4', 'day4p5', 'day4p5-more']   
 
 
 OVERWRITE = True
@@ -137,6 +141,9 @@ FILTERS = [
     ),
 ]
 
+CALC_GAUSSIAN_CURV = True # if True, compute and store Gaussian curvature field for full organoid
+TAU_GAUSSIAN_CURV = None # optional dimensionless timescales used for computing Gaussian curvature
+
 # =============================================================================
 # Segmentation parameters (ALL user-tunable args live here)
 # =============================================================================
@@ -172,8 +179,8 @@ SEGMENT_KWARGS = dict(
 SAVE_SEG_VARS = [
     # "ts_mesh",
     # "ts_vocab",
-    # "hks",
-    # "normalised_hks",
+    # "hks_segment",
+    # "normalised_hks_segment",
     # "encoding",
     # "filter_info",
 ]
@@ -328,6 +335,11 @@ def main():
                 continue  # already stored above
             if k in seg_vars:
                 save_dict[k] = seg_vars[k]
+
+        # --- optional computations ---
+        if CALC_GAUSSIAN_CURV:
+            curvature_gauss = compute_gaussian_curvature(mesh, TAU_GAUSSIAN_CURV)
+            save_dict["curvature_gauss"] = curvature_gauss
 
         np.savez_compressed(out_path, **save_dict)
 

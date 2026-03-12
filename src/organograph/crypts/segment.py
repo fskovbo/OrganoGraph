@@ -58,8 +58,8 @@ def segment_crypts_organoid(
     seg_vars["encoding"] = enc_vars["encoding"]
     seg_vars["ts_mesh"] = enc_vars["ts_mesh"]
     seg_vars["ts_vocab"] = enc_vars["ts_vocab"]
-    seg_vars["hks"] = enc_vars["hks"]
-    seg_vars["normalised_hks"] = enc_vars["norm_hks"]
+    seg_vars["hks_segment"] = enc_vars["hks"]
+    seg_vars["normalised_hks_segment"] = enc_vars["norm_hks"]
 
     # --- Filters after detection ---
     crypts, filt_info_initial, _keep_idx_initial = apply_filters(

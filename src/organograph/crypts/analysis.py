@@ -57,42 +57,6 @@ def crypt_circumference(
     return C
 
 
-# ============================================================
-# Marker binning
-# ============================================================
-
-def bin_marker_positivity(
-    markers,   # (N_cells, M) array, marker positivity per cell
-    distance,  # (N_cells,) array, distance coordinate per cell
-    bin_edges, # (B+1,) array, bin edges
-):
-    """
-    Bin marker positivity vs distance.
-
-    Output
-    ------
-    counts_pos : (M, B) array
-    counts_total : (B,) array
-    """
-    markers = np.asarray(markers)
-    distance = np.asarray(distance)
-    bin_edges = np.asarray(bin_edges)
-
-    N, M = markers.shape
-    B = len(bin_edges) - 1
-    bin_ids = np.digitize(distance, bin_edges) - 1
-
-    counts_pos = np.zeros((M, B), dtype=int)
-    counts_total = np.zeros(B, dtype=int)
-
-    for b in range(B):
-        mask = (bin_ids == b)
-        if np.any(mask):
-            counts_total[b] = mask.sum()
-            counts_pos[:, b] = markers[mask].astype(bool).sum(axis=0)
-
-    return counts_pos, counts_total
-
 
 def field_stats_along_crypt(
     mesh_field,        # (V,) field on mesh vertices

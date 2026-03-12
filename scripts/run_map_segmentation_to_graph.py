@@ -81,7 +81,7 @@ CELL_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_
 # OPTIONAL FILTERING / BEHAVIOR
 # =============================================================================
 
-TIMEPOINTS = ['day3p5']   # or None for all timepoints found under SEG_MESH_DIR
+TIMEPOINTS = ['day3p5', 'day4', 'day4p5', 'day4p5-more']   # or None for all timepoints found under SEG_MESH_DIR
 
 OVERWRITE = True
 VERBOSE = True
@@ -460,8 +460,8 @@ def main():
             "crypts_ll": np.array(patches_to_ll(graph_patches), dtype=object),
             "d_crypts_graph": d_crypts_graph,
             "n_crypts": int(len(graph_patches)),
-            # "keep_idx_graph": np.asarray(keep_idx_graph, dtype=np.int64),
-            # "mesh_to_graph_index": remap_mesh_to_graph_index(info["mesh_to_graph_index"], keep_idx_graph,),
+            "keep_idx_graph": np.asarray(keep_idx_graph, dtype=np.int64),
+            "mesh_to_graph_index": remap_mesh_to_graph_index(info["mesh_to_graph_index"], keep_idx_graph,),
             "graph_patch_sizes": graph_patch_sizes,
             "mesh_patch_sizes": np.asarray(info["mesh_patch_sizes"], dtype=np.int64),
         }

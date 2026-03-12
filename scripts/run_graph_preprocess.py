@@ -65,18 +65,11 @@ BLACKLIST_PATH  = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "black
 
 
 # Optional override. 
-timepoints = ['day3p5'] # ['day3p5', 'day4', 'day4p5', 'day4p5-more']   
+timepoints = ['day3p5', 'day4', 'day4p5', 'day4p5-more']   
 
 
 MAX_PROJ_DIST = 2.0  # max accepted distance between nuclei and membrane for projection. If None, use all distances
 
-INCLUDE_HKS = False
-HKS_TIMES = [1.0, 2.0, 4.0, 8.0, 25.0]
-
-
-VOCAB_PATH = "./sim/vocab_with_meta.npz"
-# If you know specific arrays that MUST be present in vocab.npz, list them here.
-REQUIRED_VOCAB_KEYS = []
 
 # Dev/UX options
 OVERWRITE = True
@@ -120,23 +113,6 @@ def marker_postprocess(markers_bin, marker_names):
     )
 
 
-def validate_vocab_npz(vocab):
-    # Basic sanity checks to fail early with a helpful message
-    files = getattr(vocab, "files", None)
-    if files is None or len(files) == 0:
-        raise ValueError(
-            f"Vocab file '{VOCAB_PATH}' loaded, but contained no arrays. "
-            "Expected an .npz with at least one array."
-        )
-
-    missing = [k for k in REQUIRED_VOCAB_KEYS if k not in files]
-    if missing:
-        raise ValueError(
-            f"Vocab file '{VOCAB_PATH}' is missing required keys: {missing}. "
-            f"Available keys: {list(files)}"
-        )
-
-
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -173,13 +149,6 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist_path=None)
         marker_alias=MARKER_ALIAS,
         marker_postprocess_fn=marker_postprocess,
     )
-
-    # --- load + validate vocab once ---
-    if not os.path.exists(VOCAB_PATH):
-        raise FileNotFoundError(f"VOCAB_PATH not found: {VOCAB_PATH}")
-
-    vocab = np.load(VOCAB_PATH, allow_pickle=True)
-    validate_vocab_npz(vocab)
 
     # --- discover mesh paths (restrictive glob based on config) ---
     mesh_paths = discover_mesh_paths(
@@ -269,29 +238,6 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist_path=None)
                 print(f"[{tp}] graph build failed for {label_uid}: {e}")
             continue
 
-        # --- compute + attach HKS (optional) ---
-        if INCLUDE_HKS:
-            try:
-                mesh._eig_decomp()  # Laplace eigenpairs (required for HKS)
-                hks = compute_hks(mesh, t=HKS_TIMES, coeffs=False)  # (V, T)
-                add_vertex_field_to_graph(G, hks, "hks")
-                G.graph["hks_times"] = np.asarray(HKS_TIMES, float)
-            except Exception as e:
-                if verbose:
-                    print(f"[{tp}] HKS failed for {label_uid}: {e}")
-                # Requirement: do not save graphs without HKS
-                continue
-
-            # --- compute + attach vocab encoding ---
-            try:
-                encoding = compute_vocabulary_encoding(vocab, mesh)[0]
-                add_vertex_field_to_graph(G, encoding, "vocab_encoding")
-                G.graph["vocab_path"] = VOCAB_PATH
-            except Exception as e:
-                if verbose:
-                    print(f"[{tp}] vocab encoding failed for {label_uid}: {e}")
-                # Keep going: you may still want graphs with HKS only
-
         # --- save graph + index ---
         save_cell_graph(out_path, G)
         index_rows.setdefault(tp, []).append(
@@ -302,9 +248,7 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist_path=None)
                 "graph_path": out_path,
                 "N_cells": int(G.number_of_nodes()),
                 "N_edges": int(G.number_of_edges()),
-                "has_hks": True,
                 "max_proj_dist": MAX_PROJ_DIST,
-                "has_vocab_encoding": ("vocab_encoding" in next(iter(G.nodes(data=True)))[1]) if G.number_of_nodes() > 0 else False,
             }
         )
 

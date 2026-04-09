@@ -84,19 +84,22 @@ from organograph.crypts.filters import filter_crypts_by_hks_percent, filter_cryp
 # CONFIG: paths + dataset layout (EDIT THESE)
 # =============================================================================
 
-DATASET         = "20250929" # 20250929
+DATASET         = "20250929" # 20250929 20251201
 
 _SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT    = os.path.dirname(_SCRIPT_DIR)
 
 MESH_DATA_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "fractal_output")
-SEG_DIR         = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_mesh")
+SEG_DIR         = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_mesh_3p5selected")
 VOCAB_PATH      = os.path.join(PROJECT_ROOT, "sim", "vocab_with_meta.npz")
 MESH_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "mesh_config.json")
-BLACKLIST_PATH  = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "blacklist_labels.csv")
+
+BLACKLIST_PATH  = None # os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "blacklist_labels.csv")
+WHITELIST_PATH  = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "day3p5_goodmeshes.csv")
+
 
 # Optional override. If None, use all timepoints from mesh_config.json
-TIMEPOINTS      = ['day3p5', 'day4', 'day4p5', 'day4p5-more']   
+TIMEPOINTS      = ['day3p5']   
 
 
 OVERWRITE = True
@@ -129,7 +132,7 @@ GEODESIC_KWARGS = None  # or dict(...)
 FILTERS = [
     lambda patches, **kw: filter_crypts_by_hks_percent(
         patches,
-        min_percent_greater=3.0,
+        min_percent_greater=4.0, # 1.5, 3.0
         t_max=10,
         **kw
     ),
@@ -157,13 +160,13 @@ SEGMENT_KWARGS = dict(
     threshold=0.5,
 
     # --- refinement ---
-    refine_crypts=True,
+    refine_crypts=False, # True
     refine_threshold=0.0,
     refine_only_if_area_at_least=5.0,
     min_refined_frac_of_parent=0.05,
 
     # --- neck extension ---
-    extend_max=2.0,
+    extend_max=1.5, # 2.0
     disc_resolution=150,
     remove_nested_features=True,
 )
@@ -214,8 +217,12 @@ def main():
     vocab = np.load(VOCAB_PATH, allow_pickle=True)
 
     blacklist = load_blacklist(BLACKLIST_PATH) if BLACKLIST_PATH else set()
+    whitelist = load_blacklist(WHITELIST_PATH) if WHITELIST_PATH else None
+
     if VERBOSE and blacklist:
         print(f"[mesh-seg] loaded blacklist with {len(blacklist)} entries")
+    if VERBOSE and whitelist is not None:
+        print(f"[mesh-seg] loaded whitelist with {len(whitelist)} entries")
 
     # discover mesh files
     timepoints = list(TIMEPOINTS)
@@ -246,13 +253,20 @@ def main():
 
         tp = rec.get("timepoint", None)
         label_uid = rec.get("label_uid", None)
+
+        if not tp or not label_uid:
+            if VERBOSE:
+                print(f"[skip] missing timepoint/label_uid for: {mesh_path}")
+            continue
+
         if label_uid in blacklist:
             if VERBOSE:
                 print(f"[skip] {label_uid} is blacklisted")
             continue
-        if not tp or not label_uid:
+
+        if whitelist is not None and label_uid not in whitelist:
             if VERBOSE:
-                print(f"[skip] missing timepoint/label_uid for: {mesh_path}")
+                print(f"[skip] {label_uid} not in whitelist")
             continue
 
         out_dir = os.path.join(SEG_DIR, tp)

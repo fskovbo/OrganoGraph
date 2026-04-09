@@ -25,3 +25,7 @@ Thumbs.db
 
 # Legacy code
 legacy/
+
+# Personal
+scripts_dev/
+notebooks_dev/

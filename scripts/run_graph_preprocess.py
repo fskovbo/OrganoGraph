@@ -32,7 +32,7 @@ from tqdm import tqdm
 import organograph
 from organograph.mesh.OrganoidMesh import OrganoidMesh
 
-from organograph.io_utils.cells_table import prepare_cells_table, make_nuclei_extractor, suppress_marker_if_coexpressed
+from organograph.io_utils.cells_table import prepare_cells_table, make_nuclei_extractor, suppress_marker_if_coexpressed, enforce_marker_exclusivity, harmonize_markers
 from organograph.io_utils.path_parsing import parse_mesh_path, discover_mesh_paths
 from organograph.io_utils.dataset_config import load_mesh_dataset_config, load_cell_table_config
 from organograph.io_utils.blacklist import load_blacklist
@@ -47,7 +47,7 @@ from organograph.crypts.vocab import compute_vocabulary_encoding
 # DATASET CONFIG
 # =============================================================================
 
-DATASET         = "20250929" # "20251201"
+DATASET         = "20251201" # "20251201" 20250929
 
 # Absolute path to this script file
 _SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
@@ -56,16 +56,16 @@ _SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT    = os.path.dirname(_SCRIPT_DIR)
 
 MESH_DATA_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "fractal_output")
-CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_types_class.csv") # cell_types_class # cell_features_class
-OUT_GRAPHS_DIR  = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "graphs_preprocessed")
+CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_features_class.csv") # cell_types_class # cell_features_class
+OUT_GRAPHS_DIR  = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "graphs_preprocessed_exclusive")
 
 MESH_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "mesh_config.json")
 CELL_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_table_config.json")
-BLACKLIST_PATH  = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "blacklist_labels.csv")
+BLACKLIST_PATH  = None # os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "blacklist_labels.csv")
 
 
 # Optional override. 
-timepoints = ['day3p5', 'day4', 'day4p5', 'day4p5-more']   
+timepoints = ['day4p5'] # ['day3p5', 'day4', 'day4p5', 'day4p5-more']   
 
 
 MAX_PROJ_DIST = 2.0  # max accepted distance between nuclei and membrane for projection. If None, use all distances
@@ -94,23 +94,62 @@ cell_cfg    = load_cell_table_config(CELL_CONFIG_PATH)
 COORD_COLS  = tuple(cell_cfg["coord_cols"])
 MARKER_COLS = list(cell_cfg["marker_cols"])
 MARKER_ALIAS = list(cell_cfg["marker_names"])
-LGR5_MARKER = cell_cfg["lgr5_marker"]
-COEXP_MARKERS = tuple(cell_cfg["coexp_markers"])
+# LGR5_MARKER = cell_cfg["lgr5_marker"]
+# COEXP_MARKERS = tuple(cell_cfg["coexp_markers"])
+
+
+EXCLUSIVITY_RULES = {
+    "LGR5":     ["Chroma", "Mucin 2", "AldoB", "Glucagon", "Agr2", "Serotonin", "Lysozyme"],
+    "Chroma":   ["Mucin 2", "Glucagon", "Serotonin", "Lysozyme"],
+    "Mucin 2":  ["Chroma", "Glucagon", "Serotonin", "Lysozyme"],
+    "AldoB":    ["Chroma", "Mucin 2", "Glucagon", "Agr2", "Serotonin", "Lysozyme"],
+    "Glucagon": ["Serotonin"],
+    "Agr2":     ["Chroma", "Mucin 2", "Glucagon", "Serotonin", "Lysozyme"],
+    "Serotonin":[],
+    "Lysozyme": ["Chroma", "Glucagon", "Serotonin"],
+    "Cyclin D": ["LGR5", "Chroma", "Mucin 2", "AldoB", "Glucagon", "Agr2", "Serotonin", "Lysozyme"],
+    "Cyclin A": ["LGR5", "Chroma", "Mucin 2", "AldoB", "Glucagon", "Agr2", "Serotonin", "Lysozyme"],
+    "KI67":     ["LGR5", "Chroma", "Mucin 2", "AldoB", "Glucagon", "Agr2", "Serotonin", "Lysozyme"],
+}
+
+HARMONIZATION_RULES = {
+    "TA": ["Cyclin A", "Cyclin D", "KI67"],
+}
 
 
 # =============================================================================
 # MARKER POSTPROCESS
 # =============================================================================
 
+# def marker_postprocess(markers_bin, marker_names):
+#     return suppress_marker_if_coexpressed(
+#         markers_bin,
+#         marker_names,
+#         exclusive_marker=LGR5_MARKER,
+#         forbidden_markers=COEXP_MARKERS,
+#         copy=True,
+#         ignore_missing=True,
+#     )
+
 def marker_postprocess(markers_bin, marker_names):
-    return suppress_marker_if_coexpressed(
+    # Step 1: enforce exclusivity on the original marker space
+    markers_bin = enforce_marker_exclusivity(
         markers_bin,
         marker_names,
-        exclusive_marker=LGR5_MARKER,
-        forbidden_markers=COEXP_MARKERS,
+        exclusivity_rules=EXCLUSIVITY_RULES,
         copy=True,
         ignore_missing=True,
     )
+
+    # Step 2: harmonize markers (this may change both matrix and names)
+    markers_bin, marker_names = harmonize_markers(
+        markers_bin,
+        marker_names,
+        marker_rules=HARMONIZATION_RULES,
+        keep_unmapped=True,
+    )
+
+    return markers_bin, marker_names
 
 
 # =============================================================================

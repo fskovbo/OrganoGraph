@@ -54,22 +54,22 @@ from organograph.graph.access import graph_get
 # DATASET PATHS (EDIT THESE)
 # =============================================================================
 
-DATASET         = "20250929" # "20251201" 
+DATASET         = "20250929" # "20251201"  20250929
 
 _SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT    = os.path.dirname(_SCRIPT_DIR)
 
 # Input: mesh-based segmentation results
-SEG_MESH_DIR    = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_mesh")
+SEG_MESH_DIR    = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_mesh_3p5selected")
 
 # Input: nuclei/cell table used to build graphs if needed
 CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_types_class.csv") # cell_types_class # cell_features_class
 
 # Optional existing graph directory; if graph missing here, it will be built on the fly
-GRAPHS_DIR      = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "graphs_preprocessed")
+GRAPHS_DIR      = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "graphs_preprocessed_exclusive")
 
 # Output: graph-based crypt projections
-GRAPH_SEG_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_graph")
+GRAPH_SEG_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_graph_3p5selected")
 
 # config files with data structure
 MESH_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "mesh_config.json")
@@ -81,7 +81,7 @@ CELL_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_
 # OPTIONAL FILTERING / BEHAVIOR
 # =============================================================================
 
-TIMEPOINTS = ['day3p5', 'day4', 'day4p5', 'day4p5-more']   # or None for all timepoints found under SEG_MESH_DIR
+TIMEPOINTS = ['day3p5'] # ['day3p5', 'day4', 'day4p5', 'day4p5-more']   # or None for all timepoints found under SEG_MESH_DIR
 
 OVERWRITE = True
 VERBOSE = True
@@ -277,19 +277,37 @@ def build_graph_for_organoid(mesh_path, label_uid, extractor):
     return G
 
 
-def project_d_crypts_to_graph(G, d_crypts_mesh, *, proj_field="proj_vertex"):
+def project_mesh_field_to_graph(G, field_mesh, *, proj_field="proj_vertex"):
     """
-    Project per-crypt mesh distances to graph nodes via each node's projected mesh vertex.
+    Project a mesh-based field to graph nodes via each node's projected mesh vertex.
+
+    Parameters
+    ----------
+    G
+        Cell graph whose nodes contain a mesh vertex index in `proj_field`.
+    field_mesh : array_like
+        Mesh-based field to project. Supported shapes:
+          - (V_mesh,)      : one value per mesh vertex
+          - (K, V_mesh)    : K values per mesh vertex (e.g. one row per crypt)
+    proj_field : str
+        Node attribute containing the projected mesh vertex index.
 
     Returns
     -------
-    d_crypts_graph : ndarray, shape (K, N_nodes)
-        Per-crypt distances evaluated at each graph node's projected mesh vertex.
+    field_graph : ndarray
+        Graph-level field evaluated at each node's projected mesh vertex.
+        Shapes:
+          - (N_nodes,)      if input shape is (V_mesh,)
+          - (K, N_nodes)    if input shape is (K, V_mesh)
+
         Nodes with invalid proj_vertex get NaN.
     """
-    D = np.asarray(d_crypts_mesh, dtype=float)
-    if D.ndim != 2:
-        raise ValueError(f"d_crypts_mesh must have shape (K, V_mesh), got {D.shape}")
+    F = np.asarray(field_mesh)
+
+    if F.ndim not in (1, 2):
+        raise ValueError(
+            f"field_mesh must have shape (V_mesh,) or (K, V_mesh), got {F.shape}"
+        )
 
     n_nodes = G.number_of_nodes()
     if n_nodes == 0:
@@ -299,12 +317,19 @@ def project_d_crypts_to_graph(G, d_crypts_mesh, *, proj_field="proj_vertex"):
     if proj_vertex.ndim != 1 or proj_vertex.size != n_nodes:
         raise ValueError("proj_vertex must be a 1D array of length N_nodes")
 
-    valid = (proj_vertex >= 0) & (proj_vertex < D.shape[1])
+    V_mesh = F.shape[-1]
+    valid = (proj_vertex >= 0) & (proj_vertex < V_mesh)
 
-    out = np.full((D.shape[0], n_nodes), np.nan, dtype=float)
+    if F.ndim == 1:
+        out = np.full(n_nodes, np.nan, dtype=float)
+        if np.any(valid):
+            out[valid] = F[proj_vertex[valid]]
+        return out
+
+    # F.ndim == 2
+    out = np.full((F.shape[0], n_nodes), np.nan, dtype=float)
     if np.any(valid):
-        out[:, valid] = D[:, proj_vertex[valid]]
-
+        out[:, valid] = F[:, proj_vertex[valid]]
     return out
 
 
@@ -444,9 +469,18 @@ def main():
 
         # project per-crypt mesh distance fields to graph nodes
         if "d_crypts" in seg:
-            d_crypts_graph = project_d_crypts_to_graph(G, seg["d_crypts"], proj_field="proj_vertex")
+            d_crypts_graph = project_mesh_field_to_graph(G, seg["d_crypts"], proj_field="proj_vertex")
         else:
             d_crypts_graph = None
+            if VERBOSE:
+                print(f"[warn] 'd_crypts' not in segmentation {seg_path}")
+
+        if "curvature_gauss" in seg:
+            curvature_gauss_graph = project_mesh_field_to_graph(G, seg["curvature_gauss"], proj_field="proj_vertex")
+        else:
+            curvature_gauss_graph = None
+            if VERBOSE:
+                print(f"[warn] 'curvature_gauss' not in segmentation {seg_path}")
         
         # recompute graph patch sizes after filtering
         graph_patch_sizes = np.array([len(p) for p in graph_patches], dtype=np.int64)
@@ -459,6 +493,7 @@ def main():
             "graph_path": str(gpath),
             "crypts_ll": np.array(patches_to_ll(graph_patches), dtype=object),
             "d_crypts_graph": d_crypts_graph,
+            "curvature_gauss_graph": curvature_gauss_graph,
             "n_crypts": int(len(graph_patches)),
             "keep_idx_graph": np.asarray(keep_idx_graph, dtype=np.int64),
             "mesh_to_graph_index": remap_mesh_to_graph_index(info["mesh_to_graph_index"], keep_idx_graph,),

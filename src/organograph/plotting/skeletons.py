@@ -8,6 +8,7 @@ import numpy as np
 NODE_COLORS = {
     "body": "#4c78a8",
     "neck": "#f58518",
+    "crypt": "#72b7b2",
     "bend": "#54a24b",
     "branch": "#b279a2",
     "tip": "#e45756",
@@ -15,10 +16,14 @@ NODE_COLORS = {
 
 EDGE_COLORS = {
     "body_to_neck": "#7f7f7f",
+    "neck_to_crypt": "#222222",
+    "crypt_to_tip": "#222222",
     "neck_to_tip": "#222222",
     "neck_to_bend": "#222222",
+    "bend_to_crypt": "#222222",
     "bend_to_tip": "#222222",
     "neck_to_branch": "#222222",
+    "branch_to_neck": "#222222",
     "branch_to_tip": "#222222",
     "skeleton": "#222222",
 }
@@ -90,6 +95,7 @@ def plot_skeleton_3d(
     node_size=40,
     edge_width=2.0,
     fig_size=(7, 6),
+    camera_eye=None,
 ):
     """Plot straight skeleton edges and typed nodes in 3D."""
     backend = str(backend).lower()
@@ -115,6 +121,9 @@ def plot_skeleton_3d(
                 aspectmode="data",
             )
         )
+        if camera_eye is None:
+            camera_eye = dict(x=1.05, y=1.05, z=0.75)
+        fig.update_layout(scene_camera=dict(eye=camera_eye))
         return fig
 
     import matplotlib.pyplot as plt
@@ -229,6 +238,7 @@ def plot_mesh_with_skeleton(
     node_size=10,
     edge_width=2.5,
     fig_size=(7, 6),
+    camera_eye=None,
 ):
     """Overlay a skeleton on a mesh."""
     backend = str(backend).lower()
@@ -268,6 +278,9 @@ def plot_mesh_with_skeleton(
                 aspectmode="data",
             )
         )
+        if camera_eye is None:
+            camera_eye = dict(x=1.05, y=1.05, z=0.75)
+        fig.update_layout(scene_camera=dict(eye=camera_eye))
         return fig
 
     if backend != "mpl3d":

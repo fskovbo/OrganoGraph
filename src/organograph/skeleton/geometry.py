@@ -106,6 +106,11 @@ def estimate_bend_position(
         return None
     if strategy == "midpoint":
         return chord_midpoint(neck_position, tip_position)
+    if strategy == "crypt_centroid":
+        idx = as_vertex_indices(crypt_vertices)
+        if idx.size:
+            return centroid(as_points(vertices)[idx])
+        return chord_midpoint(neck_position, tip_position)
     if strategy == "crypt_centroid_midsection":
         bend = crypt_centroid_midsection(
             vertices,
@@ -118,7 +123,7 @@ def estimate_bend_position(
         return chord_midpoint(neck_position, tip_position)
     raise ValueError(
         "bend_strategy must be one of 'none', 'midpoint', "
-        "or 'crypt_centroid_midsection'"
+        "'crypt_centroid', or 'crypt_centroid_midsection'"
     )
 
 
@@ -190,12 +195,31 @@ def _neck_nodes(graph: SkeletonGraph, crypt_id) -> list[SkeletonNode]:
     return graph.nodes_for_crypt(crypt_id, node_type="neck")
 
 
+def _root_neck_nodes(graph: SkeletonGraph, crypt_id) -> list[SkeletonNode]:
+    """Neck nodes with no same-crypt non-body parent.
+
+    Split crypts can contain daughter necks downstream of a branch node.  For
+    path descriptors and attachment direction, the root neck is the crypt's
+    attachment to the villus/body.
+    """
+    necks = _neck_nodes(graph, crypt_id)
+    if len(necks) <= 1:
+        return necks
+
+    incoming_nonbody = set()
+    for edge in graph.edges_for_crypt(crypt_id, include_body_edge=False):
+        if graph.node(edge.target).node_type == "neck":
+            incoming_nonbody.add(edge.target)
+    roots = [neck for neck in necks if neck.node_id not in incoming_nonbody]
+    return roots or necks
+
+
 def _tip_nodes(graph: SkeletonGraph, crypt_id) -> list[SkeletonNode]:
     return graph.nodes_for_crypt(crypt_id, node_type="tip")
 
 
 def _paths_from_neck_to_tips(graph: SkeletonGraph, crypt_id) -> list[list[str]]:
-    necks = _neck_nodes(graph, crypt_id)
+    necks = _root_neck_nodes(graph, crypt_id)
     tips = {node.node_id for node in _tip_nodes(graph, crypt_id)}
     if not necks or not tips:
         return []
@@ -281,7 +305,7 @@ def crypt_bend_angle(graph: SkeletonGraph, crypt_id) -> float:
 def crypt_attachment_direction(graph: SkeletonGraph, crypt_id) -> np.ndarray:
     """Unit vector from body center to the crypt neck."""
     body = graph.body_node()
-    necks = _neck_nodes(graph, crypt_id)
+    necks = _root_neck_nodes(graph, crypt_id)
     if not necks:
         return np.full(3, np.nan)
     vec = necks[0].position - body.position

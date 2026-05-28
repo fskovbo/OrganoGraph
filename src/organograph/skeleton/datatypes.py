@@ -16,7 +16,7 @@ import numpy as np
 from organograph.skeleton.primitives import PrimitiveAttachment
 
 
-NODE_TYPES = {"body", "neck", "bend", "branch", "tip"}
+NODE_TYPES = {"body", "neck", "crypt", "bend", "branch", "tip"}
 
 
 def _jsonify(value: Any) -> Any:

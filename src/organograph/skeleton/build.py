@@ -1262,6 +1262,7 @@ def build_skeleton_from_crypt_detections(
                     "n_daughters": len(daughters),
                     "center_refined_from_neck_regions": bool(branch_region.size),
                     "n_branch_region_vertices": int(branch_region.size),
+                    "branch_region_vertices": branch_region.tolist(),
                 },
             )
             graph.add_edge(

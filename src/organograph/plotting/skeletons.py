@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import numpy as np
 
+from organograph.skeleton.primitive_geometry import polyline_lengths, quadratic_radius
+
 
 NODE_COLORS = {
     "body": "#4c78a8",
@@ -26,6 +28,12 @@ EDGE_COLORS = {
     "branch_to_neck": "#222222",
     "branch_to_tip": "#222222",
     "skeleton": "#222222",
+}
+
+PRIMITIVE_COLORS = {
+    "ellipsoid": "#4c78a8",
+    "superellipsoid_placeholder": "#4c78a8",
+    "tapered_capped_tube": "#72b7b2",
 }
 
 
@@ -311,4 +319,212 @@ def plot_mesh_with_skeleton(
         node_size=node_size,
     )
     ax.set_axis_off()
+    return fig
+
+
+def _ellipsoid_surface(parameters, *, n_u=32, n_v=16):
+    center = np.asarray(parameters["center"], dtype=float)
+    orientation = np.asarray(parameters["orientation"], dtype=float)
+    axes = np.asarray(parameters["axis_lengths"], dtype=float)
+    u = np.linspace(0.0, 2.0 * np.pi, int(n_u), endpoint=False)
+    v = np.linspace(0.0, np.pi, int(n_v))
+    uu, vv = np.meshgrid(u, v)
+    local = np.stack(
+        [
+            axes[0] * np.cos(uu) * np.sin(vv),
+            axes[1] * np.sin(uu) * np.sin(vv),
+            axes[2] * np.cos(vv),
+        ],
+        axis=-1,
+    )
+    xyz = local.reshape(-1, 3) @ orientation.T + center[None, :]
+    faces = []
+    for i in range(int(n_v) - 1):
+        for j in range(int(n_u)):
+            a = i * int(n_u) + j
+            b = i * int(n_u) + (j + 1) % int(n_u)
+            c = (i + 1) * int(n_u) + j
+            d = (i + 1) * int(n_u) + (j + 1) % int(n_u)
+            faces.append([a, b, c])
+            faces.append([b, d, c])
+    return xyz, np.asarray(faces, dtype=np.int64)
+
+
+def _polyline_point_at_s(centerline, s):
+    centerline = np.asarray(centerline, dtype=float)
+    lengths, cumulative, total = polyline_lengths(centerline)
+    if total <= 1e-12 or centerline.shape[0] == 1:
+        return centerline[0], np.array([1.0, 0.0, 0.0])
+    target = float(np.clip(s, 0.0, 1.0)) * total
+    i = int(np.searchsorted(cumulative, target, side="right") - 1)
+    i = max(0, min(i, len(lengths) - 1))
+    t = (target - cumulative[i]) / max(lengths[i], 1e-12)
+    point = centerline[i] + t * (centerline[i + 1] - centerline[i])
+    tangent = centerline[i + 1] - centerline[i]
+    tangent = tangent / max(np.linalg.norm(tangent), 1e-12)
+    return point, tangent
+
+
+def _tube_surface(parameters, *, n_s=32, n_theta=16):
+    centerline = np.asarray(parameters["centerline_points"], dtype=float)
+    radii = (
+        float(parameters["r_neck"]),
+        float(parameters["r_body"]),
+        float(parameters["r_tip"]),
+    )
+    s_values = np.linspace(0.0, 1.0, int(n_s))
+    theta = np.linspace(0.0, 2.0 * np.pi, int(n_theta), endpoint=False)
+    vertices = []
+    previous_normal = None
+    for s in s_values:
+        center, tangent = _polyline_point_at_s(centerline, s)
+        if previous_normal is None:
+            ref = np.array([0.0, 0.0, 1.0])
+            if abs(float(np.dot(ref, tangent))) > 0.9:
+                ref = np.array([0.0, 1.0, 0.0])
+            normal = np.cross(tangent, ref)
+            normal = normal / max(np.linalg.norm(normal), 1e-12)
+        else:
+            normal = previous_normal - tangent * float(np.dot(previous_normal, tangent))
+            normal = normal / max(np.linalg.norm(normal), 1e-12)
+        binormal = np.cross(tangent, normal)
+        binormal = binormal / max(np.linalg.norm(binormal), 1e-12)
+        previous_normal = normal
+        radius = float(max(quadratic_radius(np.array([s]), *radii)[0], 1e-8))
+        ring = [
+            center + radius * (np.cos(a) * normal + np.sin(a) * binormal)
+            for a in theta
+        ]
+        vertices.extend(ring)
+
+    faces = []
+    n_theta = int(n_theta)
+    for i in range(int(n_s) - 1):
+        for j in range(n_theta):
+            a = i * n_theta + j
+            b = i * n_theta + (j + 1) % n_theta
+            c = (i + 1) * n_theta + j
+            d = (i + 1) * n_theta + (j + 1) % n_theta
+            faces.append([a, b, c])
+            faces.append([b, d, c])
+    return np.asarray(vertices, dtype=float), np.asarray(faces, dtype=np.int64)
+
+
+def _primitive_mesh(attachment, *, n_s=32, n_theta=16):
+    primitive_type = attachment.primitive_type
+    if primitive_type in {"ellipsoid", "superellipsoid_placeholder"}:
+        return _ellipsoid_surface(attachment.parameters, n_u=n_theta * 2, n_v=n_s)
+    if primitive_type == "tapered_capped_tube":
+        return _tube_surface(attachment.parameters, n_s=n_s, n_theta=n_theta)
+    return None, None
+
+
+def _plotly_primitive_traces(
+    graph,
+    *,
+    primitive_alpha=0.35,
+    n_s=32,
+    n_theta=16,
+):
+    import plotly.graph_objects as go
+
+    attachments = []
+    for node in graph.nodes.values():
+        if node.primitive_attachment is not None:
+            attachments.append((node.node_id, node.primitive_attachment))
+    for edge in graph.edges.values():
+        if edge.primitive_attachment is not None:
+            attachments.append((edge.edge_id, edge.primitive_attachment))
+    attachments.extend(graph.primitive_attachments.items())
+
+    traces = []
+    for attachment_id, attachment in attachments:
+        xyz, faces = _primitive_mesh(attachment, n_s=n_s, n_theta=n_theta)
+        if xyz is None or faces is None or xyz.size == 0 or faces.size == 0:
+            continue
+        color = PRIMITIVE_COLORS.get(attachment.primitive_type, "#72b7b2")
+        traces.append(
+            go.Mesh3d(
+                x=xyz[:, 0],
+                y=xyz[:, 1],
+                z=xyz[:, 2],
+                i=faces[:, 0],
+                j=faces[:, 1],
+                k=faces[:, 2],
+                color=color,
+                opacity=float(primitive_alpha),
+                name=str(attachment_id),
+                hovertext=str(attachment_id),
+            )
+        )
+    return traces
+
+
+def plot_primitives_3d(
+    graph,
+    *,
+    backend="plotly",
+    primitive_alpha=0.35,
+    n_s=32,
+    n_theta=16,
+):
+    """Plot primitive attachments without mesh or skeleton."""
+    backend = str(backend).lower()
+    if backend != "plotly":
+        raise ValueError("plot_primitives_3d currently supports backend='plotly'")
+    import plotly.graph_objects as go
+
+    fig = go.Figure(
+        data=_plotly_primitive_traces(
+            graph,
+            primitive_alpha=primitive_alpha,
+            n_s=n_s,
+            n_theta=n_theta,
+        )
+    )
+    fig.update_layout(
+        scene=dict(
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            zaxis=dict(visible=False),
+            aspectmode="data",
+        )
+    )
+    return fig
+
+
+def plot_mesh_with_skeleton_and_primitives(
+    vertices,
+    faces,
+    graph,
+    *,
+    backend="plotly",
+    mesh_alpha=0.14,
+    primitive_alpha=0.35,
+    mesh_color="lightgray",
+    show_node_labels=False,
+    node_size=7,
+    edge_width=3.0,
+    camera_eye=None,
+):
+    """Overlay mesh, skeleton, and fitted primitive attachments."""
+    backend = str(backend).lower()
+    if backend != "plotly":
+        raise ValueError(
+            "plot_mesh_with_skeleton_and_primitives currently supports backend='plotly'"
+        )
+    fig = plot_mesh_with_skeleton(
+        vertices,
+        faces,
+        graph,
+        backend="plotly",
+        mesh_alpha=mesh_alpha,
+        mesh_color=mesh_color,
+        show_node_labels=show_node_labels,
+        node_size=node_size,
+        edge_width=edge_width,
+        camera_eye=camera_eye,
+    )
+    for trace in _plotly_primitive_traces(graph, primitive_alpha=primitive_alpha):
+        fig.add_trace(trace)
     return fig

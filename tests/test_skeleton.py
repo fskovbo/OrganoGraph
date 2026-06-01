@@ -7,14 +7,19 @@ import numpy as np
 
 from organograph.skeleton.build import _grow_parent_patch_to_neck, _select_hks_tips_from_axis
 from organograph.skeleton import (
+    attach_body_primitive,
+    attach_crypt_tube_primitives,
     build_skeleton_from_crypt_detections,
     crypt_bend_angle,
     crypt_path_length,
     crypt_straight_distance,
     crypt_tortuosity,
+    fit_crypt_tube_to_points,
+    fit_ellipsoid_to_points,
     load_skeleton_json,
     number_of_crypts,
     number_of_split_crypts,
+    primitive_components_from_crypt_detections,
     save_skeleton_json,
 )
 
@@ -75,6 +80,55 @@ def make_radial_ring_test_mesh(n=9):
             else:
                 vertices.append([radius * dx / norm, radius * dy / norm, 0.0])
     return np.asarray(vertices, dtype=float), faces
+
+
+def make_ellipsoid_points(center, axes, n_u=24, n_v=13):
+    center = np.asarray(center, dtype=float)
+    axes = np.asarray(axes, dtype=float)
+    u = np.linspace(0.0, 2.0 * math.pi, n_u, endpoint=False)
+    v = np.linspace(0.0, math.pi, n_v)
+    pts = []
+    for vv in v:
+        for uu in u:
+            pts.append(
+                center
+                + axes
+                * np.array(
+                    [math.cos(uu) * math.sin(vv), math.sin(uu) * math.sin(vv), math.cos(vv)]
+                )
+            )
+    return np.asarray(pts, dtype=float)
+
+
+def make_tube_points(centerline, radii=(1.0, 1.0, 1.0), n_s=21, n_theta=24):
+    from organograph.skeleton.primitive_geometry import quadratic_radius
+
+    centerline = np.asarray(centerline, dtype=float)
+    pts = []
+    for s in np.linspace(0.0, 1.0, n_s):
+        if centerline.shape[0] == 2:
+            center = centerline[0] + s * (centerline[1] - centerline[0])
+            tangent = centerline[1] - centerline[0]
+        else:
+            if s <= 0.5:
+                t = s / 0.5
+                center = centerline[0] + t * (centerline[1] - centerline[0])
+                tangent = centerline[1] - centerline[0]
+            else:
+                t = (s - 0.5) / 0.5
+                center = centerline[1] + t * (centerline[2] - centerline[1])
+                tangent = centerline[2] - centerline[1]
+        tangent = tangent / np.linalg.norm(tangent)
+        ref = np.array([0.0, 0.0, 1.0])
+        if abs(float(np.dot(ref, tangent))) > 0.9:
+            ref = np.array([0.0, 1.0, 0.0])
+        normal = np.cross(tangent, ref)
+        normal = normal / np.linalg.norm(normal)
+        binormal = np.cross(tangent, normal)
+        radius = float(quadratic_radius(np.array([s]), *radii)[0])
+        for theta in np.linspace(0.0, 2.0 * math.pi, n_theta, endpoint=False):
+            pts.append(center + radius * (math.cos(theta) * normal + math.sin(theta) * binormal))
+    return np.asarray(pts, dtype=float)
 
 
 class SkeletonTests(unittest.TestCase):
@@ -353,6 +407,136 @@ class SkeletonTests(unittest.TestCase):
                 graph.node(node_id).position,
                 loaded.node(node_id).position,
             )
+
+    def test_ellipsoid_point_cloud_fit_recovers_center_and_axes(self):
+        center = np.array([2.0, -1.0, 0.5])
+        axes = np.array([3.0, 1.5, 0.75])
+        points = make_ellipsoid_points(center, axes)
+        fit = fit_ellipsoid_to_points(points, axis_quantile=1.0)
+
+        np.testing.assert_allclose(fit.parameters["center"], center, atol=1e-12)
+        np.testing.assert_allclose(
+            np.sort(fit.parameters["axis_lengths"]),
+            np.sort(axes),
+            atol=0.08,
+        )
+
+    def test_straight_tapered_tube_fit_recovers_radii(self):
+        centerline = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 10.0]])
+        points = make_tube_points(centerline, radii=(1.0, 2.0, 0.5))
+        fit = fit_crypt_tube_to_points(
+            points,
+            centerline,
+            radius_quantile=0.5,
+            neck_window=(0.0, 0.01),
+            body_window=(0.48, 0.52),
+            tip_window=(0.99, 1.0),
+        )
+
+        self.assertAlmostEqual(fit.parameters["r_neck"], 1.0, delta=0.15)
+        self.assertAlmostEqual(fit.parameters["r_body"], 2.0, delta=0.15)
+        self.assertAlmostEqual(fit.parameters["r_tip"], 0.5, delta=0.15)
+        self.assertAlmostEqual(fit.derived_parameters["length"], 10.0)
+        self.assertAlmostEqual(fit.derived_parameters["bend_angle"], 0.0)
+
+    def test_bent_tube_fit_reports_length_and_bend_angle(self):
+        centerline = np.array(
+            [[0.0, 0.0, 0.0], [5.0, 0.0, 0.0], [5.0, 5.0, 0.0]],
+            dtype=float,
+        )
+        points = make_tube_points(centerline, radii=(1.0, 1.0, 1.0))
+        fit = fit_crypt_tube_to_points(points, centerline)
+
+        self.assertAlmostEqual(fit.derived_parameters["length"], 10.0)
+        self.assertAlmostEqual(fit.derived_parameters["bend_angle"], math.pi / 2.0)
+        self.assertAlmostEqual(fit.derived_parameters["tortuosity"], math.sqrt(2.0))
+
+    def test_primitive_attachments_survive_json_round_trip(self):
+        graph = build_skeleton_from_crypt_detections(
+            VERTICES,
+            FACES,
+            [
+                {
+                    "crypt_id": "a",
+                    "neck_position": [0.0, 0.0, 0.0],
+                    "tip_position": [0.0, 0.0, 2.0],
+                    "crypt_vertices": [1, 2, 4],
+                }
+            ],
+            body_center=[0.0, 0.0, -1.0],
+            bend_strategy="crypt_centroid",
+        )
+        attach_body_primitive(graph, VERTICES)
+        tube_points = make_tube_points(
+            np.vstack(
+                [
+                    graph.node("crypt_a_neck").position,
+                    graph.node("crypt_a_crypt").position,
+                    graph.node("crypt_a_tip").position,
+                ]
+            )
+        )
+        attach_crypt_tube_primitives(graph, VERTICES, {"a": tube_points})
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "skeleton_with_primitives.json"
+            save_skeleton_json(graph, path)
+            loaded = load_skeleton_json(path)
+
+        self.assertEqual(graph.body_node().primitive_attachment.primitive_type, "ellipsoid")
+        self.assertEqual(loaded.body_node().primitive_attachment.primitive_type, "ellipsoid")
+        self.assertEqual(len(loaded.primitive_attachments), 1)
+        attachment = next(iter(loaded.primitive_attachments.values()))
+        self.assertEqual(attachment.primitive_type, "tapered_capped_tube")
+
+    def test_primitive_components_cut_body_and_branch_at_necks(self):
+        vertices = np.zeros((9, 3), dtype=float)
+        graph = build_skeleton_from_crypt_detections(
+            vertices,
+            np.empty((0, 3), dtype=np.int64),
+            [
+                {
+                    "crypt_id": "split",
+                    "neck_position": [0.0, 0.0, 0.0],
+                    "branch_position": [1.0, 0.0, 0.0],
+                    "neck_region_vertices": [2, 3, 4, 5, 6, 7],
+                    "daughters": [
+                        {
+                            "neck_position": [1.0, 1.0, 0.0],
+                            "tip_position": [1.0, 2.0, 0.0],
+                            "neck_region_vertices": [5, 6],
+                            "crypt_vertices": [5, 6],
+                        },
+                        {
+                            "neck_position": [1.0, -1.0, 0.0],
+                            "tip_position": [1.0, -2.0, 0.0],
+                            "neck_region_vertices": [7],
+                            "crypt_vertices": [7],
+                        },
+                    ],
+                }
+            ],
+            body_center=[0.0, 0.0, 0.0],
+        )
+        components = primitive_components_from_crypt_detections(
+            vertices,
+            [
+                {
+                    "crypt_id": "split",
+                    "neck_region_vertices": [2, 3, 4, 5, 6, 7],
+                    "daughters": [
+                        {"neck_region_vertices": [5, 6], "crypt_vertices": [5, 6]},
+                        {"neck_region_vertices": [7], "crypt_vertices": [7]},
+                    ],
+                }
+            ],
+            graph=graph,
+        )
+
+        self.assertEqual(components["body"], [0, 1, 8])
+        self.assertEqual(components["branches"]["crypt_split_branch"], [2, 3, 4])
+        self.assertEqual(components["crypts"]["crypt_split_tip_0"], [5, 6])
+        self.assertEqual(components["crypts"]["crypt_split_tip_1"], [7])
 
     def test_neck_from_distance_field_uses_ring_center(self):
         vertices = np.array(

@@ -139,6 +139,7 @@ class SkeletonGraph:
 
     nodes: dict[str, SkeletonNode] = field(default_factory=dict)
     edges: dict[str, SkeletonEdge] = field(default_factory=dict)
+    primitive_attachments: dict[str, PrimitiveAttachment] = field(default_factory=dict)
     metadata: dict[str, Any] = field(default_factory=dict)
     coordinate_frame: dict[str, Any] = field(default_factory=dict)
 
@@ -204,6 +205,25 @@ class SkeletonGraph:
     def edge(self, edge_id: str) -> SkeletonEdge:
         return self.edges[str(edge_id)]
 
+    def add_primitive_attachment(
+        self,
+        attachment_id: str,
+        primitive_attachment: PrimitiveAttachment,
+    ) -> PrimitiveAttachment:
+        """Attach a fitted primitive to a graph-level target.
+
+        Use this for primitives that belong to a biological component or path,
+        for example a tapered tube fitted to a whole crypt path.
+        """
+        attachment_id = str(attachment_id)
+        if attachment_id in self.primitive_attachments:
+            raise ValueError(f"Duplicate primitive attachment id {attachment_id!r}")
+        primitive_attachment.attachment_id = (
+            primitive_attachment.attachment_id or attachment_id
+        )
+        self.primitive_attachments[attachment_id] = primitive_attachment
+        return primitive_attachment
+
     def nodes_for_crypt(
         self,
         crypt_id: str | int,
@@ -246,6 +266,10 @@ class SkeletonGraph:
         return {
             "nodes": [node.to_dict() for node in self.nodes.values()],
             "edges": [edge.to_dict() for edge in self.edges.values()],
+            "primitive_attachments": [
+                attachment.to_dict()
+                for attachment in self.primitive_attachments.values()
+            ],
             "metadata": _jsonify(self.metadata),
             "coordinate_frame": _jsonify(self.coordinate_frame),
         }
@@ -264,6 +288,12 @@ class SkeletonGraph:
             if edge.source not in graph.nodes or edge.target not in graph.nodes:
                 raise ValueError(f"Edge {edge.edge_id!r} references missing node")
             graph.edges[edge.edge_id] = edge
+        for attachment_data in data.get("primitive_attachments", []):
+            attachment = PrimitiveAttachment.from_dict(attachment_data)
+            if attachment is None:
+                continue
+            attachment_id = attachment.attachment_id or f"primitive_{len(graph.primitive_attachments)}"
+            graph.primitive_attachments[str(attachment_id)] = attachment
         return graph
 
     def to_node_dataframe(self):
@@ -288,6 +318,29 @@ class SkeletonGraph:
                     ),
                 }
             )
+        return pd.DataFrame(rows)
+
+    def to_primitive_dataframe(self):
+        """Return graph-level primitive attachments as a pandas DataFrame."""
+        import pandas as pd
+
+        rows = []
+        for attachment_id, attachment in self.primitive_attachments.items():
+            row = {
+                "attachment_id": attachment_id,
+                "attachment_type": attachment.attachment_type,
+                "primitive_type": attachment.primitive_type,
+                "target_ids": _jsonify(attachment.target_ids),
+                "fit_error": attachment.fit_error,
+                "metadata": _jsonify(attachment.metadata),
+                "derived_parameters": _jsonify(attachment.derived_parameters),
+            }
+            for key, value in attachment.parameters.items():
+                if np.isscalar(value):
+                    row[key] = value
+                else:
+                    row[key] = _jsonify(value)
+            rows.append(row)
         return pd.DataFrame(rows)
 
     def to_edge_dataframe(self):

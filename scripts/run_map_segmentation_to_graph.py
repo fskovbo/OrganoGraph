@@ -54,22 +54,22 @@ from organograph.graph.access import graph_get
 # DATASET PATHS (EDIT THESE)
 # =============================================================================
 
-DATASET         = "20250929" # "20251201"  20250929
+DATASET         = "20251201" # "20251201"  20250929
 
 _SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT    = os.path.dirname(_SCRIPT_DIR)
 
 # Input: mesh-based segmentation results
-SEG_MESH_DIR    = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_mesh_3p5selected")
+SEG_MESH_DIR    = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_mesh")
 
 # Input: nuclei/cell table used to build graphs if needed
-CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_types_class.csv") # cell_types_class # cell_features_class
+CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_features_class.csv") # cell_types_class # cell_features_class
 
 # Optional existing graph directory; if graph missing here, it will be built on the fly
-GRAPHS_DIR      = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "graphs_preprocessed_exclusive")
+GRAPHS_DIR      = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "graphs_preprocessed")
 
 # Output: graph-based crypt projections
-GRAPH_SEG_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_graph_3p5selected")
+GRAPH_SEG_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_graph")
 
 # config files with data structure
 MESH_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "mesh_config.json")
@@ -81,7 +81,7 @@ CELL_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_
 # OPTIONAL FILTERING / BEHAVIOR
 # =============================================================================
 
-TIMEPOINTS = ['day3p5'] # ['day3p5', 'day4', 'day4p5', 'day4p5-more']   # or None for all timepoints found under SEG_MESH_DIR
+TIMEPOINTS = None # ['day3p5', 'day4', 'day4p5', 'day4p5-more']   # or None for all timepoints found under SEG_MESH_DIR
 
 OVERWRITE = True
 VERBOSE = True
@@ -109,8 +109,23 @@ cell_cfg = load_cell_table_config(CELL_CONFIG_PATH)
 
 COORD_COLS = tuple(cell_cfg["coord_cols"])
 MARKER_COLS = list(cell_cfg["marker_cols"])
-LGR5_MARKER = cell_cfg["lgr5_marker"]
-COEXP_MARKERS = tuple(cell_cfg["coexp_markers"])
+MARKER_ALIAS = list(cell_cfg["marker_names"])
+
+
+def marker_config_name_to_alias(name):
+    """Resolve a marker config entry to the names stored on graph nodes."""
+    if name in MARKER_ALIAS:
+        return name
+    if name in MARKER_COLS:
+        return MARKER_ALIAS[MARKER_COLS.index(name)]
+    raise ValueError(
+        f"Marker '{name}' is not in marker_cols or marker_names. "
+        f"Available marker_cols={MARKER_COLS}; marker_names={MARKER_ALIAS}"
+    )
+
+
+LGR5_MARKER = marker_config_name_to_alias(cell_cfg["lgr5_marker"])
+COEXP_MARKERS = tuple(marker_config_name_to_alias(m) for m in cell_cfg["coexp_markers"])
 
 
 # =============================================================================
@@ -124,7 +139,7 @@ def marker_postprocess(markers_bin, marker_names):
         exclusive_marker=LGR5_MARKER,
         forbidden_markers=COEXP_MARKERS,
         copy=True,
-        ignore_missing=True,
+        ignore_missing=False,
     )
 
 
@@ -352,6 +367,7 @@ def main():
         label_col="label_uid",
         xyz_cols=COORD_COLS,
         marker_cols=MARKER_COLS,
+        marker_alias=MARKER_ALIAS,
         marker_postprocess_fn=marker_postprocess,
     )
 

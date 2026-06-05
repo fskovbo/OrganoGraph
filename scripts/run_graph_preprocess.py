@@ -38,6 +38,11 @@ from organograph.io_utils.dataset_config import load_mesh_dataset_config, load_c
 from organograph.io_utils.blacklist import load_blacklist
 from organograph.graph.build import build_organoid_graph, add_vertex_field_to_graph
 from organograph.graph.io import save_cell_graph
+from organograph.graph.marker_postprocess import (
+    ablate_lysozyme_not_agr2_in_clusters,
+    copy_graph_markers_bin,
+    suppress_graph_marker_if_coexpressed,
+)
 
 from organograph.mesh.hks import compute_hks
 from organograph.crypts.vocab import compute_vocabulary_encoding
@@ -57,7 +62,7 @@ PROJECT_ROOT    = os.path.dirname(_SCRIPT_DIR)
 
 MESH_DATA_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "fractal_output")
 CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_features_class.csv") # cell_types_class # cell_features_class
-OUT_GRAPHS_DIR  = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "graphs_preprocessed_coexpfixed")
+OUT_GRAPHS_DIR  = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "graphs_preprocessed")
 
 MESH_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "mesh_config.json")
 CELL_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_table_config.json")
@@ -111,6 +116,15 @@ def marker_config_name_to_alias(name):
 LGR5_MARKER = marker_config_name_to_alias(cell_cfg["lgr5_marker"])
 COEXP_MARKERS = tuple(marker_config_name_to_alias(m) for m in cell_cfg["coexp_markers"])
 
+# Graph-level marker postprocessing. These steps run after graph construction,
+# so they can use graph adjacency before co-expression suppression is applied.
+STORE_RAW_GRAPH_MARKERS = True  # Preserve the original per-node marker calls in markers_bin_raw.
+ENABLE_LYSOZYME_AGR2_ABLATION = True  # Remove Lysozyme from clustered Lysozyme+ cells unless they are Agr2+.
+LYSOZYME_MARKER = marker_config_name_to_alias("Lysozyme")
+AGR2_MARKER = marker_config_name_to_alias("Agr2")
+LYSOZYME_ABLATION_MIN_CLUSTER_SIZE = 2  # Only process connected Lysozyme+ components with at least this many cells.
+ENABLE_GRAPH_COEXPRESSION_SUPPRESSION = True  # Apply the LGR5-vs-forbidden-marker rule after cluster cleanup.
+
 
 # EXCLUSIVITY_RULES = {
 #     "LGR5":     ["Chroma", "Mucin 2", "AldoB", "Glucagon", "Agr2", "Serotonin", "Lysozyme"],
@@ -136,14 +150,49 @@ COEXP_MARKERS = tuple(marker_config_name_to_alias(m) for m in cell_cfg["coexp_ma
 # =============================================================================
 
 def marker_postprocess(markers_bin, marker_names):
-    return suppress_marker_if_coexpressed(
-        markers_bin,
-        marker_names,
-        exclusive_marker=LGR5_MARKER,
-        forbidden_markers=COEXP_MARKERS,
-        copy=True,
-        ignore_missing=False,
-    )
+    """Keep the raw binarized marker calls unchanged."""
+    return markers_bin
+
+
+def graph_marker_postprocess(G):
+    """Apply graph-dependent marker cleanup after cell adjacency is available."""
+    steps = []
+
+    if STORE_RAW_GRAPH_MARKERS:
+        copy_graph_markers_bin(G)
+        steps.append("copy_markers_bin_raw")
+
+    if ENABLE_LYSOZYME_AGR2_ABLATION:
+        ablate_lysozyme_not_agr2_in_clusters(
+            G,
+            lysozyme_marker=LYSOZYME_MARKER,
+            agr2_marker=AGR2_MARKER,
+            min_cluster_size=LYSOZYME_ABLATION_MIN_CLUSTER_SIZE,
+        )
+        steps.append("ablate_lysozyme_not_agr2_in_clusters")
+
+    if ENABLE_GRAPH_COEXPRESSION_SUPPRESSION:
+        suppress_graph_marker_if_coexpressed(
+            G,
+            exclusive_marker=LGR5_MARKER,
+            forbidden_markers=COEXP_MARKERS,
+            copy=True,
+            ignore_missing=False,
+        )
+        steps.append("suppress_marker_if_coexpressed")
+
+    G.graph["marker_postprocess_steps"] = steps
+    return G
+
+# def marker_postprocess(markers_bin, marker_names):
+#     return suppress_marker_if_coexpressed(
+#         markers_bin,
+#         marker_names,
+#         exclusive_marker=LGR5_MARKER,
+#         forbidden_markers=COEXP_MARKERS,
+#         copy=True,
+#         ignore_missing=False,
+#     )
 
 # def marker_postprocess(markers_bin, marker_names):
 #     # Step 1: enforce exclusivity on the original marker space
@@ -289,6 +338,13 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist_path=None)
         except Exception as e:
             if verbose:
                 print(f"[{tp}] graph build failed for {label_uid}: {e}")
+            continue
+
+        try:
+            G = graph_marker_postprocess(G)
+        except Exception as e:
+            if verbose:
+                print(f"[{tp}] graph marker postprocess failed for {label_uid}: {e}")
             continue
 
         # --- save graph + index ---

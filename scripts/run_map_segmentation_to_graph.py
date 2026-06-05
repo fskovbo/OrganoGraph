@@ -49,6 +49,11 @@ from organograph.graph.build import build_organoid_graph, assign_mesh_patches_to
 from organograph.io_utils.segmentation_io import load_mesh_crypt_segmentation
 from organograph.graph.io import load_cell_graph, save_cell_graph
 from organograph.graph.access import graph_get
+from organograph.graph.marker_postprocess import (
+    ablate_lysozyme_not_agr2_in_clusters,
+    copy_graph_markers_bin,
+    suppress_graph_marker_if_coexpressed,
+)
 
 # =============================================================================
 # DATASET PATHS (EDIT THESE)
@@ -127,20 +132,54 @@ def marker_config_name_to_alias(name):
 LGR5_MARKER = marker_config_name_to_alias(cell_cfg["lgr5_marker"])
 COEXP_MARKERS = tuple(marker_config_name_to_alias(m) for m in cell_cfg["coexp_markers"])
 
+# Graph-level marker postprocessing for graphs built on the fly. Existing graphs
+# loaded from GRAPHS_DIR are assumed to have been created by run_graph_preprocess.py.
+STORE_RAW_GRAPH_MARKERS = True  # Preserve original per-node marker calls in markers_bin_raw.
+ENABLE_LYSOZYME_AGR2_ABLATION = True  # Remove Lysozyme from clustered Lysozyme+ cells unless they are Agr2+.
+LYSOZYME_MARKER = marker_config_name_to_alias("Lysozyme")
+AGR2_MARKER = marker_config_name_to_alias("Agr2")
+LYSOZYME_ABLATION_MIN_CLUSTER_SIZE = 2  # Only process connected Lysozyme+ components with at least this many cells.
+ENABLE_GRAPH_COEXPRESSION_SUPPRESSION = True  # Apply the LGR5-vs-forbidden-marker rule after cluster cleanup.
+
 
 # =============================================================================
 # HELPERS
 # =============================================================================
 
 def marker_postprocess(markers_bin, marker_names):
-    return suppress_marker_if_coexpressed(
-        markers_bin,
-        marker_names,
-        exclusive_marker=LGR5_MARKER,
-        forbidden_markers=COEXP_MARKERS,
-        copy=True,
-        ignore_missing=False,
-    )
+    """Keep table-derived markers raw until graph-level cleanup can use adjacency."""
+    return markers_bin
+
+
+def graph_marker_postprocess(G):
+    """Apply graph-dependent marker cleanup after cell adjacency is available."""
+    steps = []
+
+    if STORE_RAW_GRAPH_MARKERS:
+        copy_graph_markers_bin(G)
+        steps.append("copy_markers_bin_raw")
+
+    if ENABLE_LYSOZYME_AGR2_ABLATION:
+        ablate_lysozyme_not_agr2_in_clusters(
+            G,
+            lysozyme_marker=LYSOZYME_MARKER,
+            agr2_marker=AGR2_MARKER,
+            min_cluster_size=LYSOZYME_ABLATION_MIN_CLUSTER_SIZE,
+        )
+        steps.append("ablate_lysozyme_not_agr2_in_clusters")
+
+    if ENABLE_GRAPH_COEXPRESSION_SUPPRESSION:
+        suppress_graph_marker_if_coexpressed(
+            G,
+            exclusive_marker=LGR5_MARKER,
+            forbidden_markers=COEXP_MARKERS,
+            copy=True,
+            ignore_missing=False,
+        )
+        steps.append("suppress_marker_if_coexpressed")
+
+    G.graph["marker_postprocess_steps"] = steps
+    return G
 
 
 def patches_to_ll(patches):
@@ -289,7 +328,7 @@ def build_graph_for_organoid(mesh_path, label_uid, extractor):
     mesh.normalize_inplace()
     mesh.label_uid = label_uid
     G, _aux = build_organoid_graph(mesh=mesh, extract_fn=extractor)
-    return G
+    return graph_marker_postprocess(G)
 
 
 def project_mesh_field_to_graph(G, field_mesh, *, proj_field="proj_vertex"):

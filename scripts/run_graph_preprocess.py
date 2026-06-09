@@ -52,7 +52,7 @@ from organograph.crypts.vocab import compute_vocabulary_encoding
 # DATASET CONFIG
 # =============================================================================
 
-DATASET         = "20251201" # "20251201" 20250929
+DATASET         = "20250929" # "20251201" 20250929
 
 # Absolute path to this script file
 _SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
@@ -61,16 +61,16 @@ _SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT    = os.path.dirname(_SCRIPT_DIR)
 
 MESH_DATA_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "fractal_output")
-CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_features_class.csv") # cell_types_class # cell_features_class
+CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_types_class.csv") # cell_types_class # cell_features_class
 OUT_GRAPHS_DIR  = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "graphs_preprocessed")
 
 MESH_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "mesh_config.json")
 CELL_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_table_config.json")
-BLACKLIST_PATH  = None # os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "blacklist_labels.csv")
+BLACKLIST_PATH  = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "blacklist_labels.csv")
 
 
 # Optional override. 
-timepoints = ['day4p5'] # ['day3p5', 'day4', 'day4p5', 'day4p5-more']   
+timepoints = None # ['day3p5', 'day4', 'day4p5', 'day4p5-more']   
 
 
 MAX_PROJ_DIST = 2.0  # max accepted distance between nuclei and membrane for projection. If None, use all distances
@@ -148,6 +148,13 @@ ENABLE_GRAPH_COEXPRESSION_SUPPRESSION = True  # Apply the LGR5-vs-forbidden-mark
 # =============================================================================
 # MARKER POSTPROCESS
 # =============================================================================
+
+def resolve_timepoints(timepoints_override, zarr_names, rounds, meshes):
+    """Return the configured timepoints unless a manual override is supplied."""
+    if timepoints_override is not None:
+        return list(timepoints_override)
+    return [tp for tp in zarr_names if tp in rounds and tp in meshes]
+
 
 def marker_postprocess(markers_bin, marker_names):
     """Keep the raw binarized marker calls unchanged."""
@@ -233,7 +240,8 @@ def main():
 
 def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist_path=None):
     blacklist = load_blacklist(blacklist_path) if blacklist_path else set()
-    tp_allow = set(timepoints) if timepoints else None
+    search_timepoints = resolve_timepoints(timepoints, zarr_names, rounds, meshes)
+    tp_allow = set(search_timepoints)
 
     # --- load & index cells table once ---
     if not os.path.exists(CELLS_CSV):
@@ -255,7 +263,7 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist_path=None)
     # --- discover mesh paths (restrictive glob based on config) ---
     mesh_paths = discover_mesh_paths(
         data_dir=MESH_DATA_DIR,
-        timepoints=timepoints,
+        timepoints=search_timepoints,
         zarr_names=zarr_names,
         rounds=rounds,
         meshes=meshes,
@@ -263,6 +271,7 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist_path=None)
     )
 
     if verbose:
+        print(f"[graphs] searching timepoints: {search_timepoints}")
         print(f"[graphs] found {len(mesh_paths)} mesh files (pre-filter)")
 
     index_rows = {}  # timepoint -> list of dicts

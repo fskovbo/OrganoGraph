@@ -69,8 +69,9 @@ def discover_mesh_paths(data_dir, timepoints, zarr_names, rounds, meshes, wells=
     ----------
     data_dir : str
         Root folder.
-    timepoints : list[str]
-        Timepoints to search under.
+    timepoints : list[str] or None
+        Timepoints to search under. If None, search all timepoints present in
+        the folder-name config dictionaries.
     zarr_names, rounds, meshes : dict[str, str]
         Per-timepoint folder names.
     wells : dict[str, list[str]] or None
@@ -83,8 +84,11 @@ def discover_mesh_paths(data_dir, timepoints, zarr_names, rounds, meshes, wells=
     if wells is None:
         wells = {}
 
+    if timepoints is None:
+        timepoints = [tp for tp in zarr_names if tp in rounds and tp in meshes]
+
     found = []
-    for tp in (timepoints or []):
+    for tp in timepoints:
         zarr = zarr_names.get(tp, None)
         rnd = rounds.get(tp, None)
         mesh_name = meshes.get(tp, None)

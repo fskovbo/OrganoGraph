@@ -59,7 +59,7 @@ from organograph.graph.marker_postprocess import (
 # DATASET PATHS (EDIT THESE)
 # =============================================================================
 
-DATASET         = "20251201" # "20251201"  20250929
+DATASET         = "20250929" # "20251201"  20250929
 
 _SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT    = os.path.dirname(_SCRIPT_DIR)
@@ -68,7 +68,7 @@ PROJECT_ROOT    = os.path.dirname(_SCRIPT_DIR)
 SEG_MESH_DIR    = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_mesh")
 
 # Input: nuclei/cell table used to build graphs if needed
-CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_features_class.csv") # cell_types_class # cell_features_class
+CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_types_class.csv") # cell_types_class # cell_features_class
 
 # Optional existing graph directory; if graph missing here, it will be built on the fly
 GRAPHS_DIR      = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "graphs_preprocessed")
@@ -86,7 +86,7 @@ CELL_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_
 # OPTIONAL FILTERING / BEHAVIOR
 # =============================================================================
 
-TIMEPOINTS = None # ['day3p5', 'day4', 'day4p5', 'day4p5-more']   # or None for all timepoints found under SEG_MESH_DIR
+TIMEPOINTS = ['day3p5', 'day4', 'day4p5', 'day4p5-more']   # or None for all timepoints found under SEG_MESH_DIR
 
 OVERWRITE = True
 VERBOSE = True

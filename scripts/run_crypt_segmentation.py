@@ -225,7 +225,11 @@ def main():
         print(f"[mesh-seg] loaded whitelist with {len(whitelist)} entries")
 
     # discover mesh files
-    timepoints = list(TIMEPOINTS)
+    timepoints = (
+        list(TIMEPOINTS)
+        if TIMEPOINTS is not None
+        else [tp for tp in ZARR_NAME_BY_TP if tp in ROUND_BY_TP and tp in MESHNAME_BY_TP]
+    )
 
     mesh_paths = discover_mesh_paths(
         data_dir=MESH_DATA_DIR,

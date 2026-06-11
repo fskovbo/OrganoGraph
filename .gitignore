@@ -15,6 +15,7 @@ dist/
 
 # Jupyter
 .ipynb_checkpoints/
+/exports/
 
 # VScode
 .vscode

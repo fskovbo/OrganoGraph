@@ -30,6 +30,10 @@ from organograph.skeleton.geometry import (
     transform_points_body_relative,
 )
 from organograph.skeleton.io import load_skeleton_json, save_skeleton_json
+from organograph.skeleton.primitive_geometry import (
+    estimate_smooth_crypt_centerline,
+    sample_quadratic_bezier,
+)
 from organograph.skeleton.primitive_fitting import (
     attach_body_primitive,
     attach_branch_primitives,
@@ -68,6 +72,7 @@ __all__ = [
     "crypt_terminal_paths",
     "detect_crypts_for_skeleton",
     "edge_length",
+    "estimate_smooth_crypt_centerline",
     "fit_blob_primitive_to_points",
     "fit_crypt_tube_to_points",
     "fit_ellipsoid_to_points",
@@ -78,6 +83,7 @@ __all__ = [
     "primitive_components_from_crypt_detections",
     "primitive_attachments_to_dataframe",
     "save_skeleton_json",
+    "sample_quadratic_bezier",
     "skeleton_to_body_relative",
     "transform_points_body_relative",
 ]

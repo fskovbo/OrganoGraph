@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from organograph.skeleton.primitive_geometry import polyline_lengths, quadratic_radius
+from organograph.skeleton.primitive_geometry import capped_tube_radius, polyline_lengths
 
 
 NODE_COLORS = {
@@ -36,6 +36,28 @@ PRIMITIVE_COLORS = {
     "tapered_capped_tube": "#72b7b2",
 }
 
+SMOOTH_CENTERLINE_COLOR = "#008b8b"
+
+
+def _smooth_centerlines(graph):
+    seen = set()
+    centerlines = []
+    for attachment_id, attachment in graph.primitive_attachments.items():
+        if attachment.primitive_type != "tapered_capped_tube":
+            continue
+        points = attachment.parameters.get("centerline_points")
+        if points is None:
+            continue
+        points = np.asarray(points, dtype=float)
+        if points.ndim != 2 or points.shape[0] < 2 or points.shape[1] != 3:
+            continue
+        key = str(attachment_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        centerlines.append((key, points))
+    return centerlines
+
 
 def _node_arrays(graph):
     nodes = list(graph.nodes.values())
@@ -49,6 +71,8 @@ def _plotly_skeleton_traces(
     show_node_labels=False,
     node_size=6,
     edge_width=5,
+    show_smooth_centerlines=True,
+    smooth_centerline_width=7,
 ):
     import plotly.graph_objects as go
 
@@ -71,6 +95,24 @@ def _plotly_skeleton_traces(
                 showlegend=False,
             )
         )
+
+    if show_smooth_centerlines:
+        for attachment_id, points in _smooth_centerlines(graph):
+            traces.append(
+                go.Scatter3d(
+                    x=points[:, 0],
+                    y=points[:, 1],
+                    z=points[:, 2],
+                    mode="lines",
+                    line=dict(
+                        color=SMOOTH_CENTERLINE_COLOR,
+                        width=float(smooth_centerline_width),
+                    ),
+                    name="smooth crypt centerline",
+                    hovertext=attachment_id,
+                    showlegend=False,
+                )
+            )
 
     for node_type, color in NODE_COLORS.items():
         nodes = [node for node in graph.nodes.values() if node.node_type == node_type]
@@ -102,6 +144,8 @@ def plot_skeleton_3d(
     show_node_labels=False,
     node_size=40,
     edge_width=2.0,
+    show_smooth_centerlines=True,
+    smooth_centerline_width=3.0,
     fig_size=(7, 6),
     camera_eye=None,
 ):
@@ -119,6 +163,8 @@ def plot_skeleton_3d(
                 show_node_labels=show_node_labels,
                 node_size=node_size,
                 edge_width=edge_width,
+                show_smooth_centerlines=show_smooth_centerlines,
+                smooth_centerline_width=smooth_centerline_width,
             )
         )
         fig.update_layout(
@@ -143,7 +189,14 @@ def plot_skeleton_3d(
     else:
         fig = ax.figure
 
-    plot_skeleton_edges(graph, ax=ax, backend="mpl3d", linewidth=edge_width)
+    plot_skeleton_edges(
+        graph,
+        ax=ax,
+        backend="mpl3d",
+        linewidth=edge_width,
+        show_smooth_centerlines=show_smooth_centerlines,
+        smooth_centerline_width=smooth_centerline_width,
+    )
     plot_skeleton_nodes(
         graph,
         ax=ax,
@@ -207,6 +260,8 @@ def plot_skeleton_edges(
     *,
     backend="mpl3d",
     linewidth=2.0,
+    show_smooth_centerlines=True,
+    smooth_centerline_width=3.0,
 ):
     """Plot straight skeleton edges."""
     backend = str(backend).lower()
@@ -231,6 +286,15 @@ def plot_skeleton_edges(
             color=EDGE_COLORS.get(edge.edge_type, EDGE_COLORS["skeleton"]),
             linewidth=float(linewidth),
         )
+    if show_smooth_centerlines:
+        for _, points in _smooth_centerlines(graph):
+            ax.plot(
+                points[:, 0],
+                points[:, 1],
+                points[:, 2],
+                color=SMOOTH_CENTERLINE_COLOR,
+                linewidth=float(smooth_centerline_width),
+            )
     return ax
 
 
@@ -245,6 +309,8 @@ def plot_mesh_with_skeleton(
     show_node_labels=False,
     node_size=10,
     edge_width=2.5,
+    show_smooth_centerlines=True,
+    smooth_centerline_width=7,
     fig_size=(7, 6),
     camera_eye=None,
 ):
@@ -276,6 +342,8 @@ def plot_mesh_with_skeleton(
             show_node_labels=show_node_labels,
             node_size=node_size,
             edge_width=edge_width,
+            show_smooth_centerlines=show_smooth_centerlines,
+            smooth_centerline_width=smooth_centerline_width,
         ):
             fig.add_trace(trace)
         fig.update_layout(
@@ -310,7 +378,14 @@ def plot_mesh_with_skeleton(
         edgecolor="none",
         shade=True,
     )
-    plot_skeleton_edges(graph, ax=ax, backend="mpl3d", linewidth=edge_width)
+    plot_skeleton_edges(
+        graph,
+        ax=ax,
+        backend="mpl3d",
+        linewidth=edge_width,
+        show_smooth_centerlines=show_smooth_centerlines,
+        smooth_centerline_width=smooth_centerline_width,
+    )
     plot_skeleton_nodes(
         graph,
         ax=ax,
@@ -370,9 +445,14 @@ def _tube_surface(parameters, *, n_s=32, n_theta=16):
     radii = (
         float(parameters["r_neck"]),
         float(parameters["r_body"]),
-        float(parameters["r_tip"]),
+        float(parameters.get("r_taper", parameters["r_tip"])),
     )
-    s_values = np.linspace(0.0, 1.0, int(n_s))
+    body_s = float(parameters.get("s_body", 0.5))
+    taper_start = float(
+        parameters.get("s_taper", parameters.get("distal_taper_start", 0.85))
+    )
+    n_s = max(6, int(n_s))
+    s_values = np.linspace(0.0, 1.0, n_s, endpoint=False)
     theta = np.linspace(0.0, 2.0 * np.pi, int(n_theta), endpoint=False)
     vertices = []
     previous_normal = None
@@ -390,7 +470,14 @@ def _tube_surface(parameters, *, n_s=32, n_theta=16):
         binormal = np.cross(tangent, normal)
         binormal = binormal / max(np.linalg.norm(binormal), 1e-12)
         previous_normal = normal
-        radius = float(max(quadratic_radius(np.array([s]), *radii)[0], 1e-8))
+        radius = float(
+            capped_tube_radius(
+                np.array([s]),
+                *radii,
+                body_s=body_s,
+                taper_start=taper_start,
+            )[0]
+        )
         ring = [
             center + radius * (np.cos(a) * normal + np.sin(a) * binormal)
             for a in theta
@@ -399,7 +486,8 @@ def _tube_surface(parameters, *, n_s=32, n_theta=16):
 
     faces = []
     n_theta = int(n_theta)
-    for i in range(int(n_s) - 1):
+    n_rings = len(s_values)
+    for i in range(n_rings - 1):
         for j in range(n_theta):
             a = i * n_theta + j
             b = i * n_theta + (j + 1) % n_theta
@@ -407,6 +495,19 @@ def _tube_surface(parameters, *, n_s=32, n_theta=16):
             d = (i + 1) * n_theta + (j + 1) % n_theta
             faces.append([a, b, c])
             faces.append([b, d, c])
+
+    # Collapse the integrated taper to one vertex at the crypt-tip node.
+    tip_index = len(vertices)
+    vertices.append(centerline[-1])
+    last_ring = (n_rings - 1) * n_theta
+    for j in range(n_theta):
+        faces.append(
+            [
+                last_ring + j,
+                last_ring + (j + 1) % n_theta,
+                tip_index,
+            ]
+        )
     return np.asarray(vertices, dtype=float), np.asarray(faces, dtype=np.int64)
 
 

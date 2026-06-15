@@ -14,6 +14,7 @@ from organograph.skeleton import (
     crypt_path_length,
     crypt_straight_distance,
     crypt_tortuosity,
+    estimate_smooth_crypt_centerline,
     fit_crypt_tube_to_points,
     fit_ellipsoid_to_points,
     load_skeleton_json,
@@ -100,8 +101,15 @@ def make_ellipsoid_points(center, axes, n_u=24, n_v=13):
     return np.asarray(pts, dtype=float)
 
 
-def make_tube_points(centerline, radii=(1.0, 1.0, 1.0), n_s=21, n_theta=24):
-    from organograph.skeleton.primitive_geometry import quadratic_radius
+def make_tube_points(
+    centerline,
+    radii=(1.0, 1.0, 1.0),
+    n_s=21,
+    n_theta=24,
+    body_s=0.5,
+    distal_taper_start=0.85,
+):
+    from organograph.skeleton.primitive_geometry import capped_tube_radius
 
     centerline = np.asarray(centerline, dtype=float)
     pts = []
@@ -125,7 +133,14 @@ def make_tube_points(centerline, radii=(1.0, 1.0, 1.0), n_s=21, n_theta=24):
         normal = np.cross(tangent, ref)
         normal = normal / np.linalg.norm(normal)
         binormal = np.cross(tangent, normal)
-        radius = float(quadratic_radius(np.array([s]), *radii)[0])
+        radius = float(
+            capped_tube_radius(
+                np.array([s]),
+                *radii,
+                body_s=body_s,
+                taper_start=distal_taper_start,
+            )[0]
+        )
         for theta in np.linspace(0.0, 2.0 * math.pi, n_theta, endpoint=False):
             pts.append(center + radius * (math.cos(theta) * normal + math.sin(theta) * binormal))
     return np.asarray(pts, dtype=float)
@@ -430,7 +445,9 @@ class SkeletonTests(unittest.TestCase):
             radius_quantile=0.5,
             neck_window=(0.0, 0.01),
             body_window=(0.48, 0.52),
-            tip_window=(0.99, 1.0),
+            tip_window=(0.84, 0.86),
+            distal_taper_start=0.85,
+            optimize_radius_profile=False,
         )
 
         self.assertAlmostEqual(fit.parameters["r_neck"], 1.0, delta=0.15)
@@ -438,6 +455,105 @@ class SkeletonTests(unittest.TestCase):
         self.assertAlmostEqual(fit.parameters["r_tip"], 0.5, delta=0.15)
         self.assertAlmostEqual(fit.derived_parameters["length"], 10.0)
         self.assertAlmostEqual(fit.derived_parameters["bend_angle"], 0.0)
+        self.assertEqual(
+            fit.parameters["distal_taper"],
+            "smooth_squared_radius_to_zero",
+        )
+
+    def test_tube_fit_optimizes_ordered_profile_positions(self):
+        centerline = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 10.0]])
+        points = make_tube_points(
+            centerline,
+            radii=(0.8, 2.0, 0.6),
+            n_s=41,
+            body_s=0.35,
+            distal_taper_start=0.76,
+        )
+        fit = fit_crypt_tube_to_points(
+            points,
+            centerline,
+            initial_body_position=0.5,
+            initial_taper_position=0.85,
+        )
+
+        self.assertGreaterEqual(fit.parameters["s_body"], 0.2)
+        self.assertLessEqual(fit.parameters["s_body"], 0.7)
+        self.assertGreaterEqual(
+            fit.parameters["s_taper"],
+            fit.parameters["s_body"] + 0.1 - 1e-12,
+        )
+        self.assertLessEqual(fit.parameters["s_taper"], 0.9)
+        self.assertAlmostEqual(fit.parameters["s_body"], 0.35, delta=0.05)
+        self.assertAlmostEqual(fit.parameters["s_taper"], 0.76, delta=0.05)
+        self.assertTrue(fit.metadata["profile_optimization"]["success"])
+
+    def test_tube_radius_profile_is_smooth_at_taper_control(self):
+        from organograph.skeleton.primitive_geometry import capped_tube_radius
+
+        taper = 0.78
+        epsilon = 1e-5
+        samples = np.linspace(0.0, 1.0, 1001)
+        radii = capped_tube_radius(
+            samples,
+            0.7,
+            2.0,
+            0.6,
+            body_s=0.38,
+            taper_start=taper,
+        )
+        local = capped_tube_radius(
+            np.array([taper - epsilon, taper, taper + epsilon]),
+            0.7,
+            2.0,
+            0.6,
+            body_s=0.38,
+            taper_start=taper,
+        )
+        left_slope = (local[1] - local[0]) / epsilon
+        right_slope = (local[2] - local[1]) / epsilon
+
+        self.assertTrue(np.all(radii >= 0.0))
+        self.assertAlmostEqual(radii[-1], 0.0)
+        self.assertAlmostEqual(left_slope, right_slope, delta=1e-3)
+        self.assertLess(left_slope, -0.1)
+
+    def test_smooth_crypt_centerline_uses_geodesic_band_centers(self):
+        vertices = []
+        distances = []
+        n_rings = 21
+        n_theta = 20
+        for s in np.linspace(0.0, 1.0, n_rings):
+            angle = 0.5 * math.pi * s
+            center = np.array([math.sin(angle), 0.0, 1.0 - math.cos(angle)])
+            tangent = np.array([math.cos(angle), 0.0, math.sin(angle)])
+            normal = np.array([-math.sin(angle), 0.0, math.cos(angle)])
+            for theta in np.linspace(0.0, 2.0 * math.pi, n_theta, endpoint=False):
+                offset = 0.15 * (
+                    math.cos(theta) * normal
+                    + math.sin(theta) * np.array([0.0, 1.0, 0.0])
+                )
+                vertices.append(center + offset)
+                distances.append(1.0 - s)
+        vertices = np.asarray(vertices, dtype=float)
+        result = estimate_smooth_crypt_centerline(
+            vertices,
+            np.arange(vertices.shape[0]),
+            np.asarray(distances),
+            neck_position=[0.0, 0.0, 0.0],
+            tip_position=[1.0, 0.0, 1.0],
+            n_bands=7,
+            n_samples=65,
+        )
+
+        centerline = result["centerline_points"]
+        np.testing.assert_allclose(centerline[0], [0.0, 0.0, 0.0])
+        np.testing.assert_allclose(centerline[-1], [1.0, 0.0, 1.0])
+        expected_midpoint = np.array([math.sqrt(0.5), 0.0, 1.0 - math.sqrt(0.5)])
+        np.testing.assert_allclose(centerline[32], expected_midpoint, atol=0.04)
+        self.assertEqual(
+            result["method"],
+            "geodesic_band_centroids_quadratic_bezier",
+        )
 
     def test_bent_tube_fit_reports_length_and_bend_angle(self):
         centerline = np.array(
@@ -445,7 +561,11 @@ class SkeletonTests(unittest.TestCase):
             dtype=float,
         )
         points = make_tube_points(centerline, radii=(1.0, 1.0, 1.0))
-        fit = fit_crypt_tube_to_points(points, centerline)
+        fit = fit_crypt_tube_to_points(
+            points,
+            centerline,
+            optimize_radius_profile=False,
+        )
 
         self.assertAlmostEqual(fit.derived_parameters["length"], 10.0)
         self.assertAlmostEqual(fit.derived_parameters["bend_angle"], math.pi / 2.0)
@@ -488,6 +608,12 @@ class SkeletonTests(unittest.TestCase):
         self.assertEqual(len(loaded.primitive_attachments), 1)
         attachment = next(iter(loaded.primitive_attachments.values()))
         self.assertEqual(attachment.primitive_type, "tapered_capped_tube")
+        self.assertGreater(len(attachment.parameters["centerline_points"]), 3)
+        self.assertTrue(
+            loaded.node("crypt_a_crypt").metadata[
+                "position_refined_from_smooth_centerline"
+            ]
+        )
 
     def test_primitive_components_cut_body_and_branch_at_necks(self):
         vertices = np.zeros((9, 3), dtype=float)

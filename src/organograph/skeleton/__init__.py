@@ -6,6 +6,7 @@ axis extraction.
 """
 
 from organograph.skeleton.build import (
+    analyze_neck_circumference_profile,
     build_skeleton_from_crypt_detections,
     build_skeleton_from_segmentation_parameters,
     detect_crypts_for_skeleton,
@@ -36,12 +37,15 @@ from organograph.skeleton.primitive_geometry import (
 )
 from organograph.skeleton.primitive_fitting import (
     attach_body_primitive,
+    attach_body_branch_neck_primitives,
     attach_branch_primitives,
     attach_crypt_tube_primitives,
     crypt_terminal_paths,
     fit_blob_primitive_to_points,
+    fit_asymmetric_superellipsoid_to_points,
     fit_crypt_tube_to_points,
     fit_ellipsoid_to_points,
+    fit_straight_neck_cylinder,
     primitive_components_from_crypt_detections,
     primitive_attachments_to_dataframe,
 )
@@ -60,8 +64,10 @@ __all__ = [
     "SkeletonGraph",
     "SkeletonNode",
     "attach_body_primitive",
+    "attach_body_branch_neck_primitives",
     "attach_branch_primitives",
     "attach_crypt_tube_primitives",
+    "analyze_neck_circumference_profile",
     "build_skeleton_from_crypt_detections",
     "build_skeleton_from_segmentation_parameters",
     "crypt_attachment_direction",
@@ -74,8 +80,10 @@ __all__ = [
     "edge_length",
     "estimate_smooth_crypt_centerline",
     "fit_blob_primitive_to_points",
+    "fit_asymmetric_superellipsoid_to_points",
     "fit_crypt_tube_to_points",
     "fit_ellipsoid_to_points",
+    "fit_straight_neck_cylinder",
     "load_skeleton_json",
     "normalize_crypt_detections",
     "number_of_crypts",

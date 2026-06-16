@@ -192,7 +192,11 @@ def _crypt_adjacency(graph: SkeletonGraph, crypt_id, *, include_body_edge: bool 
 
 
 def _neck_nodes(graph: SkeletonGraph, crypt_id) -> list[SkeletonNode]:
-    return graph.nodes_for_crypt(crypt_id, node_type="neck")
+    return [
+        node
+        for node in graph.nodes_for_crypt(crypt_id)
+        if node.node_type in {"neck", "attachment"}
+    ]
 
 
 def _root_neck_nodes(graph: SkeletonGraph, crypt_id) -> list[SkeletonNode]:
@@ -208,7 +212,7 @@ def _root_neck_nodes(graph: SkeletonGraph, crypt_id) -> list[SkeletonNode]:
 
     incoming_nonbody = set()
     for edge in graph.edges_for_crypt(crypt_id, include_body_edge=False):
-        if graph.node(edge.target).node_type == "neck":
+        if graph.node(edge.target).node_type in {"neck", "attachment"}:
             incoming_nonbody.add(edge.target)
     roots = [neck for neck in necks if neck.node_id not in incoming_nonbody]
     return roots or necks

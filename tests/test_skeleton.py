@@ -2,21 +2,36 @@ import math
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
-from organograph.skeleton.build import _grow_parent_patch_to_neck, _select_hks_tips_from_axis
+from organograph.skeleton.build import (
+    _grow_parent_patch_to_neck,
+    _earlier_second_derivative_transition_level,
+    _penalize_short_crypt_bending,
+    _refine_body_transition_width_outliers,
+    _refine_broad_transition_opening,
+    _select_hks_tips_from_axis,
+    _validate_split_branch_geometry,
+)
 from organograph.skeleton import (
+    analyze_neck_circumference_profile,
     attach_body_primitive,
+    attach_body_branch_neck_primitives,
     attach_crypt_tube_primitives,
     build_skeleton_from_crypt_detections,
     crypt_bend_angle,
     crypt_path_length,
     crypt_straight_distance,
+    crypt_terminal_paths,
     crypt_tortuosity,
     estimate_smooth_crypt_centerline,
+    fit_asymmetric_superellipsoid_to_points,
     fit_crypt_tube_to_points,
     fit_ellipsoid_to_points,
+    fit_straight_neck_cylinder,
     load_skeleton_json,
     number_of_crypts,
     number_of_split_crypts,
@@ -108,6 +123,8 @@ def make_tube_points(
     n_theta=24,
     body_s=0.5,
     distal_taper_start=0.85,
+    constriction_s=None,
+    r_constriction=None,
 ):
     from organograph.skeleton.primitive_geometry import capped_tube_radius
 
@@ -139,6 +156,8 @@ def make_tube_points(
                 *radii,
                 body_s=body_s,
                 taper_start=distal_taper_start,
+                constriction_s=constriction_s,
+                r_constriction=r_constriction,
             )[0]
         )
         for theta in np.linspace(0.0, 2.0 * math.pi, n_theta, endpoint=False):
@@ -147,6 +166,171 @@ def make_tube_points(
 
 
 class SkeletonTests(unittest.TestCase):
+    def test_circumference_profile_distinguishes_constriction_and_transition(self):
+        levels = np.linspace(0.01, 2.0, 200)
+        constricted = 8.0 + 10.0 * (levels - 1.0) ** 2
+        profile = analyze_neck_circumference_profile(levels, constricted)
+
+        self.assertEqual(profile["kind"], "constriction")
+        self.assertAlmostEqual(profile["constriction_level"], 1.0, delta=0.02)
+        self.assertLess(profile["distal_boundary_level"], 1.0)
+        self.assertGreater(profile["attachment_level"], 1.0)
+        self.assertAlmostEqual(
+            profile["c_half"],
+            0.5 * (profile["c_min"] + profile["c_max"]),
+        )
+
+        transition = 3.0 + 4.0 * levels + 1.5 * np.tanh(8.0 * (levels - 1.0))
+        transition_profile = analyze_neck_circumference_profile(
+            levels,
+            transition,
+        )
+        self.assertEqual(transition_profile["kind"], "transition")
+        self.assertEqual(transition_profile["attachment_level"], 1.0)
+
+    def test_strong_second_derivative_transition_is_scored_highly(self):
+        levels = np.linspace(0.01, 2.0, 200)
+        transition = 8.0 + 2.0 * levels + np.logaddexp(
+            0.0,
+            25.0 * (levels - 1.0),
+        ) / 25.0
+        profile = analyze_neck_circumference_profile(levels, transition)
+
+        self.assertEqual(profile["kind"], "transition")
+        self.assertGreater(profile["second_derivative_peak_score"], 0.7)
+        self.assertAlmostEqual(
+            profile["second_derivative_peak_level"],
+            1.0,
+            delta=0.06,
+        )
+
+    def test_circumference_profile_does_not_relocate_neck_to_later_minimum(self):
+        levels = np.linspace(0.01, 2.0, 200)
+        circumference = (
+            8.0
+            + 2.0 * levels
+            - 5.0 * np.exp(-((levels - 1.5) / 0.06) ** 2)
+        )
+        profile = analyze_neck_circumference_profile(levels, circumference)
+
+        self.assertEqual(profile["kind"], "transition")
+        self.assertIsNone(profile["constriction_level"])
+        self.assertEqual(profile["attachment_level"], 1.0)
+        self.assertEqual(profile["distal_boundary_level"], 1.0)
+
+    def test_body_branch_neck_uses_twice_minimum_circumference(self):
+        levels = np.linspace(0.01, 2.0, 200)
+        circumference = 8.0 + 10.0 * (levels - 1.0) ** 2
+        profile = analyze_neck_circumference_profile(
+            levels,
+            circumference,
+            relation="body_branch",
+        )
+
+        self.assertEqual(profile["kind"], "constriction")
+        self.assertAlmostEqual(profile["c_max"], 2.0 * profile["c_min"])
+        self.assertAlmostEqual(profile["c_half"], 1.5 * profile["c_min"])
+
+    def test_short_constricted_neck_collapses_to_one_attachment(self):
+        levels = np.linspace(0.01, 2.0, 200)
+        circumference = 10.0 - 2.0 * np.exp(
+            -((levels - 1.0) / 0.02) ** 2
+        )
+        profile = analyze_neck_circumference_profile(
+            levels,
+            circumference,
+            min_neck_length=0.05,
+        )
+
+        self.assertEqual(profile["kind"], "transition")
+        self.assertEqual(profile["reason"], "constricted_neck_below_min_length")
+        self.assertEqual(profile["attachment_level"], 1.0)
+        self.assertIsNone(profile["constriction_level"])
+        self.assertLess(profile["candidate_neck_length"], 0.05)
+
+    def test_nearby_resampling_minimum_classifies_fixed_neck_as_constriction(self):
+        levels = np.linspace(0.01, 2.0, 200)
+        circumference = 12.0 + 20.0 * (levels - 1.02) ** 2
+        profile = analyze_neck_circumference_profile(levels, circumference)
+
+        self.assertEqual(profile["kind"], "constriction")
+        self.assertEqual(profile["constriction_level"], 1.0)
+        self.assertAlmostEqual(
+            profile["classification_minimum_level"],
+            1.02,
+            delta=0.011,
+        )
+
+    def test_explicit_neck_profile_builds_attachment_and_constriction_nodes(self):
+        graph = build_skeleton_from_crypt_detections(
+            VERTICES,
+            FACES,
+            [
+                {
+                    "crypt_id": "budded",
+                    "crypt_vertices": [0, 1, 2, 4],
+                    "attachment_position": [0.0, 0.0, -0.2],
+                    "constriction_position": [0.0, 0.0, 0.0],
+                    "tip_position": [0.0, 0.0, 2.0],
+                    "attachment_level": 1.3,
+                    "neck_profile": {
+                        "kind": "constriction",
+                        "attachment_level": 1.3,
+                        "constriction_level": 1.0,
+                        "distal_boundary_level": 0.7,
+                        "c_min": 1.0,
+                        "c_half": 1.5,
+                    },
+                }
+            ],
+            body_center=[0.0, 0.0, -1.0],
+            bend_strategy="crypt_centroid",
+        )
+
+        self.assertIn("crypt_budded_attachment", graph.nodes)
+        self.assertIn("crypt_budded_constriction", graph.nodes)
+        self.assertEqual(
+            graph.node("crypt_budded_attachment").node_type,
+            "attachment",
+        )
+        self.assertEqual(
+            graph.node("crypt_budded_constriction").node_type,
+            "constriction",
+        )
+        self.assertEqual(
+            graph.edge("crypt_budded_attachment_to_constriction").source,
+            "crypt_budded_attachment",
+        )
+        path = crypt_terminal_paths(graph, "budded")[0]
+        self.assertEqual(path[0], "crypt_budded_attachment")
+        self.assertIn("crypt_budded_constriction", path)
+
+    def test_transition_profile_builds_attachment_without_constriction(self):
+        graph = build_skeleton_from_crypt_detections(
+            VERTICES,
+            FACES,
+            [
+                {
+                    "crypt_id": "bulged",
+                    "crypt_vertices": [0, 1, 2, 4],
+                    "attachment_position": [0.0, 0.0, 0.0],
+                    "tip_position": [0.0, 0.0, 2.0],
+                    "neck_profile": {
+                        "kind": "transition",
+                        "attachment_level": 1.0,
+                    },
+                }
+            ],
+            body_center=[0.0, 0.0, -1.0],
+        )
+
+        self.assertIn("crypt_bulged_attachment", graph.nodes)
+        self.assertNotIn("crypt_bulged_constriction", graph.nodes)
+        self.assertEqual(
+            graph.edge("crypt_bulged_attachment_to_tip").source,
+            "crypt_bulged_attachment",
+        )
+
     def test_parent_patch_growth_accepts_boundary_minimum(self):
         vertices, faces = make_radial_ring_test_mesh(9)
         patch = [r * 9 + c for r in [3, 4, 5] for c in [3, 4, 5]]
@@ -192,6 +376,389 @@ class SkeletonTests(unittest.TestCase):
 
         self.assertLessEqual(result["final_region_size"], result["mesh_fraction_size_limit"])
         self.assertLessEqual(result["max_allowed_size"], int(np.floor(0.35 * len(vertices))))
+
+    def test_branch_geometry_rejects_broad_shallow_body_side_neck(self):
+        vertices, faces = make_grid_mesh(7, 7)
+        parent = [r * 7 + c for r in range(1, 6) for c in range(1, 6)]
+        daughter = [r * 7 + c for r in range(1, 6) for c in [4, 5]]
+        validation = {
+            "kept_as_split": True,
+            "reason": "boundary_minimum_found",
+            "neck_position": [3.0, 3.0, 0.0],
+            "neck_region_vertices": parent,
+        }
+
+        result = _validate_split_branch_geometry(
+            vertices,
+            faces,
+            parent,
+            [{"crypt_vertices": daughter}],
+            validation,
+            min_confidence=0.6,
+        )
+
+        self.assertFalse(result["kept_as_split"])
+        self.assertEqual(result["reason"], "branch_confidence_below_threshold")
+        self.assertTrue(result["branch_geometry_validation"]["applied"])
+        self.assertLess(result["branch_geometry_validation"]["confidence"], 0.6)
+
+    def test_branch_confidence_does_not_depend_on_residual_stem_width(self):
+        vertices, faces = make_grid_mesh(9, 9)
+        parent = [r * 9 + c for r in range(1, 8) for c in range(1, 8)]
+        validation = {
+            "kept_as_split": True,
+            "reason": "boundary_minimum_found",
+            "neck_position": [1.0, 1.0, 0.0],
+            "neck_region_vertices": parent,
+            "boundary_lengths": [30.0, 20.0, 12.0, 22.0],
+            "minimum_index": 2,
+            "max_mesh_fraction": 0.4,
+        }
+        small_daughters = [
+            {"crypt_vertices": [5 * 9 + 5, 5 * 9 + 6, 6 * 9 + 5]},
+            {"crypt_vertices": [3 * 9 + 5, 3 * 9 + 6, 4 * 9 + 6]},
+        ]
+        large_daughters = [
+            {
+                "crypt_vertices": [
+                    r * 9 + c for r in range(3, 8) for c in range(4, 8)
+                ]
+            },
+            {
+                "crypt_vertices": [
+                    r * 9 + c for r in range(1, 5) for c in range(4, 8)
+                ]
+            },
+        ]
+
+        small = _validate_split_branch_geometry(
+            vertices,
+            faces,
+            parent,
+            small_daughters,
+            validation,
+            min_confidence=0.0,
+        )
+        large = _validate_split_branch_geometry(
+            vertices,
+            faces,
+            parent,
+            large_daughters,
+            validation,
+            min_confidence=0.0,
+        )
+
+        self.assertAlmostEqual(
+            small["branch_geometry_validation"]["confidence"],
+            large["branch_geometry_validation"]["confidence"],
+        )
+        self.assertNotEqual(
+            small["branch_geometry_validation"]["n_branch_vertices"],
+            large["branch_geometry_validation"]["n_branch_vertices"],
+        )
+
+    def test_branch_validation_applies_final_body_radius_veto(self):
+        vertices, faces = make_grid_mesh(9, 9)
+        parent = [r * 9 + c for r in range(2, 8) for c in range(2, 8)]
+        daughters = [
+            {"crypt_vertices": [5 * 9 + 5, 5 * 9 + 6, 6 * 9 + 5]},
+            {"crypt_vertices": [3 * 9 + 5, 3 * 9 + 6, 4 * 9 + 6]},
+        ]
+        validation = {
+            "kept_as_split": True,
+            "reason": "boundary_minimum_found",
+            "neck_position": [2.0, 2.0, 0.0],
+            "neck_region_vertices": parent,
+            "boundary_lengths": [30.0, 20.0, 12.0, 22.0],
+            "minimum_index": 2,
+            "max_mesh_fraction": 0.4,
+        }
+        diagnostic = _validate_split_branch_geometry(
+            vertices,
+            faces,
+            parent,
+            daughters,
+            validation,
+            min_confidence=0.0,
+            max_neck_to_body_radius_ratio=10.0,
+        )
+        ratio = diagnostic["branch_geometry_validation"][
+            "neck_to_body_radius_ratio"
+        ]
+        self.assertIsNotNone(ratio)
+
+        rejected = _validate_split_branch_geometry(
+            vertices,
+            faces,
+            parent,
+            daughters,
+            validation,
+            min_confidence=0.0,
+            max_neck_to_body_radius_ratio=max(float(ratio) - 1e-6, 0.0),
+        )
+
+        self.assertFalse(rejected["kept_as_split"])
+        self.assertEqual(
+            rejected["reason"],
+            "body_side_neck_too_broad_for_body",
+        )
+        self.assertFalse(
+            rejected["branch_geometry_validation"]["body_radius_check_passed"]
+        )
+
+    def test_short_crypt_bend_penalty_reduces_lateral_waypoint_offset(self):
+        source = np.array([0.0, 0.0, 0.0])
+        tip = np.array([1.0, 0.0, 0.0])
+        candidate = np.array([0.5, 1.0, 0.0])
+        vertices = np.array(
+            [
+                [0.1, 0.2, 0.0],
+                [0.3, -0.2, 0.0],
+                [0.5, 0.2, 0.0],
+                [0.7, -0.2, 0.0],
+                [0.9, 0.2, 0.0],
+            ]
+        )
+
+        refined, diagnostics = _penalize_short_crypt_bending(
+            vertices,
+            np.arange(len(vertices)),
+            source,
+            candidate,
+            tip,
+            max_dimensionless_curvature=0.05,
+            penalty_strength=12.0,
+        )
+
+        self.assertTrue(diagnostics["applied"])
+        self.assertLess(abs(refined[1]), abs(candidate[1]))
+        self.assertLess(
+            diagnostics["final_dimensionless_curvature"],
+            diagnostics["original_dimensionless_curvature"],
+        )
+
+    def test_broad_transition_opening_moves_attachment_tipward(self):
+        vertices, faces = make_grid_mesh(7, 7)
+        mesh = SimpleNamespace(v=vertices, f=faces)
+        patch_vertices = [r * 7 + c for r in range(7) for c in range(5)]
+        old_field = vertices[:, 0] / 4.0
+        detection = {
+            "crypt_vertices": patch_vertices,
+            "bottom_vertex_id": 3 * 7,
+            "d_crypt": old_field,
+            "L_crypt": 4.0,
+            "attachment_level": 1.0,
+            "neck_profile": {"kind": "transition", "attachment_level": 1.0},
+        }
+        levels = np.linspace(0.05, 1.5, 60)
+        detection["circumference_levels"] = levels
+        detection["circumference"] = 5.0 + 7.0 * levels
+
+        def geodesics(_mesh, sources=None, **kwargs):
+            return vertices[:, 0][None, :]
+
+        with patch(
+            "organograph.crypts.analysis.crypt_circumference",
+            return_value=5.0 + 7.0 * levels,
+        ):
+            refined = _refine_broad_transition_opening(
+                mesh,
+                detection,
+                levels,
+                geodesic_fn=geodesics,
+                geodesic_kwargs={},
+                max_opening_to_crypt_body_ratio=0.85,
+                min_attachment_level=0.35,
+            )
+
+        diagnostics = refined["broad_opening_validation"]
+        self.assertTrue(diagnostics["refined"])
+        self.assertLess(refined["attachment_level"], 1.0)
+        self.assertEqual(refined["bottom_vertex_id"], 3 * 7)
+
+    def test_broad_opening_preserves_structured_transition_profile(self):
+        vertices, faces = make_grid_mesh(7, 7)
+        mesh = SimpleNamespace(v=vertices, f=faces)
+        levels = np.linspace(0.05, 1.5, 60)
+        structured = (
+            4.0
+            + 5.0 * levels
+            - 1.2 * np.exp(-((levels - 0.65) / 0.13) ** 2)
+            + 1.5 * np.logaddexp(0.0, 18.0 * (levels - 0.9)) / 18.0
+        )
+        detection = {
+            "crypt_vertices": np.arange(len(vertices)),
+            "bottom_vertex_id": 0,
+            "d_crypt": np.zeros(len(vertices)),
+            "attachment_level": 1.0,
+            "circumference_levels": levels,
+            "circumference": structured,
+            "neck_profile": {
+                "kind": "transition",
+                "relation": "body_crypt",
+                "attachment_level": 1.0,
+            },
+        }
+
+        refined = _refine_broad_transition_opening(
+            mesh,
+            detection,
+            levels,
+            geodesic_fn=lambda *args, **kwargs: self.fail(
+                "structured transitions should not recompute geodesics"
+            ),
+            geodesic_kwargs={},
+        )
+
+        self.assertEqual(refined["attachment_level"], 1.0)
+        self.assertFalse(refined["broad_opening_validation"]["refined"])
+        self.assertEqual(
+            refined["broad_opening_validation"]["reason"],
+            "structured_transition_profile_preserved",
+        )
+        self.assertLess(
+            refined["broad_opening_validation"]["linear_profile_r2"],
+            0.985,
+        )
+
+    def test_branch_crypt_uses_looser_opening_ratio(self):
+        vertices, faces = make_grid_mesh(7, 7)
+        mesh = SimpleNamespace(v=vertices, f=faces)
+        patch_vertices = [r * 7 + c for r in range(7) for c in range(5)]
+        detection = {
+            "crypt_vertices": patch_vertices,
+            "bottom_vertex_id": 3 * 7,
+            "d_crypt": vertices[:, 0] / 4.0,
+            "attachment_level": 1.0,
+            "neck_profile": {
+                "kind": "transition",
+                "relation": "branch_crypt",
+                "attachment_level": 1.0,
+                "second_derivative_peak_score": 0.0,
+            },
+        }
+        levels = np.linspace(0.05, 1.5, 60)
+        detection["circumference_levels"] = levels
+        detection["circumference"] = 5.0 + 7.0 * levels
+        circumference = 10.0 - np.exp(-((levels - 1.0) / 0.08) ** 2)
+
+        with patch(
+            "organograph.crypts.analysis.crypt_circumference",
+            return_value=circumference,
+        ):
+            refined = _refine_broad_transition_opening(
+                mesh,
+                detection,
+                levels,
+                geodesic_fn=lambda _mesh, sources=None, **kwargs: vertices[:, 0][None, :],
+                geodesic_kwargs={},
+                max_opening_to_crypt_body_ratio=0.85,
+                branch_max_opening_to_crypt_body_ratio=0.95,
+            )
+
+        self.assertFalse(refined["broad_opening_validation"]["refined"])
+        self.assertAlmostEqual(
+            refined["broad_opening_validation"]["max_opening_to_crypt_body_ratio"],
+            0.95,
+        )
+
+    def test_body_transition_width_outlier_uses_earlier_second_derivative_peak(self):
+        vertices, faces = make_grid_mesh(9, 9)
+        mesh = SimpleNamespace(v=vertices, f=faces)
+        levels = np.linspace(0.05, 1.0, 120)
+        circumference = 5.0 + 16.0 * levels + 8.0 * np.logaddexp(
+            0.0,
+            35.0 * (levels - 0.55),
+        ) / 35.0
+        detection = {
+            "crypt_id": "wide",
+            "crypt_vertices": np.arange(len(vertices)),
+            "bottom_vertex_id": 4 * 9,
+            "d_crypt": vertices[:, 0] / 8.0,
+            "attachment_level": 1.0,
+            "attachment_position": [8.0, 4.0, 0.0],
+            "circumference_levels": levels,
+            "circumference": circumference,
+            "neck_profile": {
+                "kind": "transition",
+                "relation": "body_crypt",
+                "attachment_level": 1.0,
+            },
+        }
+
+        refined = _refine_body_transition_width_outliers(
+            mesh,
+            [detection],
+            max_crypt_to_host_width_ratio=0.8,
+            min_second_derivative_score=0.5,
+            min_attachment_level=0.3,
+        )[0]
+
+        diagnostics = refined["body_transition_width_validation"]
+        self.assertTrue(diagnostics["refined"])
+        self.assertEqual(diagnostics["reason"], "earlier_second_derivative_transition")
+        self.assertLess(refined["attachment_level"], 1.0)
+        self.assertAlmostEqual(refined["attachment_level"], 0.55, delta=0.08)
+
+    def test_second_derivative_transition_selects_earliest_plausible_peak(self):
+        levels = np.linspace(0.05, 1.0, 160)
+        smooth = (
+            4.0
+            + 5.0 * levels
+            + 4.0 * np.logaddexp(0.0, 45.0 * (levels - 0.32)) / 45.0
+            + 9.0 * np.logaddexp(0.0, 45.0 * (levels - 0.72)) / 45.0
+        )
+
+        level, details = _earlier_second_derivative_transition_level(
+            levels,
+            smooth,
+            current_level=1.0,
+            min_level=0.25,
+            min_score=0.5,
+            window_length=9,
+        )
+
+        self.assertIsNotNone(level)
+        self.assertAlmostEqual(level, 0.32, delta=0.06)
+        self.assertGreaterEqual(len(details["accepted_candidate_levels"]), 2)
+        self.assertAlmostEqual(level, details["accepted_candidate_levels"][0])
+
+    def test_body_transition_width_outlier_shrinks_to_threshold_without_peak(self):
+        vertices, faces = make_grid_mesh(9, 9)
+        mesh = SimpleNamespace(v=vertices, f=faces)
+        levels = np.linspace(0.05, 1.0, 120)
+        circumference = 5.0 + 22.0 * levels
+        detection = {
+            "crypt_id": "wide",
+            "crypt_vertices": np.arange(len(vertices)),
+            "bottom_vertex_id": 4 * 9,
+            "d_crypt": vertices[:, 0] / 8.0,
+            "attachment_level": 1.0,
+            "attachment_position": [8.0, 4.0, 0.0],
+            "circumference_levels": levels,
+            "circumference": circumference,
+            "neck_profile": {
+                "kind": "transition",
+                "relation": "body_crypt",
+                "attachment_level": 1.0,
+            },
+        }
+
+        refined = _refine_body_transition_width_outliers(
+            mesh,
+            [detection],
+            max_crypt_to_host_width_ratio=0.8,
+            min_second_derivative_score=0.99,
+            min_attachment_level=0.3,
+        )[0]
+
+        diagnostics = refined["body_transition_width_validation"]
+        self.assertTrue(diagnostics["refined"])
+        self.assertIn("width_threshold", diagnostics["reason"])
+        self.assertLessEqual(
+            diagnostics["refined_crypt_to_host_width_ratio"],
+            0.8 + 1e-6,
+        )
 
     def test_final_hks_tip_selection_uses_refined_axis_bottom_fraction(self):
         vertices, faces = make_grid_mesh(7, 7)
@@ -329,6 +896,14 @@ class SkeletonTests(unittest.TestCase):
         self.assertEqual(number_of_crypts(graph), 1)
         self.assertEqual(number_of_split_crypts(graph), 1)
         self.assertEqual(len(graph.nodes_for_crypt("split", node_type="neck")), 3)
+        self.assertEqual(
+            len(graph.nodes_for_crypt("split", node_type="attachment")),
+            0,
+        )
+        self.assertEqual(
+            len(graph.nodes_for_crypt("split", node_type="constriction")),
+            0,
+        )
         self.assertEqual(len(graph.nodes_for_crypt("split", node_type="crypt")), 0)
         self.assertEqual(len(graph.nodes_for_crypt("split", node_type="tip")), 2)
 
@@ -346,6 +921,7 @@ class SkeletonTests(unittest.TestCase):
             ],
             body_center=[0.0, 0.0, -1.0],
             bend_strategy="crypt_centroid",
+            bend_max_dimensionless_curvature=None,
         )
 
         self.assertEqual(len(graph.nodes_for_crypt("centroid", node_type="crypt")), 1)
@@ -436,6 +1012,41 @@ class SkeletonTests(unittest.TestCase):
             atol=0.08,
         )
 
+    def test_asymmetric_superellipsoid_recovers_directional_axes(self):
+        eta = np.linspace(-0.5 * math.pi, 0.5 * math.pi, 28)
+        omega = np.linspace(-math.pi, math.pi, 48, endpoint=False)
+        ee, ww = np.meshgrid(eta, omega, indexing="ij")
+
+        def signed_power(values, exponent):
+            return np.sign(values) * np.abs(values) ** exponent
+
+        epsilon_1, epsilon_2 = 0.8, 1.2
+        base = np.stack(
+            [
+                signed_power(np.cos(ee), epsilon_1)
+                * signed_power(np.cos(ww), epsilon_2),
+                signed_power(np.cos(ee), epsilon_1)
+                * signed_power(np.sin(ww), epsilon_2),
+                signed_power(np.sin(ee), epsilon_1),
+            ],
+            axis=-1,
+        )
+        negative = np.array([1.2, 1.5, 0.9])
+        positive = np.array([3.0, 2.0, 1.1])
+        points = (base * np.where(base >= 0.0, positive, negative)).reshape(-1, 3)
+        fit = fit_asymmetric_superellipsoid_to_points(points)
+
+        self.assertEqual(fit.primitive_type, "asymmetric_superellipsoid")
+        fitted_negative = np.asarray(fit.parameters["axis_lengths_negative"])
+        fitted_positive = np.asarray(fit.parameters["axis_lengths_positive"])
+        directional_ratios = np.maximum(
+            fitted_positive / fitted_negative,
+            fitted_negative / fitted_positive,
+        )
+        self.assertGreater(float(np.max(directional_ratios)), 1.5)
+        self.assertTrue(0.3 <= fit.parameters["epsilon_1"] <= 2.0)
+        self.assertTrue(0.3 <= fit.parameters["epsilon_2"] <= 2.0)
+
     def test_straight_tapered_tube_fit_recovers_radii(self):
         centerline = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 10.0]])
         points = make_tube_points(centerline, radii=(1.0, 2.0, 0.5))
@@ -517,6 +1128,40 @@ class SkeletonTests(unittest.TestCase):
         self.assertAlmostEqual(left_slope, right_slope, delta=1e-3)
         self.assertLess(left_slope, -0.1)
 
+    def test_constricted_crypt_tube_recovers_internal_neck_radius(self):
+        centerline = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 10.0]])
+        points = make_tube_points(
+            centerline,
+            radii=(1.4, 2.1, 0.6),
+            n_s=61,
+            body_s=0.5,
+            distal_taper_start=0.82,
+            constriction_s=0.18,
+            r_constriction=0.7,
+        )
+        fit = fit_crypt_tube_to_points(
+            points,
+            centerline,
+            constriction_s=0.18,
+            initial_body_position=0.5,
+            initial_taper_position=0.82,
+        )
+
+        self.assertAlmostEqual(fit.parameters["s_constriction"], 0.18)
+        self.assertAlmostEqual(
+            fit.parameters["r_constriction"],
+            0.7,
+            delta=0.12,
+        )
+        self.assertLess(
+            fit.parameters["r_constriction"],
+            fit.parameters["r_neck"],
+        )
+        self.assertAlmostEqual(
+            fit.derived_parameters["constriction_ratio"],
+            fit.parameters["r_constriction"] / fit.parameters["r_body"],
+        )
+
     def test_smooth_crypt_centerline_uses_geodesic_band_centers(self):
         vertices = []
         distances = []
@@ -553,6 +1198,63 @@ class SkeletonTests(unittest.TestCase):
         self.assertEqual(
             result["method"],
             "geodesic_band_centroids_quadratic_bezier",
+        )
+
+    def test_smooth_centerline_is_influenced_by_constriction_center(self):
+        vertices = []
+        distances = []
+        neck_level = 1.25
+        for s in np.linspace(0.0, 1.0, 21):
+            center = np.array([0.0, 0.0, s])
+            for theta in np.linspace(0.0, 2.0 * math.pi, 16, endpoint=False):
+                vertices.append(
+                    center
+                    + 0.1
+                    * np.array([math.cos(theta), math.sin(theta), 0.0])
+                )
+                distances.append(neck_level * (1.0 - s))
+        vertices = np.asarray(vertices, dtype=float)
+        distances = np.asarray(distances, dtype=float)
+        constriction = np.array([0.4, 0.0, 0.2])
+
+        unanchored = estimate_smooth_crypt_centerline(
+            vertices,
+            np.arange(vertices.shape[0]),
+            distances,
+            neck_position=[0.0, 0.0, 0.0],
+            tip_position=[0.0, 0.0, 1.0],
+            neck_level=neck_level,
+            n_samples=101,
+        )
+        anchored = estimate_smooth_crypt_centerline(
+            vertices,
+            np.arange(vertices.shape[0]),
+            distances,
+            neck_position=[0.0, 0.0, 0.0],
+            tip_position=[0.0, 0.0, 1.0],
+            neck_level=neck_level,
+            n_samples=101,
+            constriction_position=constriction,
+            constriction_level=1.0,
+            constriction_weight=4.0,
+        )
+
+        unanchored_distance = np.linalg.norm(
+            unanchored["centerline_points"][20] - constriction
+        )
+        anchored_distance = np.linalg.norm(
+            anchored["centerline_points"][20] - constriction
+        )
+        self.assertLess(anchored_distance, unanchored_distance)
+        self.assertTrue(anchored["constriction_used"])
+        self.assertAlmostEqual(anchored["constriction_parameter"], 0.2)
+        self.assertEqual(
+            anchored["method"],
+            "geodesic_bands_constriction_anchored_quadratic_bezier",
+        )
+        np.testing.assert_allclose(
+            anchored["centerline_points"][[0, -1]],
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
         )
 
     def test_bent_tube_fit_reports_length_and_bend_angle(self):
@@ -663,6 +1365,94 @@ class SkeletonTests(unittest.TestCase):
         self.assertEqual(components["branches"]["crypt_split_branch"], [2, 3, 4])
         self.assertEqual(components["crypts"]["crypt_split_tip_0"], [5, 6])
         self.assertEqual(components["crypts"]["crypt_split_tip_1"], [7])
+
+    def test_body_branch_neck_cylinder_fits_before_blob_components(self):
+        theta = np.linspace(0.0, 2.0 * math.pi, 24, endpoint=False)
+        ring = np.column_stack(
+            [
+                np.zeros(theta.size),
+                np.cos(theta),
+                np.sin(theta),
+            ]
+        )
+        body_points = np.array(
+            [
+                [-3.0, 0.0, 0.0],
+                [-2.0, 1.5, 0.0],
+                [-2.0, -1.5, 0.0],
+                [-2.0, 0.0, 1.5],
+            ]
+        )
+        branch_points = np.array(
+            [
+                [3.0, 0.0, 0.0],
+                [2.0, 1.5, 0.0],
+                [2.0, -1.5, 0.0],
+                [2.0, 0.0, 1.5],
+            ]
+        )
+        vertices = np.vstack([ring, body_points, branch_points])
+        boundary = np.arange(ring.shape[0])
+        fit = fit_straight_neck_cylinder(
+            vertices,
+            boundary,
+            body_center=[-2.0, 0.0, 0.0],
+            neck_center=[0.0, 0.0, 0.0],
+            branch_center=[2.0, 0.0, 0.0],
+            max_extent_fraction=0.25,
+        )
+
+        self.assertEqual(fit.primitive_type, "straight_cylinder")
+        self.assertAlmostEqual(fit.parameters["radius"], 1.0, delta=0.05)
+        np.testing.assert_allclose(fit.parameters["axis"], [1.0, 0.0, 0.0])
+        self.assertLessEqual(fit.derived_parameters["length"], 1.0 + 1e-12)
+
+        graph = build_skeleton_from_crypt_detections(
+            vertices,
+            np.empty((0, 3), dtype=np.int64),
+            [
+                {
+                    "crypt_id": "split",
+                    "neck_position": [0.0, 0.0, 0.0],
+                    "branch_position": [2.0, 0.0, 0.0],
+                    "neck_region_vertices": list(range(24, 28)),
+                    "daughters": [
+                        {
+                            "neck_position": [2.0, 1.0, 0.0],
+                            "tip_position": [2.0, 2.0, 0.0],
+                            "crypt_vertices": [28],
+                        },
+                        {
+                            "neck_position": [2.0, -1.0, 0.0],
+                            "tip_position": [2.0, -2.0, 0.0],
+                            "crypt_vertices": [29],
+                        },
+                    ],
+                }
+            ],
+            body_center=[-2.0, 0.0, 0.0],
+        )
+        result = attach_body_branch_neck_primitives(
+            graph,
+            vertices,
+            {
+                "crypt_split_neck_cylinder": {
+                    "body_node_id": "body",
+                    "neck_node_id": "crypt_split_neck",
+                    "branch_node_id": "crypt_split_branch",
+                    "boundary_vertices": boundary,
+                }
+            },
+            body_component=np.arange(vertices.shape[0]),
+            branch_components={"crypt_split_branch": np.arange(vertices.shape[0])},
+            max_extent_fraction=0.25,
+        )
+        self.assertIn("crypt_split_neck_cylinder", graph.primitive_attachments)
+        self.assertLess(len(result["body"]), vertices.shape[0])
+        self.assertLess(
+            len(result["branches"]["crypt_split_branch"]),
+            vertices.shape[0],
+        )
 
     def test_neck_from_distance_field_uses_ring_center(self):
         vertices = np.array(

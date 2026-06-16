@@ -4,12 +4,17 @@ from __future__ import annotations
 
 import numpy as np
 
-from organograph.skeleton.primitive_geometry import capped_tube_radius, polyline_lengths
+from organograph.skeleton.primitive_geometry import (
+    capped_tube_radius,
+    polyline_lengths,
+)
 
 
 NODE_COLORS = {
     "body": "#4c78a8",
     "neck": "#f58518",
+    "attachment": "#ffbf79",
+    "constriction": "#d95f02",
     "crypt": "#72b7b2",
     "bend": "#54a24b",
     "branch": "#b279a2",
@@ -18,6 +23,17 @@ NODE_COLORS = {
 
 EDGE_COLORS = {
     "body_to_neck": "#7f7f7f",
+    "body_to_attachment": "#7f7f7f",
+    "attachment_to_constriction": "#222222",
+    "attachment_to_crypt": "#222222",
+    "attachment_to_bend": "#222222",
+    "attachment_to_tip": "#222222",
+    "constriction_to_crypt": "#222222",
+    "constriction_to_bend": "#222222",
+    "constriction_to_tip": "#222222",
+    "attachment_to_branch": "#222222",
+    "constriction_to_branch": "#222222",
+    "branch_to_attachment": "#222222",
     "neck_to_crypt": "#222222",
     "crypt_to_tip": "#222222",
     "neck_to_tip": "#222222",
@@ -33,7 +49,9 @@ EDGE_COLORS = {
 PRIMITIVE_COLORS = {
     "ellipsoid": "#4c78a8",
     "superellipsoid_placeholder": "#4c78a8",
+    "asymmetric_superellipsoid": "#4c78a8",
     "tapered_capped_tube": "#72b7b2",
+    "straight_cylinder": "#e6ab02",
 }
 
 SMOOTH_CENTERLINE_COLOR = "#008b8b"
@@ -425,6 +443,45 @@ def _ellipsoid_surface(parameters, *, n_u=32, n_v=16):
     return xyz, np.asarray(faces, dtype=np.int64)
 
 
+def _signed_power(values, exponent):
+    values = np.asarray(values, dtype=float)
+    return np.sign(values) * np.abs(values) ** float(exponent)
+
+
+def _asymmetric_superellipsoid_surface(parameters, *, n_u=32, n_v=16):
+    center = np.asarray(parameters["center"], dtype=float)
+    orientation = np.asarray(parameters["orientation"], dtype=float)
+    negative = np.asarray(parameters["axis_lengths_negative"], dtype=float)
+    positive = np.asarray(parameters["axis_lengths_positive"], dtype=float)
+    epsilon_1 = float(parameters["epsilon_1"])
+    epsilon_2 = float(parameters["epsilon_2"])
+    u = np.linspace(-np.pi, np.pi, int(n_u), endpoint=False)
+    v = np.linspace(-0.5 * np.pi, 0.5 * np.pi, int(n_v))
+    uu, vv = np.meshgrid(u, v)
+    base = np.stack(
+        [
+            _signed_power(np.cos(vv), epsilon_1)
+            * _signed_power(np.cos(uu), epsilon_2),
+            _signed_power(np.cos(vv), epsilon_1)
+            * _signed_power(np.sin(uu), epsilon_2),
+            _signed_power(np.sin(vv), epsilon_1),
+        ],
+        axis=-1,
+    )
+    scales = np.where(base >= 0.0, positive[None, None, :], negative[None, None, :])
+    local = base * scales
+    xyz = local.reshape(-1, 3) @ orientation.T + center[None, :]
+    faces = []
+    for i in range(int(n_v) - 1):
+        for j in range(int(n_u)):
+            a = i * int(n_u) + j
+            b = i * int(n_u) + (j + 1) % int(n_u)
+            c = (i + 1) * int(n_u) + j
+            d = (i + 1) * int(n_u) + (j + 1) % int(n_u)
+            faces.extend(([a, b, c], [b, d, c]))
+    return xyz, np.asarray(faces, dtype=np.int64)
+
+
 def _polyline_point_at_s(centerline, s):
     centerline = np.asarray(centerline, dtype=float)
     lengths, cumulative, total = polyline_lengths(centerline)
@@ -476,6 +533,8 @@ def _tube_surface(parameters, *, n_s=32, n_theta=16):
                 *radii,
                 body_s=body_s,
                 taper_start=taper_start,
+                constriction_s=parameters.get("s_constriction"),
+                r_constriction=parameters.get("r_constriction"),
             )[0]
         )
         ring = [
@@ -511,12 +570,57 @@ def _tube_surface(parameters, *, n_s=32, n_theta=16):
     return np.asarray(vertices, dtype=float), np.asarray(faces, dtype=np.int64)
 
 
+def _cylinder_surface(parameters, *, n_s=16, n_theta=16):
+    centerline = np.asarray(parameters["centerline_points"], dtype=float)
+    start, end = centerline[0], centerline[-1]
+    tangent = end - start
+    length = float(np.linalg.norm(tangent))
+    if length <= 1e-12:
+        return np.empty((0, 3), dtype=float), np.empty((0, 3), dtype=np.int64)
+    tangent /= length
+    reference = np.array([0.0, 0.0, 1.0])
+    if abs(float(np.dot(reference, tangent))) > 0.9:
+        reference = np.array([0.0, 1.0, 0.0])
+    normal = np.cross(tangent, reference)
+    normal /= max(float(np.linalg.norm(normal)), 1e-12)
+    binormal = np.cross(tangent, normal)
+    radius = float(parameters["radius"])
+    s_values = np.linspace(0.0, 1.0, max(2, int(n_s)))
+    theta = np.linspace(0.0, 2.0 * np.pi, max(3, int(n_theta)), endpoint=False)
+    vertices = []
+    for s in s_values:
+        center = start + s * (end - start)
+        vertices.extend(
+            center
+            + radius * (np.cos(angle) * normal + np.sin(angle) * binormal)
+            for angle in theta
+        )
+    faces = []
+    n_theta = len(theta)
+    for i in range(len(s_values) - 1):
+        for j in range(n_theta):
+            a = i * n_theta + j
+            b = i * n_theta + (j + 1) % n_theta
+            c = (i + 1) * n_theta + j
+            d = (i + 1) * n_theta + (j + 1) % n_theta
+            faces.extend(([a, b, c], [b, d, c]))
+    return np.asarray(vertices, dtype=float), np.asarray(faces, dtype=np.int64)
+
+
 def _primitive_mesh(attachment, *, n_s=32, n_theta=16):
     primitive_type = attachment.primitive_type
     if primitive_type in {"ellipsoid", "superellipsoid_placeholder"}:
         return _ellipsoid_surface(attachment.parameters, n_u=n_theta * 2, n_v=n_s)
+    if primitive_type == "asymmetric_superellipsoid":
+        return _asymmetric_superellipsoid_surface(
+            attachment.parameters,
+            n_u=n_theta * 2,
+            n_v=n_s,
+        )
     if primitive_type == "tapered_capped_tube":
         return _tube_surface(attachment.parameters, n_s=n_s, n_theta=n_theta)
+    if primitive_type == "straight_cylinder":
+        return _cylinder_surface(attachment.parameters, n_s=n_s, n_theta=n_theta)
     return None, None
 
 

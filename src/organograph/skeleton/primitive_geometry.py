@@ -171,6 +171,9 @@ def estimate_smooth_crypt_centerline(
     n_samples: int = 64,
     min_band_points: int = 3,
     control_regularization: float = 0.05,
+    constriction_position=None,
+    constriction_level: float | None = None,
+    constriction_weight: float = 4.0,
 ) -> dict[str, Any]:
     """Estimate a smooth internal crypt centerline from geodesic bands.
 
@@ -221,14 +224,41 @@ def estimate_smooth_crypt_centerline(
         ring_parameters.append(float(target))
         band_sizes.append(int(selected.size))
 
-    ring_centers = np.asarray(ring_centers, dtype=float)
+    ring_centers = np.asarray(ring_centers, dtype=float).reshape(-1, 3)
     ring_parameters = np.asarray(ring_parameters, dtype=float)
+    fit_centers = ring_centers.copy()
+    fit_parameters = ring_parameters.copy()
+    fit_weights = np.asarray(band_sizes, dtype=float)
+    constriction_parameter = None
+    constriction_used = False
+    if constriction_position is not None:
+        constriction = np.asarray(constriction_position, dtype=float)
+        c_level = 1.0 if constriction_level is None else float(constriction_level)
+        c_parameter = 1.0 - c_level / level
+        if (
+            constriction.shape == (3,)
+            and np.all(np.isfinite(constriction))
+            and 0.0 < c_parameter < 1.0
+            and float(constriction_weight) > 0.0
+        ):
+            reference_weight = (
+                float(np.median(fit_weights))
+                if fit_weights.size
+                else 1.0
+            )
+            anchor_weight = max(reference_weight, 1.0) * float(constriction_weight)
+            fit_centers = np.vstack([fit_centers, constriction])
+            fit_parameters = np.append(fit_parameters, c_parameter)
+            fit_weights = np.append(fit_weights, anchor_weight)
+            constriction_parameter = float(c_parameter)
+            constriction_used = True
+
     control = fit_quadratic_bezier_control(
         neck,
         tip,
-        ring_centers,
-        ring_parameters,
-        weights=np.asarray(band_sizes, dtype=float),
+        fit_centers,
+        fit_parameters,
+        weights=fit_weights,
         regularization=control_regularization,
     )
     centerline = sample_quadratic_bezier(
@@ -245,7 +275,16 @@ def estimate_smooth_crypt_centerline(
         "ring_centers": ring_centers,
         "ring_parameters": ring_parameters,
         "band_sizes": band_sizes,
-        "method": "geodesic_band_centroids_quadratic_bezier",
+        "constriction_used": constriction_used,
+        "constriction_parameter": constriction_parameter,
+        "constriction_weight": (
+            float(constriction_weight) if constriction_used else None
+        ),
+        "method": (
+            "geodesic_bands_constriction_anchored_quadratic_bezier"
+            if constriction_used
+            else "geodesic_band_centroids_quadratic_bezier"
+        ),
     }
 
 
@@ -298,6 +337,8 @@ def capped_tube_radius(
     *,
     body_s: float = 0.5,
     taper_start: float = 0.85,
+    constriction_s: float | None = None,
+    r_constriction: float | None = None,
 ) -> np.ndarray:
     """Shape-preserving smooth radius profile that closes at the crypt tip.
 
@@ -314,11 +355,24 @@ def capped_tube_radius(
         raise ValueError("Radius positions must satisfy 0 < body_s < taper_start < 1")
 
     clipped = np.clip(values, 0.0, 1.0)
-    control_s = np.array([0.0, body, start, 1.0], dtype=float)
-    control_radius = np.maximum(
-        np.array([r_neck, r_body, r_tip, 0.0], dtype=float),
-        0.0,
-    )
+    if constriction_s is not None and r_constriction is not None:
+        constriction = float(constriction_s)
+        if not (0.0 < constriction < body):
+            raise ValueError(
+                "constriction_s must satisfy 0 < constriction_s < body_s"
+            )
+        control_s = np.array(
+            [0.0, constriction, body, start, 1.0],
+            dtype=float,
+        )
+        control_radius = np.array(
+            [r_neck, r_constriction, r_body, r_tip, 0.0],
+            dtype=float,
+        )
+    else:
+        control_s = np.array([0.0, body, start, 1.0], dtype=float)
+        control_radius = np.array([r_neck, r_body, r_tip, 0.0], dtype=float)
+    control_radius = np.maximum(control_radius, 0.0)
     squared_radius = PchipInterpolator(
         control_s,
         control_radius**2,

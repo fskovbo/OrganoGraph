@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
+from organograph.skeleton.blending import blend_tube_radius
 from organograph.skeleton.primitive_geometry import (
     capped_tube_radius,
     polyline_lengths,
@@ -54,6 +55,7 @@ PRIMITIVE_COLORS = {
     "straight_cylinder": "#e6ab02",
 }
 
+BLEND_COLOR = "#f28e2b"
 SMOOTH_CENTERLINE_COLOR = "#008b8b"
 
 
@@ -570,6 +572,72 @@ def _tube_surface(parameters, *, n_s=32, n_theta=16):
     return np.asarray(vertices, dtype=float), np.asarray(faces, dtype=np.int64)
 
 
+def _blend_tube_surface(parameters, *, n_s=24, n_theta=16):
+    centerline = np.asarray(parameters["centerline_points"], dtype=float)
+    if centerline.ndim != 2 or centerline.shape[0] < 2:
+        return np.empty((0, 3), dtype=float), np.empty((0, 3), dtype=np.int64)
+    n_s = max(4, int(n_s))
+    s_values = np.linspace(0.0, 1.0, n_s)
+    theta = np.linspace(0.0, 2.0 * np.pi, max(3, int(n_theta)), endpoint=False)
+    vertices = []
+    previous_normal = None
+    for s in s_values:
+        center, tangent = _polyline_point_at_s(centerline, s)
+        if previous_normal is None:
+            ref = np.array([0.0, 0.0, 1.0])
+            if abs(float(np.dot(ref, tangent))) > 0.9:
+                ref = np.array([0.0, 1.0, 0.0])
+            normal = np.cross(tangent, ref)
+            normal = normal / max(np.linalg.norm(normal), 1e-12)
+        else:
+            normal = previous_normal - tangent * float(np.dot(previous_normal, tangent))
+            normal = normal / max(np.linalg.norm(normal), 1e-12)
+        binormal = np.cross(tangent, normal)
+        binormal = binormal / max(np.linalg.norm(binormal), 1e-12)
+        previous_normal = normal
+        profile = parameters.get("radius_profile")
+        if profile == "linear_host_local_to_attachment":
+            radius = (1.0 - float(s)) * float(parameters["r_host"]) + float(s) * float(
+                parameters["r_crypt"]
+            )
+        elif profile == "linear_body_neck_branch":
+            if float(s) <= 0.5:
+                t = float(s) / 0.5
+                radius = (1.0 - t) * float(parameters["r_body"]) + t * float(
+                    parameters["r_neck"]
+                )
+            else:
+                t = (float(s) - 0.5) / 0.5
+                radius = (1.0 - t) * float(parameters["r_neck"]) + t * float(
+                    parameters["r_branch"]
+                )
+        else:
+            radius = float(
+                blend_tube_radius(
+                    np.array([s]),
+                    parameters["r_host"],
+                    parameters["r_mid"],
+                    parameters["r_crypt"],
+                    s_mid=float(parameters.get("s_mid", 0.5)),
+                )[0]
+            )
+        vertices.extend(
+            center + radius * (np.cos(angle) * normal + np.sin(angle) * binormal)
+            for angle in theta
+        )
+
+    faces = []
+    n_theta = len(theta)
+    for i in range(len(s_values) - 1):
+        for j in range(n_theta):
+            a = i * n_theta + j
+            b = i * n_theta + (j + 1) % n_theta
+            c = (i + 1) * n_theta + j
+            d = (i + 1) * n_theta + (j + 1) % n_theta
+            faces.extend(([a, b, c], [b, d, c]))
+    return np.asarray(vertices, dtype=float), np.asarray(faces, dtype=np.int64)
+
+
 def _cylinder_surface(parameters, *, n_s=16, n_theta=16):
     centerline = np.asarray(parameters["centerline_points"], dtype=float)
     start, end = centerline[0], centerline[-1]
@@ -630,6 +698,7 @@ def _plotly_primitive_traces(
     primitive_alpha=0.35,
     n_s=32,
     n_theta=16,
+    skip_attachment_ids=None,
 ):
     import plotly.graph_objects as go
 
@@ -641,9 +710,12 @@ def _plotly_primitive_traces(
         if edge.primitive_attachment is not None:
             attachments.append((edge.edge_id, edge.primitive_attachment))
     attachments.extend(graph.primitive_attachments.items())
+    skip_attachment_ids = set(map(str, skip_attachment_ids or []))
 
     traces = []
     for attachment_id, attachment in attachments:
+        if str(attachment_id) in skip_attachment_ids:
+            continue
         xyz, faces = _primitive_mesh(attachment, n_s=n_s, n_theta=n_theta)
         if xyz is None or faces is None or xyz.size == 0 or faces.size == 0:
             continue
@@ -665,6 +737,189 @@ def _plotly_primitive_traces(
     return traces
 
 
+def _plotly_mesh_trace(vertices, faces, *, mesh_alpha=0.12, mesh_color="lightgray"):
+    import plotly.graph_objects as go
+
+    vertices = np.asarray(vertices, dtype=float)
+    faces = np.asarray(faces, dtype=np.int64)
+    return go.Mesh3d(
+        x=vertices[:, 0],
+        y=vertices[:, 1],
+        z=vertices[:, 2],
+        i=faces[:, 0],
+        j=faces[:, 1],
+        k=faces[:, 2],
+        color=mesh_color,
+        opacity=float(mesh_alpha),
+        name="mesh",
+        hoverinfo="skip",
+    )
+
+
+def _plotly_blend_traces(
+    blend_attachments,
+    *,
+    blend_alpha=0.45,
+    n_s=24,
+    n_theta=16,
+):
+    import plotly.graph_objects as go
+
+    if blend_attachments is None:
+        return []
+    if hasattr(blend_attachments, "blend_attachments"):
+        blend_attachments = blend_attachments.blend_attachments
+    traces = []
+    for blend_id, blend in dict(blend_attachments).items():
+        if blend.blend_type in {
+            "hermite_radius_blend_tube",
+            "tapered_attachment_extension_tube",
+            "body_branch_neck_replacement_tube",
+        }:
+            xyz, faces = _blend_tube_surface(blend.parameters, n_s=n_s, n_theta=n_theta)
+        elif blend.blend_type == "straight_attachment_extension_tube":
+            xyz, faces = _cylinder_surface(blend.parameters, n_s=n_s, n_theta=n_theta)
+        else:
+            continue
+        if xyz.size == 0 or faces.size == 0:
+            continue
+        traces.append(
+            go.Mesh3d(
+                x=xyz[:, 0],
+                y=xyz[:, 1],
+                z=xyz[:, 2],
+                i=faces[:, 0],
+                j=faces[:, 1],
+                k=faces[:, 2],
+                color=BLEND_COLOR,
+                opacity=float(blend_alpha),
+                name=str(blend_id),
+                hovertext=str(blend_id),
+            )
+        )
+    return traces
+
+
+def _set_triptych_scene_layout(fig, *, camera_eye=None):
+    scene = dict(
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        zaxis=dict(visible=False),
+        aspectmode="data",
+    )
+    fig.update_layout(scene=scene, scene2=scene, scene3=scene)
+    if camera_eye is None:
+        camera_eye = dict(x=1.05, y=1.05, z=0.75)
+    fig.update_layout(
+        scene_camera=dict(eye=camera_eye),
+        scene2_camera=dict(eye=camera_eye),
+        scene3_camera=dict(eye=camera_eye),
+    )
+
+
+def plot_blended_reconstruction_triptych(
+    vertices,
+    faces,
+    graph,
+    blend_result,
+    *,
+    backend="plotly",
+    mesh_alpha=0.10,
+    primitive_alpha=0.24,
+    blend_alpha=0.58,
+    reconstruction_alpha=1.0,
+    mesh_color="lightgray",
+    show_node_labels=False,
+    node_size=7,
+    edge_width=3.0,
+    camera_eye=None,
+    width=1500,
+    height=560,
+):
+    """Show mesh/skeleton, fitted primitives with blends, and reconstruction.
+
+    The reconstruction panel displays the generated primitive and blend
+    surfaces only.  It is intentionally a visualization surface collection, not
+    a boolean-unioned remesh of the primitives.
+    """
+    backend = str(backend).lower()
+    if backend != "plotly":
+        raise ValueError("plot_blended_reconstruction_triptych supports backend='plotly'")
+
+    from plotly.subplots import make_subplots
+
+    skip_attachment_ids = _replaced_primitive_attachment_ids(blend_result)
+    fig = make_subplots(
+        rows=1,
+        cols=3,
+        specs=[[{"type": "scene"}, {"type": "scene"}, {"type": "scene"}]],
+        subplot_titles=(
+            "Mesh + skeleton",
+            "Mesh + primitives + blends",
+            "Reconstructed primitive surface",
+        ),
+        horizontal_spacing=0.02,
+    )
+
+    fig.add_trace(
+        _plotly_mesh_trace(
+            vertices,
+            faces,
+            mesh_alpha=mesh_alpha,
+            mesh_color=mesh_color,
+        ),
+        row=1,
+        col=1,
+    )
+    for trace in _plotly_skeleton_traces(
+        graph,
+        show_node_labels=show_node_labels,
+        node_size=node_size,
+        edge_width=edge_width,
+    ):
+        fig.add_trace(trace, row=1, col=1)
+
+    fig.add_trace(
+        _plotly_mesh_trace(
+            vertices,
+            faces,
+            mesh_alpha=mesh_alpha,
+            mesh_color=mesh_color,
+        ),
+        row=1,
+        col=2,
+    )
+    for trace in _plotly_primitive_traces(
+        graph,
+        primitive_alpha=primitive_alpha,
+        skip_attachment_ids=skip_attachment_ids,
+    ):
+        fig.add_trace(trace, row=1, col=2)
+    for trace in _plotly_blend_traces(blend_result, blend_alpha=blend_alpha):
+        fig.add_trace(trace, row=1, col=2)
+
+    for trace in _plotly_primitive_traces(
+        graph,
+        primitive_alpha=reconstruction_alpha,
+        skip_attachment_ids=skip_attachment_ids,
+    ):
+        fig.add_trace(trace, row=1, col=3)
+    for trace in _plotly_blend_traces(
+        blend_result,
+        blend_alpha=reconstruction_alpha,
+    ):
+        fig.add_trace(trace, row=1, col=3)
+
+    _set_triptych_scene_layout(fig, camera_eye=camera_eye)
+    fig.update_layout(
+        width=int(width),
+        height=int(height),
+        margin=dict(l=0, r=0, t=45, b=0),
+        showlegend=False,
+    )
+    return fig
+
+
 def plot_primitives_3d(
     graph,
     *,
@@ -672,6 +927,7 @@ def plot_primitives_3d(
     primitive_alpha=0.35,
     n_s=32,
     n_theta=16,
+    blend_result=None,
 ):
     """Plot primitive attachments without mesh or skeleton."""
     backend = str(backend).lower()
@@ -679,12 +935,14 @@ def plot_primitives_3d(
         raise ValueError("plot_primitives_3d currently supports backend='plotly'")
     import plotly.graph_objects as go
 
+    skip_attachment_ids = _replaced_primitive_attachment_ids(blend_result)
     fig = go.Figure(
         data=_plotly_primitive_traces(
             graph,
             primitive_alpha=primitive_alpha,
             n_s=n_s,
             n_theta=n_theta,
+            skip_attachment_ids=skip_attachment_ids,
         )
     )
     fig.update_layout(
@@ -696,6 +954,24 @@ def plot_primitives_3d(
         )
     )
     return fig
+
+
+def _replaced_primitive_attachment_ids(blend_result):
+    if blend_result is None:
+        return set()
+    blend_attachments = (
+        blend_result.blend_attachments
+        if hasattr(blend_result, "blend_attachments")
+        else blend_result
+    )
+    out = set()
+    for blend in dict(blend_attachments or {}).values():
+        primitive_id = blend.metadata.get("replaces_primitive_attachment_id")
+        if primitive_id is None:
+            primitive_id = blend.parameters.get("replaced_primitive_attachment_id")
+        if primitive_id is not None:
+            out.add(str(primitive_id))
+    return out
 
 
 def plot_mesh_with_skeleton_and_primitives(
@@ -711,6 +987,7 @@ def plot_mesh_with_skeleton_and_primitives(
     node_size=7,
     edge_width=3.0,
     camera_eye=None,
+    skip_attachment_ids=None,
 ):
     """Overlay mesh, skeleton, and fitted primitive attachments."""
     backend = str(backend).lower()
@@ -730,6 +1007,77 @@ def plot_mesh_with_skeleton_and_primitives(
         edge_width=edge_width,
         camera_eye=camera_eye,
     )
-    for trace in _plotly_primitive_traces(graph, primitive_alpha=primitive_alpha):
+    for trace in _plotly_primitive_traces(
+        graph,
+        primitive_alpha=primitive_alpha,
+        skip_attachment_ids=skip_attachment_ids,
+    ):
+        fig.add_trace(trace)
+    return fig
+
+
+def plot_mesh_with_primitives_and_blends(
+    vertices,
+    faces,
+    graph,
+    blend_result,
+    *,
+    backend="plotly",
+    mesh_alpha=0.12,
+    primitive_alpha=0.28,
+    blend_alpha=0.55,
+    mesh_color="lightgray",
+    show_skeleton=True,
+    show_node_labels=False,
+    node_size=7,
+    edge_width=3.0,
+    camera_eye=None,
+):
+    """Overlay mesh, fitted primitives, and visualization-only blend geometry."""
+    backend = str(backend).lower()
+    if backend != "plotly":
+        raise ValueError("plot_mesh_with_primitives_and_blends supports backend='plotly'")
+    if show_skeleton:
+        skip_attachment_ids = _replaced_primitive_attachment_ids(blend_result)
+        fig = plot_mesh_with_skeleton_and_primitives(
+            vertices,
+            faces,
+            graph,
+            backend="plotly",
+            mesh_alpha=mesh_alpha,
+            primitive_alpha=primitive_alpha,
+            mesh_color=mesh_color,
+            show_node_labels=show_node_labels,
+            node_size=node_size,
+            edge_width=edge_width,
+            camera_eye=camera_eye,
+            skip_attachment_ids=skip_attachment_ids,
+        )
+    else:
+        fig = plot_primitives_3d(
+            graph,
+            backend="plotly",
+            primitive_alpha=primitive_alpha,
+            blend_result=blend_result,
+        )
+        import plotly.graph_objects as go
+
+        vertices = np.asarray(vertices, dtype=float)
+        faces = np.asarray(faces, dtype=np.int64)
+        fig.add_trace(
+            go.Mesh3d(
+                x=vertices[:, 0],
+                y=vertices[:, 1],
+                z=vertices[:, 2],
+                i=faces[:, 0],
+                j=faces[:, 1],
+                k=faces[:, 2],
+                color=mesh_color,
+                opacity=float(mesh_alpha),
+                name="mesh",
+                hoverinfo="skip",
+            )
+        )
+    for trace in _plotly_blend_traces(blend_result, blend_alpha=blend_alpha):
         fig.add_trace(trace)
     return fig

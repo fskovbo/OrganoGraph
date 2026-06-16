@@ -17,11 +17,15 @@ from organograph.skeleton.build import (
     _validate_split_branch_geometry,
 )
 from organograph.skeleton import (
+    BlendConfig,
+    PrimitiveAttachment,
+    SkeletonGraph,
     analyze_neck_circumference_profile,
     attach_body_primitive,
     attach_body_branch_neck_primitives,
     attach_crypt_tube_primitives,
     build_skeleton_from_crypt_detections,
+    create_attachment_blends,
     crypt_bend_angle,
     crypt_path_length,
     crypt_straight_distance,
@@ -1317,6 +1321,102 @@ class SkeletonTests(unittest.TestCase):
             ]
         )
 
+    def test_blend_attachments_are_visualization_only(self):
+        graph = SkeletonGraph()
+        graph.add_node("body", "body", [0.0, 0.0, 0.0])
+        graph.add_node("crypt_0_attachment", "attachment", [1.8, 0.0, 0.0], crypt_id=0)
+        graph.add_node("crypt_0_crypt", "crypt", [2.6, 0.0, 0.0], crypt_id=0)
+        graph.add_node("crypt_0_tip", "tip", [3.2, 0.0, 0.0], crypt_id=0)
+        graph.add_edge(
+            "crypt_0_body_to_attachment",
+            "body",
+            "crypt_0_attachment",
+            edge_type="body_to_attachment",
+            crypt_id=0,
+        )
+        graph.add_edge(
+            "crypt_0_attachment_to_crypt",
+            "crypt_0_attachment",
+            "crypt_0_crypt",
+            edge_type="attachment_to_crypt",
+            crypt_id=0,
+        )
+        graph.add_edge(
+            "crypt_0_crypt_to_tip",
+            "crypt_0_crypt",
+            "crypt_0_tip",
+            edge_type="crypt_to_tip",
+            crypt_id=0,
+        )
+        graph.body_node().primitive_attachment = PrimitiveAttachment(
+            primitive_type="ellipsoid",
+            parameters={
+                "center": np.array([0.0, 0.0, 0.0]),
+                "orientation": np.eye(3),
+                "axis_lengths": np.array([3.0, 3.0, 3.0]),
+            },
+            attachment_type="node",
+            target_ids=["body"],
+        )
+        graph.add_primitive_attachment(
+            "crypt_0_path_0",
+            PrimitiveAttachment(
+                primitive_type="tapered_capped_tube",
+                parameters={
+                    "centerline_points": np.array(
+                        [[1.8, 0.0, 0.0], [1.8, 0.2, 0.0], [3.2, 0.0, 0.0]],
+                        dtype=float,
+                    ),
+                    "r_neck": 0.2,
+                    "r_body": 0.35,
+                    "r_tip": 0.08,
+                    "s_body": 0.5,
+                    "s_taper": 0.85,
+                },
+                attachment_type="path",
+                target_ids=["crypt_0_attachment", "crypt_0_crypt", "crypt_0_tip"],
+            ),
+        )
+        blends = create_attachment_blends(
+            graph,
+            vertices=np.array(
+                [[1.6, 0.2, 0.0], [1.7, -0.2, 0.0], [2.0, 0.15, 0.0]],
+                dtype=float,
+            ),
+            config=BlendConfig(
+                extension_length_fraction=0.5,
+            ),
+        )
+        self.assertEqual(list(blends), ["blend_crypt_0_path_0"])
+        blend = blends["blend_crypt_0_path_0"]
+        self.assertEqual(blend.blend_type, "tapered_attachment_extension_tube")
+        self.assertFalse(blend.metadata["vae_parameter"])
+        self.assertNotIn("blend_crypt_0_path_0", graph.primitive_attachments)
+        self.assertEqual(blend.target_ids[0], "body")
+        self.assertAlmostEqual(blend.parameters["r_crypt"], 0.2)
+        self.assertAlmostEqual(
+            blend.parameters["r_host"],
+            math.sqrt(9.0 - 0.9**2) - 1.8,
+            places=6,
+        )
+        self.assertEqual(
+            blend.parameters["radius_profile"],
+            "linear_host_local_to_attachment",
+        )
+        self.assertEqual(
+            blend.diagnostics["host_radius_source"],
+            "endpoint_disk_expanded_to_host_primitive",
+        )
+        self.assertAlmostEqual(blend.diagnostics["length"], 0.9)
+        self.assertAlmostEqual(
+            blend.diagnostics["attachment_to_host_node_distance"],
+            1.8,
+        )
+        np.testing.assert_allclose(
+            blend.parameters["centerline_points"],
+            [[1.8, -0.9, 0.0], [1.8, 0.0, 0.0]],
+        )
+
     def test_primitive_components_cut_body_and_branch_at_necks(self):
         vertices = np.zeros((9, 3), dtype=float)
         graph = build_skeleton_from_crypt_detections(
@@ -1453,6 +1553,50 @@ class SkeletonTests(unittest.TestCase):
             len(result["branches"]["crypt_split_branch"]),
             vertices.shape[0],
         )
+
+        graph.body_node().primitive_attachment = PrimitiveAttachment(
+            primitive_type="ellipsoid",
+            parameters={
+                "center": np.array([-2.0, 0.0, 0.0]),
+                "orientation": np.eye(3),
+                "axis_lengths": np.array([3.0, 2.0, 2.0]),
+            },
+            attachment_type="node",
+            target_ids=["body"],
+        )
+        graph.node("crypt_split_branch").primitive_attachment = PrimitiveAttachment(
+            primitive_type="ellipsoid",
+            parameters={
+                "center": np.array([2.0, 0.0, 0.0]),
+                "orientation": np.eye(3),
+                "axis_lengths": np.array([3.0, 2.0, 2.0]),
+            },
+            attachment_type="node",
+            target_ids=["crypt_split_branch"],
+        )
+        blends = create_attachment_blends(graph, config=BlendConfig(n_samples=33))
+        self.assertIn("blend_crypt_split_neck_cylinder", blends)
+        blend = blends["blend_crypt_split_neck_cylinder"]
+        self.assertEqual(blend.blend_type, "body_branch_neck_replacement_tube")
+        self.assertEqual(
+            blend.metadata["replaces_primitive_attachment_id"],
+            "crypt_split_neck_cylinder",
+        )
+        self.assertEqual(
+            blend.parameters["radius_profile"],
+            "linear_body_neck_branch",
+        )
+        self.assertAlmostEqual(
+            blend.parameters["r_neck"],
+            graph.primitive_attachments["crypt_split_neck_cylinder"].parameters["radius"],
+        )
+        centerline = np.asarray(blend.parameters["centerline_points"], dtype=float)
+        body = graph.node("body").position
+        neck = graph.node("crypt_split_neck").position
+        branch = graph.node("crypt_split_branch").position
+        np.testing.assert_allclose(centerline[0], 0.5 * (body + neck))
+        np.testing.assert_allclose(centerline[16], neck)
+        np.testing.assert_allclose(centerline[-1], 0.5 * (branch + neck))
 
     def test_neck_from_distance_field_uses_ring_center(self):
         vertices = np.array(

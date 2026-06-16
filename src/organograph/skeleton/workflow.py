@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
-from organograph.skeleton.config import PrimitiveFitConfig, SkeletonizationConfig
+from organograph.skeleton.blending import create_attachment_blends
+from organograph.skeleton.config import BlendConfig, PrimitiveFitConfig, SkeletonizationConfig
 from organograph.skeleton.detection.graph_builder import build_skeleton_from_crypt_detections
 from organograph.skeleton.detection.pipeline import detect_crypts_for_skeleton
 from organograph.skeleton.primitive import (
@@ -14,7 +15,7 @@ from organograph.skeleton.primitive import (
     attach_crypt_tube_primitives,
     primitive_components_from_crypt_detections,
 )
-from organograph.skeleton.results import PrimitiveFitResult, SkeletonizationResult
+from organograph.skeleton.results import BlendResult, PrimitiveFitResult, SkeletonizationResult
 
 
 def skeletonize_organoid(
@@ -129,4 +130,27 @@ def fit_primitives_for_skeletonization_result(
         config=config,
         metadata={"skeleton_metadata": dict(result.metadata)},
         skeleton=result,
+    )
+
+
+def blend_primitives_for_visualization(
+    primitive_result: PrimitiveFitResult,
+    *,
+    config: BlendConfig | dict[str, Any] | None = None,
+) -> BlendResult:
+    """Create visualization-only blends from a primitive fit result."""
+    if not isinstance(config, BlendConfig):
+        config = BlendConfig.from_dict(config)
+    mesh = primitive_result.mesh
+    blend_attachments = create_attachment_blends(
+        primitive_result.graph,
+        vertices=None if mesh is None else mesh.v,
+        config=config,
+    )
+    return BlendResult(
+        graph=primitive_result.graph,
+        blend_attachments=blend_attachments,
+        config=config,
+        primitive_result=primitive_result,
+        metadata={"stage": "visual_blending"},
     )

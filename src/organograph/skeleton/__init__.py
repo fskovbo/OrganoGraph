@@ -12,7 +12,8 @@ from organograph.skeleton.build import (
     detect_crypts_for_skeleton,
     normalize_crypt_detections,
 )
-from organograph.skeleton.config import PrimitiveFitConfig, SkeletonizationConfig
+from organograph.skeleton.blending import BlendAttachment, create_attachment_blends
+from organograph.skeleton.config import BlendConfig, PrimitiveFitConfig, SkeletonizationConfig
 from organograph.skeleton.datatypes import (
     NODE_TYPES,
     SkeletonEdge,
@@ -56,16 +57,21 @@ from organograph.skeleton.primitives import (
     PrimitiveFit,
 )
 from organograph.skeleton.results import (
+    BlendResult,
     OrganoidShapeResult,
     PrimitiveFitResult,
     SkeletonizationResult,
 )
 from organograph.skeleton.workflow import (
+    blend_primitives_for_visualization,
     fit_primitives_for_skeletonization_result,
     skeletonize_organoid,
 )
 
 __all__ = [
+    "BlendAttachment",
+    "BlendConfig",
+    "BlendResult",
     "NODE_TYPES",
     "OrganoidShapeResult",
     "Primitive",
@@ -85,6 +91,8 @@ __all__ = [
     "analyze_neck_circumference_profile",
     "build_skeleton_from_crypt_detections",
     "build_skeleton_from_segmentation_parameters",
+    "blend_primitives_for_visualization",
+    "create_attachment_blends",
     "crypt_attachment_direction",
     "crypt_bend_angle",
     "crypt_path_length",

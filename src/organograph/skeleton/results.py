@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from organograph.skeleton.config import PrimitiveFitConfig, SkeletonizationConfig
+from organograph.skeleton.config import BlendConfig, PrimitiveFitConfig, SkeletonizationConfig
 from organograph.skeleton.datatypes import SkeletonGraph
 
 
@@ -58,6 +58,31 @@ class PrimitiveFitResult:
     @property
     def mesh(self):
         return None if self.skeleton is None else self.skeleton.mesh
+
+
+@dataclass
+class BlendResult:
+    """Visualization-only blends generated from fitted skeleton primitives."""
+
+    graph: SkeletonGraph
+    blend_attachments: dict[str, Any] = field(default_factory=dict)
+    config: BlendConfig = field(default_factory=BlendConfig)
+    primitive_result: PrimitiveFitResult | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def mesh(self):
+        return None if self.primitive_result is None else self.primitive_result.mesh
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "blend_attachments": {
+                key: attachment.to_dict()
+                for key, attachment in self.blend_attachments.items()
+            },
+            "config": self.config.to_dict(),
+            "metadata": dict(self.metadata),
+        }
 
 
 @dataclass

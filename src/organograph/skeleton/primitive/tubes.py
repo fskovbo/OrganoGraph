@@ -11,7 +11,10 @@ from scipy.special import expit
 
 from organograph.skeleton.datatypes import SkeletonGraph
 from organograph.skeleton.geometry import as_points
-from organograph.skeleton.primitive.blobs import fit_blob_primitive_to_points
+from organograph.skeleton.primitive.blobs import (
+    constrain_blob_fit_surface_radius,
+    fit_blob_primitive_to_points,
+)
 from organograph.skeleton.primitive.common import _residual_summary
 from organograph.skeleton.primitive_geometry import (
     bend_angles_for_polyline,
@@ -415,23 +418,220 @@ def fit_crypt_tube_to_points(
         },
     )
 
+def _descendant_tip_radius_constraints(
+    graph: SkeletonGraph,
+    host_node_id: str,
+    center,
+    *,
+    margin_fraction: float = 0.02,
+) -> list[dict[str, Any]]:
+    """Collect fitting-time radius bounds from host center toward crypt tips.
+
+    For the main body, traversal stops at branch nodes so daughter crypts
+    constrain the branch primitive rather than collapsing the body primitive.
+    """
+    host_node_id = str(host_node_id)
+    if host_node_id not in graph.nodes:
+        return []
+
+    center = np.asarray(center, dtype=float).reshape(-1)
+    if center.size != 3 or not np.all(np.isfinite(center)):
+        return []
+
+    children: dict[str, list[str]] = {}
+    for edge in graph.edges.values():
+        children.setdefault(edge.source, []).append(edge.target)
+
+    host_type = graph.node(host_node_id).node_type
+    constraints = []
+    stack = list(children.get(host_node_id, []))
+    seen = set()
+    while stack:
+        node_id = str(stack.pop())
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        node = graph.node(node_id)
+        if node.node_type == "tip":
+            direction = np.asarray(node.position, dtype=float) - center
+            distance = float(np.linalg.norm(direction))
+            if distance > 1e-12:
+                constraints.append(
+                    {
+                        "tip_node_id": node_id,
+                        "direction": direction / distance,
+                        "max_radius": distance
+                        * max(0.0, 1.0 - float(margin_fraction)),
+                    }
+                )
+            continue
+        if host_type != "branch" and node.node_type == "branch":
+            continue
+        stack.extend(children.get(node_id, []))
+    return constraints
+
+
+def _orthonormal_basis_from_axis(axis: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    axis = np.asarray(axis, dtype=float).reshape(3)
+    axis = axis / max(float(np.linalg.norm(axis)), 1e-12)
+    reference = np.array([0.0, 0.0, 1.0])
+    if abs(float(np.dot(axis, reference))) > 0.9:
+        reference = np.array([0.0, 1.0, 0.0])
+    normal = np.cross(axis, reference)
+    normal = normal / max(float(np.linalg.norm(normal)), 1e-12)
+    binormal = np.cross(axis, normal)
+    binormal = binormal / max(float(np.linalg.norm(binormal)), 1e-12)
+    return axis, normal, binormal
+
+
+def _first_child_of_type(
+    children: dict[str, list[str]],
+    graph: SkeletonGraph,
+    node_id: str,
+    node_types: tuple[str, ...],
+) -> str | None:
+    candidates = list(children.get(str(node_id), []))
+    for node_type in node_types:
+        for candidate in candidates:
+            if graph.node(candidate).node_type == node_type:
+                return candidate
+    return None
+
+
+def _attachment_cap_support_points(
+    graph: SkeletonGraph,
+    host_node_id: str,
+    *,
+    points_per_attachment: int = 64,
+    radius_fraction: float = 0.5,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Generate sparse unweighted support caps for host-side crypt openings.
+
+    The cap is a simple dome from an attachment node to the next crypt-side
+    skeleton node.  It is synthetic support for fitting the host blob, not mesh
+    data and not a visualization primitive.
+    """
+    children: dict[str, list[str]] = {}
+    for edge in graph.edges.values():
+        children.setdefault(edge.source, []).append(edge.target)
+
+    support = []
+    attachment_ids = []
+    n_per = max(1, int(points_per_attachment))
+    n_rings = max(2, min(6, int(np.sqrt(n_per))))
+    n_theta = max(4, int(np.ceil(max(n_per - 1, 1) / n_rings)))
+    angles = np.linspace(0.0, 2.0 * np.pi, n_theta, endpoint=False)
+    s_values = np.linspace(0.0, 0.92, n_rings)
+
+    for attachment_id in children.get(str(host_node_id), []):
+        attachment_node = graph.node(attachment_id)
+        if attachment_node.node_type != "attachment":
+            continue
+        next_id = _first_child_of_type(
+            children,
+            graph,
+            attachment_id,
+            ("constriction", "crypt", "bend", "tip"),
+        )
+        if next_id is None:
+            continue
+        next_node = graph.node(next_id)
+        start = np.asarray(attachment_node.position, dtype=float)
+        end = np.asarray(next_node.position, dtype=float)
+        axis_vector = end - start
+        length = float(np.linalg.norm(axis_vector))
+        if length <= 1e-12:
+            continue
+
+        axis, normal, binormal = _orthonormal_basis_from_axis(axis_vector)
+        base_radius = max(float(radius_fraction), 0.0) * length
+        if base_radius <= 1e-12:
+            continue
+
+        for s in s_values:
+            center = start + float(s) * length * axis
+            radius = base_radius * np.sqrt(max(1.0 - float(s) ** 2, 0.0))
+            for angle in angles:
+                support.append(
+                    center
+                    + radius
+                    * (np.cos(angle) * normal + np.sin(angle) * binormal)
+                )
+        support.append(end)
+        attachment_ids.append(str(attachment_id))
+
+    if support:
+        support_points = np.asarray(support, dtype=float)
+    else:
+        support_points = np.empty((0, 3), dtype=float)
+    metadata = {
+        "enabled": True,
+        "n_points": int(support_points.shape[0]),
+        "n_attachments": len(attachment_ids),
+        "attachment_ids": attachment_ids,
+        "points_per_attachment": int(points_per_attachment),
+        "radius_fraction": float(radius_fraction),
+        "method": "unweighted_dome_attachment_to_next_crypt_node",
+    }
+    return support_points, metadata
+
+
 def attach_body_primitive(
     graph: SkeletonGraph,
     vertices,
     component=None,
     *,
     primitive_type: str = "ellipsoid",
+    add_attachment_cap_support: bool = True,
+    cap_support_points_per_attachment: int = 64,
+    cap_support_radius_fraction: float = 0.5,
+    constrain_to_descendant_tips: bool = True,
+    tip_constraint_margin_fraction: float = 0.02,
+    tip_constraint_weight: float = 50.0,
     metadata: dict[str, Any] | None = None,
     **fit_kwargs,
 ) -> PrimitiveAttachment:
     """Fit and attach a body blob primitive to the body node."""
     points = component_points(vertices, component)
+    fit_points = points
+    cap_metadata = {
+        "enabled": bool(add_attachment_cap_support),
+        "n_points": 0,
+        "n_attachments": 0,
+    }
+    if add_attachment_cap_support:
+        cap_points, cap_metadata = _attachment_cap_support_points(
+            graph,
+            graph.body_node().node_id,
+            points_per_attachment=cap_support_points_per_attachment,
+            radius_fraction=cap_support_radius_fraction,
+        )
+        if cap_points.size:
+            fit_points = np.vstack([points, cap_points])
+
     fit = fit_blob_primitive_to_points(
-        points,
+        fit_points,
         primitive_type=primitive_type,
-        metadata={"component": "body", **dict(metadata or {})},
+        metadata={
+            "component": "body",
+            "n_real_points": int(points.shape[0]),
+            "attachment_cap_support": cap_metadata,
+            **dict(metadata or {}),
+        },
         **fit_kwargs,
     )
+    if constrain_to_descendant_tips:
+        fit = constrain_blob_fit_surface_radius(
+            fit,
+            fit_points,
+            _descendant_tip_radius_constraints(
+                graph,
+                graph.body_node().node_id,
+                fit.parameters["center"],
+                margin_fraction=tip_constraint_margin_fraction,
+            ),
+            constraint_weight=tip_constraint_weight,
+        )
     attachment = fit.to_attachment(
         attachment_type="node",
         attachment_id="body",
@@ -446,6 +646,9 @@ def attach_branch_primitives(
     branch_components: dict[str, Any],
     *,
     primitive_type: str = "ellipsoid",
+    constrain_to_descendant_tips: bool = True,
+    tip_constraint_margin_fraction: float = 0.02,
+    tip_constraint_weight: float = 50.0,
     **fit_kwargs,
 ) -> dict[str, PrimitiveAttachment]:
     """Fit blob primitives to branch components keyed by branch node id."""
@@ -460,6 +663,18 @@ def attach_branch_primitives(
             metadata={"component": "branch", "branch_node_id": branch_node_id},
             **fit_kwargs,
         )
+        if constrain_to_descendant_tips:
+            fit = constrain_blob_fit_surface_radius(
+                fit,
+                points,
+                _descendant_tip_radius_constraints(
+                    graph,
+                    branch_node_id,
+                    fit.parameters["center"],
+                    margin_fraction=tip_constraint_margin_fraction,
+                ),
+                constraint_weight=tip_constraint_weight,
+            )
         attachment = fit.to_attachment(
             attachment_type="node",
             attachment_id=branch_node_id,
@@ -496,6 +711,7 @@ def attach_crypt_tube_primitives(
     *,
     centerline_data: dict[Any, dict[str, Any]] | None = None,
     smooth_centerline: bool = True,
+    smooth_bulged_centerlines: bool = True,
     centerline_n_bands: int = 7,
     centerline_n_samples: int = 64,
     centerline_constriction_weight: float = 4.0,
@@ -528,15 +744,30 @@ def attach_crypt_tube_primitives(
             data = centerline_data.get(key)
             if data is None and path[-1] in centerline_data:
                 data = centerline_data[path[-1]]
+            profile = None if data is None else data.get("neck_profile")
+            neck_kind = profile.get("kind") if isinstance(profile, dict) else None
+            path_smooth_centerline = bool(smooth_centerline)
+            if neck_kind == "transition" and not bool(smooth_bulged_centerlines):
+                path_smooth_centerline = False
+                centerline = graph_centerline[[0, -1]]
+                centerline_metadata = {
+                    "method": "straight_attachment_to_tip",
+                    "control_points": centerline,
+                    "control_parameters": np.array([0.0, 1.0]),
+                    "bulged_centerline_smoothing_disabled": True,
+                }
             path_constrictions = [
                 graph.node(node_id).position
                 for node_id in path
                 if graph.node(node_id).node_type == "constriction"
             ]
 
-            if smooth_centerline and data is not None and data.get("distance_field") is not None:
+            if (
+                path_smooth_centerline
+                and data is not None
+                and data.get("distance_field") is not None
+            ):
                 indices = data.get("vertex_indices", component)
-                profile = data.get("neck_profile")
                 constriction_level = (
                     profile.get("constriction_level")
                     if isinstance(profile, dict)
@@ -564,7 +795,7 @@ def attach_crypt_tube_primitives(
                         **centerline_metadata,
                         "fallback_reason": str(exc),
                     }
-            elif smooth_centerline and graph_centerline.shape[0] >= 3:
+            elif path_smooth_centerline and graph_centerline.shape[0] >= 3:
                 control = np.mean(graph_centerline[1:-1], axis=0)
                 centerline = sample_quadratic_bezier(
                     graph_centerline[0],
@@ -580,7 +811,7 @@ def attach_crypt_tube_primitives(
                     "control_parameters": np.array([0.0, 0.5, 1.0]),
                 }
 
-            if update_crypt_nodes and smooth_centerline:
+            if update_crypt_nodes and path_smooth_centerline:
                 midpoint = point_at_polyline_arclength(centerline, 0.5)
                 for node_id in path[1:-1]:
                     node = graph.node(node_id)
@@ -632,6 +863,11 @@ def attach_crypt_tube_primitives(
                     "centerline_fallback_reason": centerline_metadata.get(
                         "fallback_reason"
                     ),
+                    "smooth_bulged_centerlines": bool(smooth_bulged_centerlines),
+                    "bulged_centerline_smoothing_disabled": centerline_metadata.get(
+                        "bulged_centerline_smoothing_disabled",
+                        False,
+                    ),
                 },
                 **local_fit_kwargs,
             )
@@ -647,4 +883,3 @@ def attach_crypt_tube_primitives(
 def primitive_attachments_to_dataframe(graph: SkeletonGraph):
     """Return graph-level primitive attachments as a pandas DataFrame."""
     return graph.to_primitive_dataframe()
-

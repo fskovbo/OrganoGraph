@@ -23,6 +23,7 @@ from organograph.skeleton import (
     analyze_neck_circumference_profile,
     attach_body_primitive,
     attach_body_branch_neck_primitives,
+    attach_branch_primitives,
     attach_crypt_tube_primitives,
     build_skeleton_from_crypt_detections,
     create_attachment_blends,
@@ -42,6 +43,7 @@ from organograph.skeleton import (
     primitive_components_from_crypt_detections,
     save_skeleton_json,
 )
+from organograph.skeleton.primitive.blobs import blob_surface_radius
 
 
 VERTICES = np.array(
@@ -1016,6 +1018,127 @@ class SkeletonTests(unittest.TestCase):
             atol=0.08,
         )
 
+    def test_body_blob_fit_is_constrained_before_descendant_tip(self):
+        graph = SkeletonGraph()
+        graph.add_node("body", "body", [0.0, 0.0, 0.0])
+        graph.add_node("crypt_a_attachment", "attachment", [1.0, 0.0, 0.0], crypt_id="a")
+        graph.add_node("crypt_a_tip", "tip", [2.0, 0.0, 0.0], crypt_id="a")
+        graph.add_edge(
+            "body_to_attachment",
+            "body",
+            "crypt_a_attachment",
+            edge_type="body_to_attachment",
+            crypt_id="a",
+        )
+        graph.add_edge(
+            "attachment_to_tip",
+            "crypt_a_attachment",
+            "crypt_a_tip",
+            edge_type="attachment_to_tip",
+            crypt_id="a",
+        )
+        points = make_ellipsoid_points(np.zeros(3), np.array([4.0, 1.0, 1.0]))
+
+        attachment = attach_body_primitive(
+            graph,
+            points,
+            primitive_type="ellipsoid",
+            axis_quantile=1.0,
+            tip_constraint_margin_fraction=0.0,
+        )
+
+        center = np.asarray(attachment.parameters["center"], dtype=float)
+        direction = graph.node("crypt_a_tip").position - center
+        tip_distance = float(np.linalg.norm(direction))
+        radius = blob_surface_radius(
+            attachment.parameters,
+            attachment.primitive_type,
+            direction,
+        )
+        self.assertLessEqual(radius, tip_distance + 1e-8)
+        self.assertIn("surface_radius_constraints", attachment.metadata)
+
+    def test_body_blob_fit_adds_attachment_cap_support_points(self):
+        graph = SkeletonGraph()
+        graph.add_node("body", "body", [0.0, 0.0, 0.0])
+        graph.add_node("crypt_a_attachment", "attachment", [1.0, 0.0, 0.0], crypt_id="a")
+        graph.add_node("crypt_a_crypt", "crypt", [1.6, 0.0, 0.0], crypt_id="a")
+        graph.add_node("crypt_a_tip", "tip", [2.0, 0.0, 0.0], crypt_id="a")
+        graph.add_edge(
+            "body_to_attachment",
+            "body",
+            "crypt_a_attachment",
+            edge_type="body_to_attachment",
+            crypt_id="a",
+        )
+        graph.add_edge(
+            "attachment_to_crypt",
+            "crypt_a_attachment",
+            "crypt_a_crypt",
+            edge_type="attachment_to_crypt",
+            crypt_id="a",
+        )
+        graph.add_edge(
+            "crypt_to_tip",
+            "crypt_a_crypt",
+            "crypt_a_tip",
+            edge_type="crypt_to_tip",
+            crypt_id="a",
+        )
+        points = make_ellipsoid_points(np.zeros(3), np.array([2.0, 1.0, 1.0]))
+
+        attachment = attach_body_primitive(
+            graph,
+            points,
+            primitive_type="ellipsoid",
+            axis_quantile=0.95,
+            cap_support_points_per_attachment=12,
+            cap_support_radius_fraction=0.5,
+            constrain_to_descendant_tips=False,
+        )
+
+        support = attachment.metadata["attachment_cap_support"]
+        self.assertTrue(support["enabled"])
+        self.assertEqual(support["n_attachments"], 1)
+        self.assertEqual(support["attachment_ids"], ["crypt_a_attachment"])
+        self.assertGreaterEqual(support["n_points"], 12)
+        self.assertEqual(attachment.metadata["n_real_points"], points.shape[0])
+        self.assertEqual(
+            attachment.metadata["n_points"],
+            points.shape[0] + support["n_points"],
+        )
+
+    def test_branch_blob_fit_is_constrained_before_daughter_tip(self):
+        graph = SkeletonGraph()
+        graph.add_node("body", "body", [-3.0, 0.0, 0.0])
+        graph.add_node("crypt_split_neck", "neck", [-1.0, 0.0, 0.0], crypt_id="split")
+        graph.add_node("crypt_split_branch", "branch", [0.0, 0.0, 0.0], crypt_id="split")
+        graph.add_node("crypt_split_tip_0", "tip", [2.0, 0.0, 0.0], crypt_id="split")
+        graph.add_edge("body_to_neck", "body", "crypt_split_neck", crypt_id="split")
+        graph.add_edge("neck_to_branch", "crypt_split_neck", "crypt_split_branch", crypt_id="split")
+        graph.add_edge("branch_to_tip", "crypt_split_branch", "crypt_split_tip_0", crypt_id="split")
+        points = make_ellipsoid_points(np.zeros(3), np.array([4.0, 1.0, 1.0]))
+
+        attachment = attach_branch_primitives(
+            graph,
+            points,
+            {"crypt_split_branch": np.arange(points.shape[0])},
+            primitive_type="asymmetric_superellipsoid",
+            axis_quantile=1.0,
+            tip_constraint_margin_fraction=0.0,
+        )["crypt_split_branch"]
+
+        center = np.asarray(attachment.parameters["center"], dtype=float)
+        direction = graph.node("crypt_split_tip_0").position - center
+        tip_distance = float(np.linalg.norm(direction))
+        radius = blob_surface_radius(
+            attachment.parameters,
+            attachment.primitive_type,
+            direction,
+        )
+        self.assertLessEqual(radius, tip_distance + 1e-8)
+        self.assertIn("surface_radius_constraints", attachment.metadata)
+
     def test_asymmetric_superellipsoid_recovers_directional_axes(self):
         eta = np.linspace(-0.5 * math.pi, 0.5 * math.pi, 28)
         omega = np.linspace(-math.pi, math.pi, 48, endpoint=False)
@@ -1319,6 +1442,67 @@ class SkeletonTests(unittest.TestCase):
             loaded.node("crypt_a_crypt").metadata[
                 "position_refined_from_smooth_centerline"
             ]
+        )
+
+    def test_bulged_crypt_centerline_smoothing_can_be_disabled(self):
+        graph = build_skeleton_from_crypt_detections(
+            VERTICES,
+            FACES,
+            [
+                {
+                    "crypt_id": "bulged",
+                    "attachment_position": [0.0, 0.0, 0.0],
+                    "tip_position": [0.0, 0.0, 2.0],
+                    "crypt_vertices": [1, 2, 4],
+                    "neck_profile": {
+                        "kind": "transition",
+                        "attachment_level": 1.0,
+                    },
+                }
+            ],
+            body_center=[0.0, 0.0, -1.0],
+            bend_strategy="crypt_centroid",
+        )
+        original_crypt_position = graph.node("crypt_bulged_crypt").position.copy()
+        graph_centerline = np.vstack(
+            [
+                graph.node("crypt_bulged_attachment").position,
+                graph.node("crypt_bulged_crypt").position,
+                graph.node("crypt_bulged_tip").position,
+            ]
+        )
+        tube_points = make_tube_points(graph_centerline)
+
+        attachments = attach_crypt_tube_primitives(
+            graph,
+            VERTICES,
+            {"bulged": tube_points},
+            centerline_data={
+                "bulged": {
+                    "vertex_indices": [1, 2, 4],
+                    "distance_field": np.linspace(0.0, 1.0, VERTICES.shape[0]),
+                    "neck_level": 1.0,
+                    "neck_profile": {"kind": "transition", "attachment_level": 1.0},
+                }
+            },
+            smooth_centerline=True,
+            smooth_bulged_centerlines=False,
+        )
+
+        attachment = next(iter(attachments.values()))
+        self.assertEqual(attachment.metadata["centerline_method"], "straight_attachment_to_tip")
+        self.assertTrue(attachment.metadata["bulged_centerline_smoothing_disabled"])
+        np.testing.assert_allclose(
+            attachment.parameters["centerline_points"],
+            graph_centerline[[0, -1]],
+        )
+        np.testing.assert_allclose(
+            graph.node("crypt_bulged_crypt").position,
+            original_crypt_position,
+        )
+        self.assertNotIn(
+            "position_refined_from_smooth_centerline",
+            graph.node("crypt_bulged_crypt").metadata,
         )
 
     def test_blend_attachments_are_visualization_only(self):

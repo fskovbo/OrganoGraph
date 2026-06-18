@@ -11,6 +11,259 @@ from organograph.skeleton.geometry import as_points, centroid
 from organograph.skeleton.primitive.common import _residual_summary
 from organograph.skeleton.primitives import PrimitiveFit
 
+
+def blob_surface_radius(parameters: dict[str, Any], primitive_type: str, direction) -> float:
+    """Return the blob surface distance along a world-space ray.
+
+    The center and orientation are assumed fixed.  This is used by fitting-time
+    constraints that keep body/branch blobs from extending beyond descendant
+    crypt tips.
+    """
+    direction = np.asarray(direction, dtype=float).reshape(-1)
+    if direction.size != 3 or not np.all(np.isfinite(direction)):
+        return float("nan")
+    norm = float(np.linalg.norm(direction))
+    if norm <= 1e-12:
+        return float("nan")
+    direction = direction / norm
+
+    primitive_type = str(primitive_type)
+    orientation = np.asarray(parameters["orientation"], dtype=float)
+    local = direction @ orientation
+    if primitive_type in {"ellipsoid", "superellipsoid_placeholder"}:
+        axes = np.asarray(parameters["axis_lengths"], dtype=float)
+        denom = float(np.sqrt(np.sum((local / np.maximum(axes, 1e-12)) ** 2)))
+        return 1.0 / max(denom, 1e-12)
+
+    if primitive_type == "asymmetric_superellipsoid":
+        negative = np.asarray(parameters["axis_lengths_negative"], dtype=float)
+        positive = np.asarray(parameters["axis_lengths_positive"], dtype=float)
+        epsilon_1 = float(parameters.get("epsilon_1", 1.0))
+        epsilon_2 = float(parameters.get("epsilon_2", 1.0))
+        axes = np.where(local >= 0.0, positive, negative)
+        scaled = np.abs(local) / np.maximum(axes, 1e-12)
+        xy = (
+            scaled[0] ** (2.0 / epsilon_2)
+            + scaled[1] ** (2.0 / epsilon_2)
+        ) ** (epsilon_2 / epsilon_1)
+        denom = float((xy + scaled[2] ** (2.0 / epsilon_1)) ** (epsilon_1 / 2.0))
+        return 1.0 / max(denom, 1e-12)
+
+    return float("nan")
+
+
+def _constraint_residuals(parameters, primitive_type, constraints):
+    residuals = []
+    for constraint in constraints:
+        limit = float(constraint["max_radius"])
+        if not np.isfinite(limit) or limit <= 1e-12:
+            continue
+        radius = blob_surface_radius(parameters, primitive_type, constraint["direction"])
+        if not np.isfinite(radius):
+            continue
+        residuals.append(max(0.0, radius / limit - 1.0))
+    return np.asarray(residuals, dtype=float)
+
+
+def _normalize_surface_radius_constraints(constraints) -> list[dict[str, Any]]:
+    out = []
+    for constraint in constraints or []:
+        direction = np.asarray(constraint.get("direction"), dtype=float).reshape(-1)
+        if direction.size != 3 or not np.all(np.isfinite(direction)):
+            continue
+        norm = float(np.linalg.norm(direction))
+        if norm <= 1e-12:
+            continue
+        max_radius = float(constraint.get("max_radius", np.nan))
+        if not np.isfinite(max_radius) or max_radius <= 1e-12:
+            continue
+        item = {
+            "direction": direction / norm,
+            "max_radius": max_radius,
+        }
+        if "tip_node_id" in constraint:
+            item["tip_node_id"] = str(constraint["tip_node_id"])
+        out.append(item)
+    return out
+
+
+def constrain_blob_fit_surface_radius(
+    fit: PrimitiveFit,
+    points,
+    constraints,
+    *,
+    min_axis_length: float = 1e-6,
+    point_weight: float = 1.0,
+    constraint_weight: float = 50.0,
+    axis_regularization: float = 0.2,
+) -> PrimitiveFit:
+    """Shrink fitted blob semiaxes so radius bounds are satisfied.
+
+    This is part of primitive fitting rather than rendering.  It keeps the
+    fitted center/orientation fixed and adjusts only semiaxes, so the resulting
+    stored primitive cannot extend past the supplied crypt-tip bounds.
+    """
+    constraints = _normalize_surface_radius_constraints(constraints)
+    if not constraints:
+        return fit
+
+    pts = as_points(points)
+    center = np.asarray(fit.parameters["center"], dtype=float)
+    orientation = np.asarray(fit.parameters["orientation"], dtype=float)
+    coords = (pts - center[None, :]) @ orientation
+    primitive_type = str(fit.primitive_type)
+    min_axis_length = float(min_axis_length)
+
+    before = _constraint_residuals(fit.parameters, primitive_type, constraints)
+    if before.size and float(np.max(before)) <= 1e-10:
+        return fit
+
+    sqrt_point = np.sqrt(max(float(point_weight), 0.0))
+    sqrt_constraint = np.sqrt(max(float(constraint_weight), 0.0))
+    sqrt_axis_reg = np.sqrt(max(float(axis_regularization), 0.0))
+
+    if primitive_type in {"ellipsoid", "superellipsoid_placeholder"}:
+        initial_axes = np.asarray(fit.parameters["axis_lengths"], dtype=float)
+
+        def unpack(log_axes):
+            parameters = dict(fit.parameters)
+            parameters["axis_lengths"] = np.exp(log_axes)
+            return parameters
+
+        def residual(log_axes):
+            parameters = unpack(log_axes)
+            axes = parameters["axis_lengths"]
+            point_residual = (
+                np.sqrt(np.sum((coords / np.maximum(axes, 1e-12)) ** 2, axis=1))
+                - 1.0
+            )
+            axis_residual = axes / np.maximum(initial_axes, 1e-12) - 1.0
+            constraint_residual = _constraint_residuals(
+                parameters, primitive_type, constraints
+            )
+            return np.concatenate(
+                [
+                    sqrt_point * point_residual,
+                    sqrt_axis_reg * axis_residual,
+                    sqrt_constraint * constraint_residual,
+                ]
+            )
+
+        lower = np.full(3, np.log(min_axis_length), dtype=float)
+        upper = np.log(np.maximum(initial_axes, min_axis_length))
+        optimized = least_squares(
+            residual,
+            upper,
+            bounds=(lower, upper),
+            loss="soft_l1",
+        ).x
+        fit.parameters["axis_lengths"] = np.exp(optimized)
+
+    elif primitive_type == "asymmetric_superellipsoid":
+        initial_negative = np.asarray(
+            fit.parameters["axis_lengths_negative"], dtype=float
+        )
+        initial_positive = np.asarray(
+            fit.parameters["axis_lengths_positive"], dtype=float
+        )
+        initial_axes = np.concatenate([initial_negative, initial_positive])
+        epsilon_1 = float(fit.parameters["epsilon_1"])
+        epsilon_2 = float(fit.parameters["epsilon_2"])
+
+        def unpack(log_axes):
+            axes = np.exp(log_axes)
+            parameters = dict(fit.parameters)
+            parameters["axis_lengths_negative"] = axes[:3]
+            parameters["axis_lengths_positive"] = axes[3:6]
+            return parameters
+
+        def residual(log_axes):
+            parameters = unpack(log_axes)
+            axes = np.exp(log_axes)
+            point_residual = (
+                _asymmetric_superellipsoid_radius(
+                    coords,
+                    parameters["axis_lengths_negative"],
+                    parameters["axis_lengths_positive"],
+                    epsilon_1,
+                    epsilon_2,
+                )
+                - 1.0
+            )
+            axis_residual = axes / np.maximum(initial_axes, 1e-12) - 1.0
+            constraint_residual = _constraint_residuals(
+                parameters, primitive_type, constraints
+            )
+            return np.concatenate(
+                [
+                    sqrt_point * point_residual,
+                    sqrt_axis_reg * axis_residual,
+                    sqrt_constraint * constraint_residual,
+                ]
+            )
+
+        lower = np.full(6, np.log(min_axis_length), dtype=float)
+        upper = np.log(np.maximum(initial_axes, min_axis_length))
+        optimized = least_squares(
+            residual,
+            upper,
+            bounds=(lower, upper),
+            loss="soft_l1",
+        ).x
+        optimized_axes = np.exp(optimized)
+        fit.parameters["axis_lengths_negative"] = optimized_axes[:3]
+        fit.parameters["axis_lengths_positive"] = optimized_axes[3:6]
+
+    else:
+        return fit
+
+    # Make the constraint exact even if the soft optimization stops with a
+    # tiny violation.  Uniform final scaling is rarely reached, but it is a
+    # simple hard safety net for VAE-facing primitive parameters.
+    radii = [
+        blob_surface_radius(fit.parameters, primitive_type, item["direction"])
+        for item in constraints
+    ]
+    ratios = [
+        float(item["max_radius"]) / radius
+        for item, radius in zip(constraints, radii)
+        if np.isfinite(radius) and radius > float(item["max_radius"]) > 0.0
+    ]
+    if ratios:
+        scale = max(min(ratios), min_axis_length)
+        if primitive_type in {"ellipsoid", "superellipsoid_placeholder"}:
+            fit.parameters["axis_lengths"] = (
+                np.asarray(fit.parameters["axis_lengths"], dtype=float) * scale
+            )
+        else:
+            fit.parameters["axis_lengths_negative"] = (
+                np.asarray(fit.parameters["axis_lengths_negative"], dtype=float)
+                * scale
+            )
+            fit.parameters["axis_lengths_positive"] = (
+                np.asarray(fit.parameters["axis_lengths_positive"], dtype=float)
+                * scale
+            )
+
+    after = _constraint_residuals(fit.parameters, primitive_type, constraints)
+    fit.metadata["surface_radius_constraints"] = [
+        {
+            "tip_node_id": item.get("tip_node_id"),
+            "max_radius": float(item["max_radius"]),
+            "direction": np.asarray(item["direction"], dtype=float),
+        }
+        for item in constraints
+    ]
+    fit.metadata["surface_radius_constraint_max_violation_before"] = (
+        float(np.max(before)) if before.size else 0.0
+    )
+    fit.metadata["surface_radius_constraint_max_violation_after"] = (
+        float(np.max(after)) if after.size else 0.0
+    )
+    fit.metadata["surface_radius_constraint_method"] = "fixed_center_orientation_axis_shrink"
+    return fit
+
+
 def fit_ellipsoid_to_points(
     points,
     *,
@@ -226,4 +479,3 @@ def fit_blob_primitive_to_points(
         "Blob primitive_type must be 'ellipsoid' or "
         "'asymmetric_superellipsoid'"
     )
-

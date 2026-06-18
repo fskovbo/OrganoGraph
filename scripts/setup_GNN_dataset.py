@@ -220,7 +220,7 @@ def export_organoid_npz(
     if X.ndim != 2:
         raise ValueError(f"x must be 2-D (N,M); got {X.shape}")
     if not np.isin(X, [0.0, 1.0]).all():
-        X = (X > 0.5).astype(np.float32)
+        X = (X > 0).astype(np.float32)
 
     y = np.asarray(y, dtype=np.float32)
     if y.ndim == 1:
@@ -654,7 +654,7 @@ def extract_marker_matrix(G: nx.Graph) -> np.ndarray:
     X = np.asarray(graph_get(G, GRAPH_MARKERS_FIELD))
     if X.ndim != 2:
         raise ValueError(f"{GRAPH_MARKERS_FIELD} must be 2-D (N, M); got shape {X.shape}")
-    return (X > 0.5).astype(np.float32)
+    return (X > 0).astype(np.float32)
 
 
 
@@ -684,7 +684,7 @@ def build_effective_marker_representation(
         X_src = X_eff[:, src_idx]
 
         if mode == "any":
-            new_col = (X_src > 0.5).any(axis=1).astype(np.float32)
+            new_col = (X_src > 0).any(axis=1).astype(np.float32)
         else:
             raise NotImplementedError(f"Unsupported combine mode: {mode}")
 

@@ -35,12 +35,13 @@ from organograph.mesh.OrganoidMesh import OrganoidMesh
 from organograph.io_utils.cells_table import prepare_cells_table, make_nuclei_extractor, suppress_marker_if_coexpressed, enforce_marker_exclusivity, harmonize_markers
 from organograph.io_utils.path_parsing import parse_mesh_path, discover_mesh_paths
 from organograph.io_utils.dataset_config import load_mesh_dataset_config, load_cell_table_config
-from organograph.io_utils.blacklist import load_blacklist
+from organograph.io_utils.blacklist import default_discard_labels_path, load_optional_blacklist
+from organograph.io_utils.run_metadata import write_run_settings
 from organograph.graph.build import build_organoid_graph, add_vertex_field_to_graph
 from organograph.graph.io import save_cell_graph
 from organograph.graph.marker_postprocess import (
     ablate_lysozyme_not_agr2_in_clusters,
-    copy_graph_markers_bin,
+    copy_graph_marker_fields,
     suppress_graph_marker_if_coexpressed,
 )
 
@@ -61,16 +62,17 @@ _SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT    = os.path.dirname(_SCRIPT_DIR)
 
 MESH_DATA_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "fractal_output")
-CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_types_class.csv") # cell_types_class # cell_features_class
+CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "feature_tables", "cell_features_class.csv") # cell_types_class # cell_features_class
 OUT_GRAPHS_DIR  = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "graphs_preprocessed")
+DATASET_ROOT    = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET)
 
 MESH_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "mesh_config.json")
 CELL_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_table_config.json")
-BLACKLIST_PATH  = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "blacklist_labels.csv")
+BLACKLIST_PATH  = default_discard_labels_path(DATASET_ROOT)
 
 
 # Optional override. 
-timepoints = None # ['day3p5', 'day4', 'day4p5', 'day4p5-more']   
+timepoints = ['day4p5', 'day4p5-more']   
 
 
 MAX_PROJ_DIST = 2.0  # max accepted distance between nuclei and membrane for projection. If None, use all distances
@@ -118,7 +120,7 @@ COEXP_MARKERS = tuple(marker_config_name_to_alias(m) for m in cell_cfg["coexp_ma
 
 # Graph-level marker postprocessing. These steps run after graph construction,
 # so they can use graph adjacency before co-expression suppression is applied.
-STORE_RAW_GRAPH_MARKERS = True  # Preserve the original per-node marker calls in markers_bin_raw.
+STORE_RAW_GRAPH_MARKERS = True  # Preserve original per-node markers in markers_int_raw and markers_bin_raw.
 ENABLE_LYSOZYME_AGR2_ABLATION = True  # Remove Lysozyme from clustered Lysozyme+ cells unless they are Agr2+.
 LYSOZYME_MARKER = marker_config_name_to_alias("Lysozyme")
 AGR2_MARKER = marker_config_name_to_alias("Agr2")
@@ -166,8 +168,8 @@ def graph_marker_postprocess(G):
     steps = []
 
     if STORE_RAW_GRAPH_MARKERS:
-        copy_graph_markers_bin(G)
-        steps.append("copy_markers_bin_raw")
+        copy_graph_marker_fields(G)
+        steps.append("copy_marker_fields_raw")
 
     if ENABLE_LYSOZYME_AGR2_ABLATION:
         ablate_lysozyme_not_agr2_in_clusters(
@@ -190,6 +192,17 @@ def graph_marker_postprocess(G):
 
     G.graph["marker_postprocess_steps"] = steps
     return G
+
+
+def enabled_marker_postprocessing_functions():
+    steps = []
+    if STORE_RAW_GRAPH_MARKERS:
+        steps.append("copy_marker_fields_raw")
+    if ENABLE_LYSOZYME_AGR2_ABLATION:
+        steps.append("ablate_lysozyme_not_agr2_in_clusters")
+    if ENABLE_GRAPH_COEXPRESSION_SUPPRESSION:
+        steps.append("suppress_marker_if_coexpressed")
+    return steps
 
 # def marker_postprocess(markers_bin, marker_names):
 #     return suppress_marker_if_coexpressed(
@@ -228,20 +241,31 @@ def graph_marker_postprocess(G):
 
 def main():
     t_start = time.perf_counter()
-    build_graphs_for_dataset(
+    stats = build_graphs_for_dataset(
         overwrite=OVERWRITE,
         verbose=VERBOSE,
         blacklist_path=BLACKLIST_PATH,
     )
     elapsed_s = time.perf_counter() - t_start
+    write_graph_run_settings(elapsed_s=elapsed_s, stats=stats)
     if VERBOSE:
         print(f"[graphs] done. DRY_RUN={DRY_RUN} elapsed={elapsed_s:.2f}s ({elapsed_s/60.0:.2f} min)")
 
 
 def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist_path=None):
-    blacklist = load_blacklist(blacklist_path) if blacklist_path else set()
+    blacklist = load_optional_blacklist(blacklist_path, label="blacklist", verbose=verbose)
     search_timepoints = resolve_timepoints(timepoints, zarr_names, rounds, meshes)
     tp_allow = set(search_timepoints)
+    stats = {
+        "mesh_files_found": 0,
+        "planned_or_done": 0,
+        "graphs_saved": 0,
+        "vertex_owner_sidecars_saved": 0,
+        "skipped_blacklist": 0,
+        "skipped_existing": 0,
+        "failed": 0,
+        "dry_run": bool(DRY_RUN),
+    }
 
     # --- load & index cells table once ---
     if not os.path.exists(CELLS_CSV):
@@ -258,6 +282,7 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist_path=None)
         marker_cols=MARKER_COLS,
         marker_alias=MARKER_ALIAS,
         marker_postprocess_fn=marker_postprocess,
+        return_marker_intensity=True,
     )
 
     # --- discover mesh paths (restrictive glob based on config) ---
@@ -273,6 +298,7 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist_path=None)
     if verbose:
         print(f"[graphs] searching timepoints: {search_timepoints}")
         print(f"[graphs] found {len(mesh_paths)} mesh files (pre-filter)")
+    stats["mesh_files_found"] = int(len(mesh_paths))
 
     index_rows = {}  # timepoint -> list of dicts
     it = tqdm(mesh_paths, desc="build graphs") if verbose else mesh_paths
@@ -286,6 +312,7 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist_path=None)
         except Exception as e:
             if verbose:
                 print(f"[skip] cannot parse mesh path: {mesh_path} ({e})")
+            stats["failed"] += 1
             continue
 
         tp = rec.get("timepoint", None)
@@ -309,19 +336,23 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist_path=None)
         if label_uid in blacklist:
             if verbose:
                 print(f"[skip] {label_uid} is blacklisted")
+            stats["skipped_blacklist"] += 1
             continue
 
         out_dir = os.path.join(OUT_GRAPHS_DIR, tp)
         os.makedirs(out_dir, exist_ok=True)
         out_path = os.path.join(out_dir, f"{label_uid}.gpickle")
+        vertex_owner_path = os.path.join(out_dir, f"{label_uid}.vertex_owner.npz")
 
         if (not overwrite) and os.path.exists(out_path):
             if verbose:
                 print(f"[skip] exists: {out_path}")
+            stats["skipped_existing"] += 1
             continue
 
         # DRY_RUN / MAX_MESHES logic (after all filters)
         n_planned_or_done += 1
+        stats["planned_or_done"] = int(n_planned_or_done)
         if DRY_RUN:
             if verbose:
                 print(f"[dry-run] would build: tp={tp} well={well} label_uid={label_uid} -> {out_path}")
@@ -335,6 +366,7 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist_path=None)
         except Exception as e:
             if verbose:
                 print(f"[{tp}] mesh load failed: {mesh_path} ({e})")
+            stats["failed"] += 1
             continue
 
         # --- normalize mesh coordinates ---
@@ -347,6 +379,7 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist_path=None)
         except Exception as e:
             if verbose:
                 print(f"[{tp}] graph build failed for {label_uid}: {e}")
+            stats["failed"] += 1
             continue
 
         try:
@@ -354,16 +387,32 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist_path=None)
         except Exception as e:
             if verbose:
                 print(f"[{tp}] graph marker postprocess failed for {label_uid}: {e}")
+            stats["failed"] += 1
             continue
 
         # --- save graph + index ---
+        G.graph["mesh_path"] = str(mesh_path)
+        G.graph["vertex_owner_path"] = str(vertex_owner_path)
         save_cell_graph(out_path, G)
+        stats["graphs_saved"] += 1
+
+        np.savez_compressed(
+            vertex_owner_path,
+            label_uid=str(label_uid),
+            timepoint=str(tp),
+            mesh_path=str(mesh_path),
+            graph_path=str(out_path),
+            vertex_owner=np.asarray(aux["vertex_owner"], dtype=np.int64),
+            proj_vertex_ids=np.asarray(aux["proj_vertex_ids"], dtype=np.int64),
+        )
+        stats["vertex_owner_sidecars_saved"] += 1
         index_rows.setdefault(tp, []).append(
             {
                 "label_uid": label_uid,
                 "well": well,
                 "mesh_path": mesh_path,
                 "graph_path": out_path,
+                "vertex_owner_path": vertex_owner_path,
                 "N_cells": int(G.number_of_nodes()),
                 "N_edges": int(G.number_of_edges()),
                 "max_proj_dist": MAX_PROJ_DIST,
@@ -384,6 +433,49 @@ def build_graphs_for_dataset(overwrite=False, verbose=True, blacklist_path=None)
             w.writerows(rows)
         if verbose:
             print(f"[graphs] wrote {idx_path} ({len(rows)} rows)")
+
+    return stats
+
+
+def write_graph_run_settings(*, elapsed_s, stats):
+    write_run_settings(
+        OUT_GRAPHS_DIR,
+        script_name=os.path.basename(__file__),
+        payload={
+            "dataset": DATASET,
+            "timepoints": resolve_timepoints(timepoints, zarr_names, rounds, meshes),
+            "paths": {
+                "dataset_root": DATASET_ROOT,
+                "mesh_data_dir": MESH_DATA_DIR,
+                "cells_csv": CELLS_CSV,
+                "out_graphs_dir": OUT_GRAPHS_DIR,
+                "mesh_config_path": MESH_CONFIG_PATH,
+                "cell_config_path": CELL_CONFIG_PATH,
+                "blacklist_path": BLACKLIST_PATH,
+            },
+            "parameters": {
+                "max_proj_dist": MAX_PROJ_DIST,
+                "overwrite": OVERWRITE,
+                "dry_run": DRY_RUN,
+                "max_meshes": MAX_MESHES,
+            },
+            "marker_fields": ["markers_int", "markers_bin"],
+            "marker_positive_rule": "markers_bin = markers_int > 0",
+            "postprocessing_functions": {
+                "enabled": enabled_marker_postprocessing_functions(),
+                "store_raw_graph_markers": STORE_RAW_GRAPH_MARKERS,
+                "enable_lysozyme_agr2_ablation": ENABLE_LYSOZYME_AGR2_ABLATION,
+                "enable_graph_coexpression_suppression": ENABLE_GRAPH_COEXPRESSION_SUPPRESSION,
+            },
+            "outputs": {
+                "graph_pickle": "{OUT_GRAPHS_DIR}/{timepoint}/{label_uid}.gpickle",
+                "vertex_owner_sidecar": "{OUT_GRAPHS_DIR}/{timepoint}/{label_uid}.vertex_owner.npz",
+            },
+            "stats": stats,
+            "elapsed_s": float(elapsed_s),
+        },
+        verbose=VERBOSE,
+    )
 
 
 if __name__ == "__main__":

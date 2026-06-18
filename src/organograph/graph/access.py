@@ -107,7 +107,7 @@ def graph_get_marker_bin(G, marker, nodes=None, dtype=np.int64):
     (N,) numpy array
     """
     # get (N,M) markers_bin
-    markers_bin = graph_get(G, "markers_bin", nodes=nodes, dtype=dtype)
+    markers_bin = graph_get(G, "markers_bin", nodes=nodes)
 
     if isinstance(marker, str):
         idx = graph_marker_index(G, marker)
@@ -119,7 +119,8 @@ def graph_get_marker_bin(G, marker, nodes=None, dtype=np.int64):
     if idx < 0 or idx >= markers_bin.shape[1]:
         raise IndexError(f"marker index {idx} out of range (M={markers_bin.shape[1]}).")
 
-    return markers_bin[:, idx]
+    out = (markers_bin[:, idx] > 0).astype(dtype, copy=False)
+    return out
 
 
 def graph_inspect(G):

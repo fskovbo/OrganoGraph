@@ -9,7 +9,7 @@ from organograph.graph.access import graph_get
 
 def build_organoid_graph(
     mesh,                    # OrganoidMesh with mesh.v, mesh.f; mesh.label_uid set
-    extract_fn,              # callable(label_uid)->(nuclei_xyz_raw (N,3), markers_bin (N,M), marker_names)
+    extract_fn,              # callable(label_uid)->(nuclei_xyz_raw, markers_bin, marker_names) or (nuclei_xyz_raw, markers_int, markers_bin, marker_names)
     *,
     precomputed=None,        # dict or None: {"proj_vertex_ids":..., "vertex_owner":..., "proj_points":...}
     resolve_duplicates=True,
@@ -29,15 +29,33 @@ def build_organoid_graph(
         raise ValueError("mesh.label_uid must be set")
 
     # ---- 1) extract RAW nuclei + markers for this label_uid ----
-    nuclei_xyz_raw, markers_bin, marker_names = extract_fn(mesh.label_uid)
+    extracted = extract_fn(mesh.label_uid)
+    if not isinstance(extracted, tuple):
+        raise ValueError("extract_fn must return a tuple")
+    if len(extracted) == 3:
+        nuclei_xyz_raw, markers_bin, marker_names = extracted
+        markers_int = np.asarray(markers_bin, dtype=float)
+    elif len(extracted) == 4:
+        nuclei_xyz_raw, markers_int, markers_bin, marker_names = extracted
+    else:
+        raise ValueError(
+            "extract_fn must return either "
+            "(nuclei_xyz_raw, markers_bin, marker_names) or "
+            "(nuclei_xyz_raw, markers_int, markers_bin, marker_names)"
+        )
 
     nuclei_xyz_raw = np.asarray(nuclei_xyz_raw, float)
+    markers_int = np.asarray(markers_int, dtype=float)
     markers_bin = np.asarray(markers_bin)
 
     if nuclei_xyz_raw.ndim != 2 or nuclei_xyz_raw.shape[1] != 3:
         raise ValueError(f"extract_fn must return nuclei_xyz shape (N,3), got {nuclei_xyz_raw.shape}")
+    if markers_int.ndim != 2 or markers_int.shape[0] != nuclei_xyz_raw.shape[0]:
+        raise ValueError("extract_fn must return markers_int shape (N,M) with same N as nuclei_xyz")
     if markers_bin.ndim != 2 or markers_bin.shape[0] != nuclei_xyz_raw.shape[0]:
         raise ValueError("extract_fn must return markers_bin shape (N,M) with same N as nuclei_xyz")
+    if markers_int.shape[1] != markers_bin.shape[1]:
+        raise ValueError("markers_int and markers_bin must have the same number of columns")
 
     # ---- 2) apply mesh transform to nuclei (if mesh is in a different frame) ----
     nuclei_xyz = _apply_mesh_transform_to_nuclei(mesh, nuclei_xyz_raw)
@@ -76,6 +94,7 @@ def build_organoid_graph(
     # ---- 4) build graph ----
     G = _build_graph_from_voronoi(
         nuclei_xyz=nuclei_xyz,
+        markers_int=markers_int,
         markers_bin=markers_bin,
         mesh=mesh,
         vertex_owner=vertex_owner,
@@ -86,6 +105,7 @@ def build_organoid_graph(
     # ---- 5) metadata ----
     G.graph["label_uid"] = mesh.label_uid
     G.graph["marker_names"] = list(marker_names) if marker_names is not None else []
+    G.graph["marker_fields"] = ["markers_int", "markers_bin"]
     if hasattr(mesh, "coord_transform"):
         G.graph["coord_transform"] = mesh.coord_transform
 
@@ -121,6 +141,7 @@ def _apply_mesh_transform_to_nuclei(mesh, nuclei_xyz_raw):
 
 def _build_graph_from_voronoi(
     nuclei_xyz,
+    markers_int,
     markers_bin,
     mesh,
     vertex_owner,
@@ -141,6 +162,7 @@ def _build_graph_from_voronoi(
             new_i,
             cell_index=int(old_i),   # original row / cell index
             centroid=nuclei_xyz[old_i].tolist(),
+            markers_int=markers_int[old_i].tolist(),
             markers_bin=markers_bin[old_i].tolist(),
             proj_vertex=int(proj_vertex_ids[old_i]),
             proj_point=(proj_points[old_i].tolist() if proj_points is not None else None),

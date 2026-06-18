@@ -73,8 +73,9 @@ from organograph.mesh.hks import compute_hks
 from organograph.mesh.curvature import compute_gaussian_curvature
 
 from organograph.io_utils.path_parsing import discover_mesh_paths, parse_mesh_path
-from organograph.io_utils.blacklist import load_blacklist
+from organograph.io_utils.blacklist import default_discard_labels_path, load_blacklist, load_optional_blacklist
 from organograph.io_utils.dataset_config import load_mesh_dataset_config
+from organograph.io_utils.run_metadata import write_run_settings
 
 from organograph.crypts.segment import segment_crypts_organoid
 from organograph.crypts.filters import filter_crypts_by_hks_percent, filter_crypts_by_size
@@ -90,16 +91,17 @@ _SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT    = os.path.dirname(_SCRIPT_DIR)
 
 MESH_DATA_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "fractal_output")
-SEG_DIR         = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_mesh_3p5selected")
+SEG_DIR         = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_mesh_day3")
 VOCAB_PATH      = os.path.join(PROJECT_ROOT, "sim", "vocab_with_meta.npz")
 MESH_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "mesh_config.json")
+DATASET_ROOT    = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET)
 
-BLACKLIST_PATH  = None # os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "blacklist_labels.csv")
-WHITELIST_PATH  = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "day3p5_goodmeshes.csv")
+BLACKLIST_PATH  = default_discard_labels_path(DATASET_ROOT)
+WHITELIST_PATH  = None # os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "day3p5_goodmeshes.csv")
 
 
 # Optional override. If None, use all timepoints from mesh_config.json
-TIMEPOINTS      = ['day3p5']   
+TIMEPOINTS      = ['day3']   
 
 
 OVERWRITE = True
@@ -142,6 +144,10 @@ FILTERS = [
         min_patch_area=5,
         **kw
     ),
+]
+FILTER_NAMES = [
+    "filter_crypts_by_hks_percent",
+    "filter_crypts_by_size",
 ]
 
 CALC_GAUSSIAN_CURV = True # if True, compute and store Gaussian curvature field for full organoid
@@ -211,12 +217,21 @@ def normalize_save_spec(spec):
 
 def main():
     t_start = time.perf_counter()
+    stats = {
+        "mesh_files_found": 0,
+        "segmentations_saved": 0,
+        "skipped_blacklist": 0,
+        "skipped_whitelist": 0,
+        "skipped_existing": 0,
+        "failed": 0,
+        "dry_run": bool(DRY_RUN),
+    }
 
     if not os.path.exists(VOCAB_PATH):
         raise FileNotFoundError(f"VOCAB_PATH not found: {VOCAB_PATH}")
     vocab = np.load(VOCAB_PATH, allow_pickle=True)
 
-    blacklist = load_blacklist(BLACKLIST_PATH) if BLACKLIST_PATH else set()
+    blacklist = load_optional_blacklist(BLACKLIST_PATH, label="blacklist", verbose=VERBOSE)
     whitelist = load_blacklist(WHITELIST_PATH) if WHITELIST_PATH else None
 
     if VERBOSE and blacklist:
@@ -242,6 +257,7 @@ def main():
 
     if VERBOSE:
         print(f"[mesh-seg] found {len(mesh_paths)} mesh files")
+    stats["mesh_files_found"] = int(len(mesh_paths))
 
     keys_to_save = normalize_save_spec(SAVE_SEG_VARS)
 
@@ -253,6 +269,7 @@ def main():
         except Exception as e:
             if VERBOSE:
                 print(f"[skip] cannot parse mesh path: {mesh_path} ({e})")
+            stats["failed"] += 1
             continue
 
         tp = rec.get("timepoint", None)
@@ -266,11 +283,13 @@ def main():
         if label_uid in blacklist:
             if VERBOSE:
                 print(f"[skip] {label_uid} is blacklisted")
+            stats["skipped_blacklist"] += 1
             continue
 
         if whitelist is not None and label_uid not in whitelist:
             if VERBOSE:
                 print(f"[skip] {label_uid} not in whitelist")
+            stats["skipped_whitelist"] += 1
             continue
 
         out_dir = os.path.join(SEG_DIR, tp)
@@ -280,6 +299,7 @@ def main():
         if (not OVERWRITE) and os.path.exists(out_path):
             if VERBOSE:
                 print(f"[skip] exists: {out_path}")
+            stats["skipped_existing"] += 1
             continue
 
         if DRY_RUN:
@@ -297,6 +317,7 @@ def main():
         except Exception as e:
             if VERBOSE:
                 print(f"[{tp}] mesh load failed for {label_uid}: {e}")
+            stats["failed"] += 1
             continue
 
         # normalize + id
@@ -309,6 +330,7 @@ def main():
         except Exception as e:
             if VERBOSE:
                 print(f"[{tp}] eigendecomp failed for {label_uid}: {e}")
+            stats["failed"] += 1
             continue
 
         # run segmentation
@@ -329,6 +351,7 @@ def main():
         except Exception as e:
             if VERBOSE:
                 print(f"[{tp}] segmentation failed for {label_uid}: {e}")
+            stats["failed"] += 1
             continue
 
         # --- main results ---
@@ -363,16 +386,59 @@ def main():
 
         if VERBOSE:
             print(f"[mesh-seg] saved {tp}/{label_uid} -> {out_path} (n_crypts={len(crypts)})")
+        stats["segmentations_saved"] += 1
 
         n_done += 1
         if MAX_MESHES is not None and n_done >= int(MAX_MESHES):
             break
 
     elapsed_s = time.perf_counter() - t_start
+    write_crypt_run_settings(elapsed_s=elapsed_s, stats=stats)
     if VERBOSE:
         print(f"[mesh-seg] done. processed={n_done} DRY_RUN={DRY_RUN} elapsed={elapsed_s:.2f}s ({elapsed_s/60.0:.2f} min)")
 
-    
+
+def write_crypt_run_settings(*, elapsed_s, stats):
+    timepoints = (
+        list(TIMEPOINTS)
+        if TIMEPOINTS is not None
+        else [tp for tp in ZARR_NAME_BY_TP if tp in ROUND_BY_TP and tp in MESHNAME_BY_TP]
+    )
+    write_run_settings(
+        SEG_DIR,
+        script_name=os.path.basename(__file__),
+        payload={
+            "dataset": DATASET,
+            "timepoints": timepoints,
+            "paths": {
+                "dataset_root": DATASET_ROOT,
+                "mesh_data_dir": MESH_DATA_DIR,
+                "seg_dir": SEG_DIR,
+                "vocab_path": VOCAB_PATH,
+                "mesh_config_path": MESH_CONFIG_PATH,
+                "blacklist_path": BLACKLIST_PATH,
+                "whitelist_path": WHITELIST_PATH,
+            },
+            "parameters": {
+                "overwrite": OVERWRITE,
+                "dry_run": DRY_RUN,
+                "max_meshes": MAX_MESHES,
+                "geodesic_fn": getattr(GEODESIC_FN, "__name__", str(GEODESIC_FN)),
+                "geodesic_kwargs": GEODESIC_KWARGS,
+                "calc_gaussian_curv": CALC_GAUSSIAN_CURV,
+                "tau_gaussian_curv": TAU_GAUSSIAN_CURV,
+                "segment_kwargs": SEGMENT_KWARGS,
+                "save_seg_vars": SAVE_SEG_VARS,
+            },
+            "postprocessing_functions": {
+                "filters": FILTER_NAMES,
+            },
+            "stats": stats,
+            "elapsed_s": float(elapsed_s),
+        },
+        verbose=VERBOSE,
+    )
+
 
 
 if __name__ == "__main__":

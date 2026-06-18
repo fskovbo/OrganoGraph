@@ -29,7 +29,8 @@ def kNN_marker_composition(cell_graph, positive_labels, focal_marker_idx, k=3):
         Raw per-cell compositions (rows = focal cells, cols = markers).
     """
     N, M = positive_labels.shape
-    focal_cells = np.where(positive_labels[:, focal_marker_idx] == 1)[0]
+    positive_labels = np.asarray(positive_labels) > 0
+    focal_cells = np.where(positive_labels[:, focal_marker_idx])[0]
     if len(focal_cells) == 0:
         raise ValueError("No cells positive for the focal marker")
 

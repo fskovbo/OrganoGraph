@@ -42,6 +42,31 @@ def load_blacklist(path):
     raise ValueError(f"Unsupported blacklist format: {ext}")
 
 
+def default_discard_labels_path(dataset_root):
+    """Return the streamlined dataset blacklist path."""
+    return os.path.join(dataset_root, "feature_tables", "combined_labels_to_discard.csv")
+
+
+def load_optional_blacklist(path, *, label="blacklist", verbose=True):
+    """
+    Load a blacklist-style label file if it exists.
+
+    Missing files are intentionally non-fatal for streamlined datasets where the
+    discard table may not have been created yet.
+    """
+    if path is None:
+        if verbose:
+            print(f"[warn] no {label} path configured; continuing without one")
+        return set()
+
+    if not os.path.exists(path):
+        if verbose:
+            print(f"[warn] {label} file not found: {path}; continuing without one")
+        return set()
+
+    return load_blacklist(path)
+
+
 def append_to_blacklist(path, label_uids):
     """
     Append label_uids to an existing blacklist file while avoiding duplicates.

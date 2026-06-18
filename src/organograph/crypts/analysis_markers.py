@@ -18,7 +18,7 @@ def bin_marker_positivity(
     counts_pos : (M, B) array
     counts_total : (B,) array
     """
-    markers = np.asarray(markers)
+    markers = np.asarray(markers) > 0
     distance = np.asarray(distance)
     bin_edges = np.asarray(bin_edges)
 
@@ -33,7 +33,7 @@ def bin_marker_positivity(
         mask = (bin_ids == b)
         if np.any(mask):
             counts_total[b] = mask.sum()
-            counts_pos[:, b] = markers[mask].astype(bool).sum(axis=0)
+            counts_pos[:, b] = markers[mask].sum(axis=0)
 
     return counts_pos, counts_total
 
@@ -48,7 +48,7 @@ def get_marker_counts_per_patch(G, patch):
     number of cells in the patch. Marker positivity is read from the binary
     node attribute ``markers_bin`` stored in the graph.
     """
-    markers_bin = graph_get(G, "markers_bin")
+    markers_bin = graph_get(G, "markers_bin") > 0
     idx = np.fromiter(patch, dtype=np.int64)
     num_pos_cells = np.sum(markers_bin[idx, :], axis=0).astype(np.int64)
     num_cells = len(idx)
@@ -65,7 +65,7 @@ def assign_coexpression_category(G, patch, i_LGR5, i_Sero, i_Lyso, pos_threshold
     exclusive co-expression categories (0–7). Categories 0–3 correspond to
     LGR5-positive patches, while 4–7 correspond to LGR5-negative patches.
     """
-    markers_bin = graph_get(G, "markers_bin")
+    markers_bin = graph_get(G, "markers_bin") > 0
     idx = np.fromiter(patch, dtype=np.int64)
     bin_markers_patch = markers_bin[idx, :]
 

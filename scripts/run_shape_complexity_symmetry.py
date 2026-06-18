@@ -44,7 +44,7 @@ from organograph.mesh.complexity import (
 )
 from organograph.mesh.symmetry import score_all_symmetry_candidates_at_level
 
-from organograph.io_utils.blacklist import load_blacklist
+from organograph.io_utils.blacklist import default_discard_labels_path, load_blacklist, load_optional_blacklist
 from organograph.io_utils.cells_table import prepare_cells_table
 from organograph.io_utils.dataset_config import load_mesh_dataset_config
 from organograph.io_utils.path_parsing import discover_mesh_paths, parse_mesh_path
@@ -62,10 +62,11 @@ PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 MESH_DATA_DIR = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "fractal_output")
 CELLS_CSV = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_features_class.csv") # cell_types_class # cell_features_class
 MESH_CONFIG_PATH = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "mesh_config.json")
+DATASET_ROOT = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET)
 
 OUT_DIR = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "shape_complexity_symmetry")
 
-BLACKLIST_PATH = None # os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "blacklist_labels.csv")
+BLACKLIST_PATH = default_discard_labels_path(DATASET_ROOT)
 WHITELIST_PATH = None  # e.g. os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "day3p5_goodmeshes.csv")
 
 # Optional override. If None, use all timepoints from mesh_config.json.
@@ -175,7 +176,7 @@ def main():
     cells_df = pd.read_csv(CELLS_CSV)
     cells_df = prepare_cells_table(cells_df, label_col="label_uid")
 
-    blacklist = load_blacklist(BLACKLIST_PATH) if BLACKLIST_PATH else set()
+    blacklist = load_optional_blacklist(BLACKLIST_PATH, label="blacklist", verbose=VERBOSE)
     whitelist = load_blacklist(WHITELIST_PATH) if WHITELIST_PATH else None
 
     timepoints = list(TIMEPOINTS) if TIMEPOINTS is not None else list(ZARR_NAME_BY_TP.keys())

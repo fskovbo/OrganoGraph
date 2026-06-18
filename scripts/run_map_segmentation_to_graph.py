@@ -45,13 +45,14 @@ from organograph.io_utils.cells_table import (
     suppress_marker_if_coexpressed,
 )
 from organograph.io_utils.dataset_config import load_mesh_dataset_config, load_cell_table_config
+from organograph.io_utils.run_metadata import write_run_settings
 from organograph.graph.build import build_organoid_graph, assign_mesh_patches_to_graph
 from organograph.io_utils.segmentation_io import load_mesh_crypt_segmentation
 from organograph.graph.io import load_cell_graph, save_cell_graph
 from organograph.graph.access import graph_get
 from organograph.graph.marker_postprocess import (
     ablate_lysozyme_not_agr2_in_clusters,
-    copy_graph_markers_bin,
+    copy_graph_marker_fields,
     suppress_graph_marker_if_coexpressed,
 )
 
@@ -134,7 +135,7 @@ COEXP_MARKERS = tuple(marker_config_name_to_alias(m) for m in cell_cfg["coexp_ma
 
 # Graph-level marker postprocessing for graphs built on the fly. Existing graphs
 # loaded from GRAPHS_DIR are assumed to have been created by run_graph_preprocess.py.
-STORE_RAW_GRAPH_MARKERS = True  # Preserve original per-node marker calls in markers_bin_raw.
+STORE_RAW_GRAPH_MARKERS = True  # Preserve original per-node markers in markers_int_raw and markers_bin_raw.
 ENABLE_LYSOZYME_AGR2_ABLATION = True  # Remove Lysozyme from clustered Lysozyme+ cells unless they are Agr2+.
 LYSOZYME_MARKER = marker_config_name_to_alias("Lysozyme")
 AGR2_MARKER = marker_config_name_to_alias("Agr2")
@@ -156,8 +157,8 @@ def graph_marker_postprocess(G):
     steps = []
 
     if STORE_RAW_GRAPH_MARKERS:
-        copy_graph_markers_bin(G)
-        steps.append("copy_markers_bin_raw")
+        copy_graph_marker_fields(G)
+        steps.append("copy_marker_fields_raw")
 
     if ENABLE_LYSOZYME_AGR2_ABLATION:
         ablate_lysozyme_not_agr2_in_clusters(
@@ -180,6 +181,17 @@ def graph_marker_postprocess(G):
 
     G.graph["marker_postprocess_steps"] = steps
     return G
+
+
+def enabled_marker_postprocessing_functions():
+    steps = []
+    if STORE_RAW_GRAPH_MARKERS:
+        steps.append("copy_marker_fields_raw")
+    if ENABLE_LYSOZYME_AGR2_ABLATION:
+        steps.append("ablate_lysozyme_not_agr2_in_clusters")
+    if ENABLE_GRAPH_COEXPRESSION_SUPPRESSION:
+        steps.append("suppress_marker_if_coexpressed")
+    return steps
 
 
 def patches_to_ll(patches):
@@ -393,6 +405,16 @@ def project_mesh_field_to_graph(G, field_mesh, *, proj_field="proj_vertex"):
 
 def main():
     t_start = time.perf_counter()
+    stats = {
+        "segmentations_found": 0,
+        "projected_saved": 0,
+        "graphs_built_on_the_fly": 0,
+        "graphs_loaded": 0,
+        "skipped_existing": 0,
+        "skipped_missing_graph": 0,
+        "failed": 0,
+        "dry_run": bool(DRY_RUN),
+    }
 
     if not os.path.exists(CELLS_CSV):
         raise FileNotFoundError(f"CELLS_CSV not found: {CELLS_CSV}")
@@ -408,6 +430,7 @@ def main():
         marker_cols=MARKER_COLS,
         marker_alias=MARKER_ALIAS,
         marker_postprocess_fn=marker_postprocess,
+        return_marker_intensity=True,
     )
 
     # discover segmentation files
@@ -420,6 +443,7 @@ def main():
 
     if VERBOSE:
         print(f"[graph-proj] found {len(seg_paths)} mesh segmentations")
+    stats["segmentations_found"] = int(len(seg_paths))
 
     n_done = 0
 
@@ -429,6 +453,7 @@ def main():
         except Exception as e:
             if VERBOSE:
                 print(f"[skip] failed loading segmentation {seg_path}: {e}")
+            stats["failed"] += 1
             continue
 
         tp = seg["timepoint"]
@@ -448,6 +473,7 @@ def main():
         if (not OVERWRITE) and os.path.exists(out_path):
             if VERBOSE:
                 print(f"[skip] exists: {out_path}")
+            stats["skipped_existing"] += 1
             continue
 
         gpath = graph_path_for(tp, label_uid)
@@ -468,6 +494,7 @@ def main():
         if os.path.exists(gpath):
             try:
                 G = load_cell_graph(gpath)
+                stats["graphs_loaded"] += 1
                 if VERBOSE:
                     print(f"[graph-proj] loaded existing graph for {tp}/{label_uid}")
             except Exception as e:
@@ -478,11 +505,13 @@ def main():
         if G is None and BUILD_GRAPHS_IF_MISSING:
             try:
                 G = build_graph_for_organoid(mesh_path, label_uid, extractor)
+                stats["graphs_built_on_the_fly"] += 1
                 if VERBOSE:
                     print(f"[graph-proj] built graph on the fly for {tp}/{label_uid}")
             except Exception as e:
                 if VERBOSE:
                     print(f"[{tp}] graph build failed for {label_uid}: {e}")
+                stats["failed"] += 1
                 continue
 
             if SAVE_BUILT_GRAPHS:
@@ -497,6 +526,7 @@ def main():
         if G is None:
             if VERBOSE:
                 print(f"[skip] Graph missing for {tp}/{label_uid}")
+            stats["skipped_missing_graph"] += 1
             continue
 
         # project mesh patches -> graph patches (actual node ids)
@@ -511,6 +541,7 @@ def main():
         except Exception as e:
             if VERBOSE:
                 print(f"[{tp}] graph projection failed for {label_uid}: {e}")
+            stats["failed"] += 1
             continue
 
         # optional filter by number of cells
@@ -576,14 +607,55 @@ def main():
 
         if VERBOSE:
             print(f"[graph-proj] saved {tp}/{label_uid} -> {out_path} (n_crypts={len(graph_patches)})")
+        stats["projected_saved"] += 1
 
         n_done += 1
         if MAX_ORGANOIDS is not None and n_done >= int(MAX_ORGANOIDS):
             break
 
     elapsed_s = time.perf_counter() - t_start
+    write_map_run_settings(elapsed_s=elapsed_s, stats=stats)
     if VERBOSE:
         print(f"[graph-proj] done. processed={n_done} DRY_RUN={DRY_RUN} elapsed={elapsed_s:.2f}s ({elapsed_s/60.0:.2f} min)")
+
+
+def write_map_run_settings(*, elapsed_s, stats):
+    write_run_settings(
+        GRAPH_SEG_DIR,
+        script_name=os.path.basename(__file__),
+        payload={
+            "dataset": DATASET,
+            "timepoints": TIMEPOINTS,
+            "paths": {
+                "seg_mesh_dir": SEG_MESH_DIR,
+                "cells_csv": CELLS_CSV,
+                "graphs_dir": GRAPHS_DIR,
+                "graph_seg_dir": GRAPH_SEG_DIR,
+                "mesh_config_path": MESH_CONFIG_PATH,
+                "cell_config_path": CELL_CONFIG_PATH,
+            },
+            "parameters": {
+                "overwrite": OVERWRITE,
+                "dry_run": DRY_RUN,
+                "max_organoids": MAX_ORGANOIDS,
+                "min_cells_per_crypt": MIN_CELLS_PER_CRYPT,
+                "save_crypt_index_vector": SAVE_CRYPT_INDEX_VECTOR,
+                "build_graphs_if_missing": BUILD_GRAPHS_IF_MISSING,
+                "save_built_graphs": SAVE_BUILT_GRAPHS,
+            },
+            "marker_fields": ["markers_int", "markers_bin"],
+            "marker_positive_rule": "markers_bin = markers_int > 0",
+            "postprocessing_functions": {
+                "enabled": enabled_marker_postprocessing_functions(),
+                "store_raw_graph_markers": STORE_RAW_GRAPH_MARKERS,
+                "enable_lysozyme_agr2_ablation": ENABLE_LYSOZYME_AGR2_ABLATION,
+                "enable_graph_coexpression_suppression": ENABLE_GRAPH_COEXPRESSION_SUPPRESSION,
+            },
+            "stats": stats,
+            "elapsed_s": float(elapsed_s),
+        },
+        verbose=VERBOSE,
+    )
 
 
 

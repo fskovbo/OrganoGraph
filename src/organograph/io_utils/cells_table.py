@@ -12,15 +12,18 @@ def make_nuclei_extractor(
     marker_alias=None,            # optional list[str] returned instead of marker_cols
     marker_binarize_fn=None,      # callable(markers_raw)->markers_bin ; default: >0
     marker_postprocess_fn=None,   # callable(markers_bin, marker_names)->markers_bin OR (markers_bin, marker_names)
+    return_marker_intensity=False,
 ):
     """
-    Build a callable extractor(label_uid) -> (nuclei_xyz_raw, markers_bin, marker_names).
+    Build a callable extractor(label_uid) -> marker data for one organoid.
 
     Guarantees
     ----------
     - nuclei_xyz are RAW coordinates from the table
     - fast lookup if cells_df is indexed by label_uid
     - marker extraction customizable
+    - marker intensities are stored as float values when requested
+    - marker binary calls are derived from intensity > 0 by default
     - marker_alias allows returning semantic names instead of dataframe column names
     - marker_postprocess_fn may optionally update both the marker matrix and marker names
 
@@ -28,6 +31,9 @@ def make_nuclei_extractor(
     -------
     extract : callable
         Function extract(label_uid) -> (nuclei_xyz, markers_bin, marker_names)
+        by default, or
+        extract(label_uid) -> (nuclei_xyz, markers_int, markers_bin, marker_names)
+        when return_marker_intensity=True.
     """
     if marker_cols is None:
         marker_cols = []
@@ -77,11 +83,13 @@ def make_nuclei_extractor(
         if marker_cols:
             marker_names = list(marker_alias)
 
-            # raw marker values from table
-            markers_raw = df_org.loc[:, marker_cols].to_numpy(copy=False)
+            # Raw marker values from table. Missing/non-finite values are treated
+            # as background so that positivity remains a strict > 0 test.
+            markers_int = df_org.loc[:, marker_cols].to_numpy(dtype=float, copy=True)
+            markers_int = np.nan_to_num(markers_int, nan=0.0, posinf=0.0, neginf=0.0)
 
             # binarize
-            markers_bin = np.asarray(marker_binarize_fn(markers_raw), dtype=np.int8)
+            markers_bin = np.asarray(marker_binarize_fn(markers_int), dtype=np.int8)
 
             if markers_bin.ndim != 2:
                 raise ValueError(
@@ -135,9 +143,14 @@ def make_nuclei_extractor(
                     )
 
         else:
+            markers_int = np.zeros((nuclei_xyz.shape[0], 0), dtype=float)
             markers_bin = np.zeros((nuclei_xyz.shape[0], 0), dtype=np.int8)
             marker_names = []
 
+        if return_marker_intensity:
+            markers_int = np.asarray(markers_int, dtype=float).copy()
+            markers_int[np.asarray(markers_bin) <= 0] = 0.0
+            return nuclei_xyz, markers_int, markers_bin, marker_names
         return nuclei_xyz, markers_bin, marker_names
 
     return extract

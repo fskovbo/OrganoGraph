@@ -85,13 +85,13 @@ from organograph.crypts.filters import filter_crypts_by_hks_percent, filter_cryp
 # CONFIG: paths + dataset layout (EDIT THESE)
 # =============================================================================
 
-DATASET         = "20250929" # 20250929 20251201
+DATASET         = "20251201" # 20250929 20251201
 
 _SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT    = os.path.dirname(_SCRIPT_DIR)
 
 MESH_DATA_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "fractal_output")
-SEG_DIR         = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_mesh_day3")
+SEG_DIR         = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_mesh")
 VOCAB_PATH      = os.path.join(PROJECT_ROOT, "sim", "vocab_with_meta.npz")
 MESH_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "mesh_config.json")
 DATASET_ROOT    = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET)
@@ -101,7 +101,7 @@ WHITELIST_PATH  = None # os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET,
 
 
 # Optional override. If None, use all timepoints from mesh_config.json
-TIMEPOINTS      = ['day3']   
+TIMEPOINTS      = ['day4p5']   
 
 
 OVERWRITE = True
@@ -134,7 +134,7 @@ GEODESIC_KWARGS = None  # or dict(...)
 FILTERS = [
     lambda patches, **kw: filter_crypts_by_hks_percent(
         patches,
-        min_percent_greater=4.0, # 1.5, 3.0
+        min_percent_greater=2.0, #4.0, # 1.5, 3.0
         t_max=10,
         **kw
     ),
@@ -166,13 +166,13 @@ SEGMENT_KWARGS = dict(
     threshold=0.5,
 
     # --- refinement ---
-    refine_crypts=False, # True
+    refine_crypts=True, #False, # True
     refine_threshold=0.0,
     refine_only_if_area_at_least=5.0,
     min_refined_frac_of_parent=0.05,
 
     # --- neck extension ---
-    extend_max=1.5, # 2.0
+    extend_max=2.0, #1.5, # 2.0
     disc_resolution=150,
     remove_nested_features=True,
 )

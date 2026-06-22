@@ -71,10 +71,10 @@ def ablate_lysozyme_not_agr2_in_clusters(
     intensity_field="markers_int",
 ):
     """
-    Remove Lysozyme signal from Lysozyme+ graph components unless cells are also Agr2+.
+    Remove marker signal from marker+ graph components unless cells are also Agr2+.
 
-    A Lysozyme cluster is a connected component of the subgraph induced by Lysozyme+
-    cells. Within each cluster with size >= min_cluster_size, Lysozyme is retained
+    A marker cluster is a connected component of the subgraph induced by marker+
+    cells. Within each cluster with size >= min_cluster_size, the marker is retained
     only on cells that are also Agr2+.
     """
     markers_bin = (np.asarray(graph_get(G, marker_field)) > 0).astype(np.int8)
@@ -104,13 +104,17 @@ def ablate_lysozyme_not_agr2_in_clusters(
     set_graph_markers_bin(G, markers_bin, marker_field=marker_field)
     if markers_int is not None:
         set_graph_markers_int(G, markers_int, marker_field=intensity_field)
-    G.graph["lysozyme_agr2_ablation"] = {
-        "lysozyme_marker": str(lysozyme_marker),
+    safe_marker = str(lysozyme_marker).strip().lower().replace(" ", "_")
+    metadata_key = f"{safe_marker}_agr2_ablation"
+    G.graph[metadata_key] = {
+        "target_marker": str(lysozyme_marker),
         "agr2_marker": str(agr2_marker),
         "min_cluster_size": int(min_cluster_size),
         "processed_clusters": int(processed_clusters),
-        "removed_lysozyme_cells": int(removed),
+        "removed_marker_positive_cells": int(removed),
     }
+    if str(lysozyme_marker).strip().lower() == "lysozyme":
+        G.graph["lysozyme_agr2_ablation"] = G.graph[metadata_key]
     return G
 
 

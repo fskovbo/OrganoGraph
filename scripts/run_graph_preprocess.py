@@ -72,7 +72,7 @@ BLACKLIST_PATH  = default_discard_labels_path(DATASET_ROOT)
 
 
 # Optional override. 
-timepoints = ['day4p5', 'day4p5-more']   
+timepoints = None  
 
 
 MAX_PROJ_DIST = 2.0  # max accepted distance between nuclei and membrane for projection. If None, use all distances
@@ -115,6 +115,14 @@ def marker_config_name_to_alias(name):
     )
 
 
+def optional_marker_config_name_to_alias(name):
+    """Resolve a marker name if present in this dataset marker panel."""
+    try:
+        return marker_config_name_to_alias(name)
+    except ValueError:
+        return None
+
+
 LGR5_MARKER = marker_config_name_to_alias(cell_cfg["lgr5_marker"])
 COEXP_MARKERS = tuple(marker_config_name_to_alias(m) for m in cell_cfg["coexp_markers"])
 
@@ -125,6 +133,9 @@ ENABLE_LYSOZYME_AGR2_ABLATION = True  # Remove Lysozyme from clustered Lysozyme+
 LYSOZYME_MARKER = marker_config_name_to_alias("Lysozyme")
 AGR2_MARKER = marker_config_name_to_alias("Agr2")
 LYSOZYME_ABLATION_MIN_CLUSTER_SIZE = 2  # Only process connected Lysozyme+ components with at least this many cells.
+ENABLE_MUCIN2_AGR2_ABLATION = True  # Remove Mucin 2 from clustered Mucin 2+ cells unless they are Agr2+.
+MUCIN2_MARKER = optional_marker_config_name_to_alias("Mucin 2")
+MUCIN2_ABLATION_MIN_CLUSTER_SIZE = 2  # Only process connected Mucin 2+ components with at least this many cells.
 ENABLE_GRAPH_COEXPRESSION_SUPPRESSION = True  # Apply the LGR5-vs-forbidden-marker rule after cluster cleanup.
 
 
@@ -180,6 +191,15 @@ def graph_marker_postprocess(G):
         )
         steps.append("ablate_lysozyme_not_agr2_in_clusters")
 
+    if ENABLE_MUCIN2_AGR2_ABLATION and MUCIN2_MARKER is not None:
+        ablate_lysozyme_not_agr2_in_clusters(
+            G,
+            lysozyme_marker=MUCIN2_MARKER,
+            agr2_marker=AGR2_MARKER,
+            min_cluster_size=MUCIN2_ABLATION_MIN_CLUSTER_SIZE,
+        )
+        steps.append("ablate_mucin2_not_agr2_in_clusters")
+
     if ENABLE_GRAPH_COEXPRESSION_SUPPRESSION:
         suppress_graph_marker_if_coexpressed(
             G,
@@ -200,6 +220,8 @@ def enabled_marker_postprocessing_functions():
         steps.append("copy_marker_fields_raw")
     if ENABLE_LYSOZYME_AGR2_ABLATION:
         steps.append("ablate_lysozyme_not_agr2_in_clusters")
+    if ENABLE_MUCIN2_AGR2_ABLATION and MUCIN2_MARKER is not None:
+        steps.append("ablate_mucin2_not_agr2_in_clusters")
     if ENABLE_GRAPH_COEXPRESSION_SUPPRESSION:
         steps.append("suppress_marker_if_coexpressed")
     return steps
@@ -465,6 +487,8 @@ def write_graph_run_settings(*, elapsed_s, stats):
                 "enabled": enabled_marker_postprocessing_functions(),
                 "store_raw_graph_markers": STORE_RAW_GRAPH_MARKERS,
                 "enable_lysozyme_agr2_ablation": ENABLE_LYSOZYME_AGR2_ABLATION,
+                "enable_mucin2_agr2_ablation": ENABLE_MUCIN2_AGR2_ABLATION,
+                "mucin2_marker": MUCIN2_MARKER,
                 "enable_graph_coexpression_suppression": ENABLE_GRAPH_COEXPRESSION_SUPPRESSION,
             },
             "outputs": {

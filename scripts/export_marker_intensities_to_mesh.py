@@ -24,6 +24,7 @@ The VTP contains the original mesh geometry plus point-data fields:
 Summary files:
 
     {OUT_DIR}/marker_occurrence.csv
+    {OUT_DIR}/cell_features_class_with_projection.csv
     {OUT_DIR}/marker_names.csv
     {OUT_DIR}/marker_names.json
     {OUT_DIR}/README.md
@@ -49,6 +50,8 @@ from vtk.util.numpy_support import numpy_to_vtk, numpy_to_vtkIdTypeArray
 from organograph.graph.access import graph_get
 from organograph.graph.io import load_cell_graph
 from organograph.mesh.OrganoidMesh import OrganoidMesh
+from organograph.io_utils.cells_table import prepare_cells_table
+from organograph.io_utils.dataset_config import load_cell_table_config
 from organograph.io_utils.run_metadata import write_run_settings
 
 
@@ -64,6 +67,8 @@ DATASET_ROOT = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET)
 
 GRAPHS_DIR = os.path.join(DATASET_ROOT, "graphs_preprocessed")
 OUT_DIR = os.path.join(DATASET_ROOT, "marker_intensities_mesh")
+CELLS_CSV = os.path.join(DATASET_ROOT, "feature_tables", "cell_features_class.csv")
+CELL_CONFIG_PATH = os.path.join(DATASET_ROOT, "cell_table_config.json")
 
 # If None, use all timepoint directories found in GRAPHS_DIR.
 TIMEPOINTS = None
@@ -77,6 +82,9 @@ MAX_ORGANOIDS = None
 MARKER_FIELD_SUFFIX = "_intensity"
 OWNER_FIELD_NAME = "cell_owner_table_index"
 UNASSIGNED_OWNER = -1
+PROJECTED_COL = "projected_to_mesh"
+PROJECTED_VERTEX_COL = "proj_vertex"
+ENRICHED_CELL_TABLE_NAME = "cell_features_class_with_projection.csv"
 
 
 # =============================================================================
@@ -215,6 +223,80 @@ def project_markers_to_vertices(owner_node, markers_int):
     return out
 
 
+def filtered_marker_col(marker_col: str) -> str:
+    marker_col = str(marker_col)
+    suffix = "percentile99_class"
+    if marker_col.endswith(suffix):
+        return f"{marker_col}_filtered"
+    return f"{marker_col}_filtered"
+
+
+def build_cell_projection_updates(G, markers_int, marker_cols: list[str]) -> dict[tuple[str, int], dict]:
+    updates = {}
+    label_uid = str(G.graph.get("label_uid", ""))
+    markers_int = np.asarray(markers_int, dtype=float)
+    proj_vertices = graph_get(G, "proj_vertex", dtype=np.int64)
+
+    for pos, node in enumerate(range(G.number_of_nodes())):
+        node_data = G.nodes[node]
+        cell_index = int(node_data.get("cell_index", node))
+        update = {
+            PROJECTED_COL: True,
+            PROJECTED_VERTEX_COL: int(proj_vertices[pos]),
+        }
+        for j, marker_col in enumerate(marker_cols):
+            update[filtered_marker_col(marker_col)] = float(markers_int[pos, j])
+        updates[(label_uid, cell_index)] = update
+    return updates
+
+
+def write_enriched_cell_table(
+    *,
+    path: str,
+    source_csv: str,
+    updates: dict[tuple[str, int], dict],
+    marker_cols: list[str],
+    label_col: str = "label_uid",
+) -> int:
+    if not os.path.exists(source_csv):
+        raise FileNotFoundError(f"Cell feature table not found: {source_csv}")
+
+    df = pd.read_csv(source_csv)
+    if label_col not in df.columns:
+        raise KeyError(f"Cell feature table missing required column '{label_col}': {source_csv}")
+
+    df = df.copy()
+    df["_original_row_index"] = np.arange(len(df), dtype=np.int64)
+    df_prepared = prepare_cells_table(df, label_col=label_col)
+    df_prepared = df_prepared.copy()
+    df_prepared["_organoid_cell_index"] = df_prepared.groupby(level=0).cumcount()
+    cell_index_by_original_row = df_prepared.set_index("_original_row_index")["_organoid_cell_index"]
+    df["_organoid_cell_index"] = df["_original_row_index"].map(cell_index_by_original_row).astype(int)
+
+    filtered_cols = [filtered_marker_col(c) for c in marker_cols]
+    df[PROJECTED_COL] = False
+    df[PROJECTED_VERTEX_COL] = np.int64(UNASSIGNED_OWNER)
+    for col in filtered_cols:
+        df[col] = np.nan
+
+    for row_idx, label_uid, cell_index in zip(
+        df.index,
+        df[label_col].astype(str),
+        df["_organoid_cell_index"].astype(int),
+    ):
+        update = updates.get((label_uid, int(cell_index)))
+        if update is None:
+            continue
+        for col, value in update.items():
+            df.at[row_idx, col] = value
+
+    n_projected = int(df[PROJECTED_COL].sum())
+    df = df.drop(columns=["_organoid_cell_index", "_original_row_index"])
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df.to_csv(path, index=False)
+    return n_projected
+
+
 def write_marker_name_files(out_dir: str, marker_names: list[str], vtp_fields: list[str]) -> None:
     os.makedirs(out_dir, exist_ok=True)
     rows = [
@@ -261,6 +343,7 @@ This folder contains processed cell marker intensities projected onto the origin
 
 - `vtp/<timepoint>/<label_uid>.vtp`: one VTP mesh per organoid.
 - `marker_occurrence.csv`: one row per organoid with counts of marker-positive cells.
+- `{ENRICHED_CELL_TABLE_NAME}`: copy of the source cell feature table with projection and processed-marker columns appended.
 - `marker_names.csv`: marker order and the matching VTP point-data field names.
 - `marker_names.json`: JSON version of `marker_names.csv`.
 - `export_status.csv`: export status for each attempted organoid.
@@ -292,6 +375,16 @@ The marker intensity fields are ordered as follows:
 
 Marker positivity is defined by processed graph `markers_bin`, where a cell is positive if its processed marker intensity is greater than zero after graph-level postprocessing.
 
+## Enriched Cell Feature Table
+
+`{ENRICHED_CELL_TABLE_NAME}` is a copy of the source cell feature table with extra columns appended:
+
+- `{PROJECTED_COL}`: `True` when the cell was retained in the processed graph and projected to the mesh, otherwise `False`.
+- `{PROJECTED_VERTEX_COL}`: mesh vertex id that the cell/nucleus was projected to, or `-1` when not projected.
+- `<marker-prefix>.percentile99_class_filtered`: processed marker intensity after graph preprocessing and filtering. These columns use the same marker column prefixes as `cell_table_config.json`.
+
+Rows for cells that were filtered out during projection/graph construction keep `{PROJECTED_COL}=False`, `{PROJECTED_VERTEX_COL}=-1`, and filtered marker intensity columns as missing values.
+
 ## Notes
 
 The VTP fields contain processed marker intensities, not raw unfiltered table values. Graph-level postprocessing may set selected marker intensities to zero, for example when coexpression suppression is enabled in `run_graph_preprocess.py`.
@@ -300,7 +393,12 @@ The VTP fields contain processed marker intensities, not raw unfiltered table va
         f.write(text)
 
 
-def process_one(row: dict, expected_marker_names: list[str] | None):
+def process_one(
+    row: dict,
+    expected_marker_names: list[str] | None,
+    marker_cols: list[str],
+    config_marker_names: list[str],
+):
     label_uid = str(row["label_uid"])
     tp = str(row["timepoint"])
     graph_path = str(row["graph_path"])
@@ -332,6 +430,15 @@ def process_one(row: dict, expected_marker_names: list[str] | None):
         raise ValueError(
             f"Marker matrix has {markers_int.shape[1]} columns but marker_names has {len(marker_names)}"
         )
+    if len(marker_cols) != len(marker_names):
+        raise ValueError(
+            f"cell_table_config marker_cols has {len(marker_cols)} entries but graph marker_names has {len(marker_names)}"
+        )
+    if [str(x) for x in config_marker_names] != marker_names:
+        raise ValueError(
+            f"cell_table_config marker_names order does not match graph marker_names for {label_uid}. "
+            f"Config={config_marker_names}; graph={marker_names}"
+        )
 
     mesh = OrganoidMesh(mesh_path)
     side = np.load(vertex_owner_path, allow_pickle=True)
@@ -355,16 +462,6 @@ def process_one(row: dict, expected_marker_names: list[str] | None):
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"{label_uid}.vtp")
 
-    if (not OVERWRITE) and os.path.exists(out_path):
-        return marker_names, vtp_fields, None, {
-            "label_uid": label_uid,
-            "timepoint": tp,
-            "status": "skipped_existing",
-        }
-
-    if not DRY_RUN:
-        write_mesh_vtp(Path(out_path), mesh.v, mesh.f, point_fields)
-
     counts = markers_bin.sum(axis=0).astype(int)
     occurrence = {
         "dataset": DATASET,
@@ -381,18 +478,32 @@ def process_one(row: dict, expected_marker_names: list[str] | None):
     for marker, count in zip(marker_names, counts):
         occurrence[f"{marker}_n_pos"] = int(count)
 
-    return marker_names, vtp_fields, occurrence, {
+    cell_updates = build_cell_projection_updates(G, markers_int, marker_cols)
+
+    vtp_status = "exported"
+    if (not OVERWRITE) and os.path.exists(out_path):
+        vtp_status = "skipped_existing"
+    elif DRY_RUN:
+        vtp_status = "dry_run"
+    else:
+        write_mesh_vtp(Path(out_path), mesh.v, mesh.f, point_fields)
+
+    return marker_names, vtp_fields, occurrence, cell_updates, {
         "label_uid": label_uid,
         "timepoint": tp,
-        "status": "exported" if not DRY_RUN else "dry_run",
+        "status": vtp_status,
     }
 
 
 def main():
     t_start = time.perf_counter()
     os.makedirs(OUT_DIR, exist_ok=True)
+    cell_cfg = load_cell_table_config(CELL_CONFIG_PATH)
+    marker_cols = list(cell_cfg["marker_cols"])
+    config_marker_names = list(cell_cfg.get("marker_names", marker_cols))
 
     occurrence_rows = []
+    cell_projection_updates = {}
     status_rows = []
     marker_names_ref = None
     vtp_fields_ref = None
@@ -410,13 +521,20 @@ def main():
             break
 
         try:
-            marker_names, vtp_fields, occurrence, status = process_one(row, marker_names_ref)
+            marker_names, vtp_fields, occurrence, cell_updates, status = process_one(
+                row,
+                marker_names_ref,
+                marker_cols,
+                config_marker_names,
+            )
             if marker_names_ref is None:
                 marker_names_ref = marker_names
                 vtp_fields_ref = vtp_fields
             status_rows.append(status)
-            if occurrence is not None:
-                occurrence_rows.append(occurrence)
+            occurrence_rows.append(occurrence)
+            cell_projection_updates.update(cell_updates)
+
+            if status["status"] in ("exported", "dry_run"):
                 stats["exported"] += 1
                 if VERBOSE:
                     print(f"[ok] {status['timepoint']}/{status['label_uid']}")
@@ -443,7 +561,16 @@ def main():
     write_marker_name_files(OUT_DIR, marker_names_ref, vtp_fields_ref)
     write_readme(OUT_DIR, marker_names_ref, vtp_fields_ref)
     write_occurrence_csv(os.path.join(OUT_DIR, "marker_occurrence.csv"), occurrence_rows)
+    n_projected_cells = write_enriched_cell_table(
+        path=os.path.join(OUT_DIR, ENRICHED_CELL_TABLE_NAME),
+        source_csv=CELLS_CSV,
+        updates=cell_projection_updates,
+        marker_cols=marker_cols,
+    )
     write_occurrence_csv(os.path.join(OUT_DIR, "export_status.csv"), status_rows)
+    stats["occurrence_rows_written"] = int(len(occurrence_rows))
+    stats["cell_projection_updates"] = int(len(cell_projection_updates))
+    stats["projected_cells_in_enriched_table"] = int(n_projected_cells)
 
     elapsed_s = time.perf_counter() - t_start
     write_run_settings(
@@ -455,6 +582,8 @@ def main():
             "paths": {
                 "graphs_dir": GRAPHS_DIR,
                 "out_dir": OUT_DIR,
+                "cells_csv": CELLS_CSV,
+                "cell_config_path": CELL_CONFIG_PATH,
             },
             "parameters": {
                 "overwrite": OVERWRITE,

@@ -54,7 +54,7 @@ from organograph.skeleton import (
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 
-DATASET = "20251201"
+DATASET = "20250929" # "20251201"
 DATA_ROOT = (PROJECT_ROOT.parent / "NicoleData").resolve()
 DATASET_ROOT = DATA_ROOT / DATASET
 MESH_DATA_DIR = DATASET_ROOT / "fractal_output"
@@ -65,7 +65,7 @@ BLACKLIST_PATH = default_discard_labels_path(str(DATASET_ROOT))
 WHITELIST_PATH = None
 
 # Set to None to process all configured timepoints.
-TIMEPOINTS = ["day4p5"]
+TIMEPOINTS = ["day3p5", "day4", "day4p5", "day4p5-more"]
 
 OVERWRITE = False
 VERBOSE = True
@@ -73,25 +73,53 @@ DRY_RUN = False
 STRICT = False
 MAX_MESHES = None
 
+NORMALIZE_MESH = True
+NORMALIZE_SCALE = 10.0
+EIGEN_K = 225
+SMOOTH_MESH = True
+SMOOTH_LMAX = 12
+SMOOTH_EIGEN_K = None
 
-FILTERS = [
-    lambda patches, **kw: filter_crypts_by_hks_percent(
-        patches,
-        min_percent_greater=2.0,
-        t_max=10,
-        **kw,
-    ),
-    lambda patches, **kw: filter_crypts_by_size(
-        patches,
-        min_patch_verts=25,
-        min_patch_area=5,
-        **kw,
-    ),
-]
+FILTER_KWARGS = {
+    "use_hks_filter": True,
+    "min_percent_greater": 2.0,
+    "hks_t_min": None,
+    "hks_t_max": 10.0,
+    "use_size_filter": True,
+    "min_patch_verts": 25,
+    "min_patch_area": 5.0,
+}
+
 FILTER_NAMES = [
     "filter_crypts_by_hks_percent",
     "filter_crypts_by_size",
 ]
+
+def make_filter_list(**kw):
+    filters = []
+    if kw.get("use_hks_filter", True):
+        filters.append(
+            lambda patches, **inner: filter_crypts_by_hks_percent(
+                patches,
+                min_percent_greater=kw["min_percent_greater"],
+                t_min=kw.get("hks_t_min"),
+                t_max=kw.get("hks_t_max"),
+                **inner,
+            )
+        )
+    if kw.get("use_size_filter", True):
+        filters.append(
+            lambda patches, **inner: filter_crypts_by_size(
+                patches,
+                min_patch_verts=kw["min_patch_verts"],
+                min_patch_area=kw.get("min_patch_area"),
+                **inner,
+            )
+        )
+    return filters or None
+
+
+FILTERS = make_filter_list(**FILTER_KWARGS)
 
 SKELETONIZATION_CONFIG = SkeletonizationConfig(
     detection_kwargs={
@@ -103,18 +131,80 @@ SKELETONIZATION_CONFIG = SkeletonizationConfig(
         "refine_threshold": 0.0,
         "refine_only_if_area_at_least": 5.0,
         "min_refined_frac_of_parent": 0.05,
+        "geodesic_kwargs": None,
+        "final_tip_hks_time": 1.0,
+        "final_tip_bottom_fraction": 0.6,
+        "final_tip_min_hks_percent_increase": 5.0,
         "extend_max": 2.0,
-        "disc_resolution": 150,
+        "disc_resolution": 200,
+        "neck_search_interval": (0.8, 2.0),
+        "neck_window_length": 9,
+        "neck_polyorder": 3,
+        "neck_min_prominence": 0.05,
+        "neck_min_length": 0.05,
+        "validate_split_stems": True,
+        "validate_branch_geometry": True,
+        "branch_min_confidence": 0.85,
+        "branch_max_neck_to_body_radius_ratio": 0.70,
+        "split_growth_max_size_factor": 3.0,
+        "split_growth_max_mesh_fraction": 0.40,
+        "split_growth_smooth_perimeter": True,
+        "split_growth_smoothing_tolerance": 0.0,
+        "split_growth_min_decrease_fraction": 0.0,
+        "split_growth_min_prominence_fraction": 0.01,
+        "split_growth_robust_window": 1,
+        "refine_broad_crypt_openings": False,
+        "max_opening_to_crypt_body_ratio": 0.65,
+        "branch_max_opening_to_crypt_body_ratio": 0.95,
+        "broad_opening_min_linear_profile_r2": 0.985,
+        "broad_opening_max_linear_profile_deviation": 0.08,
+        "broad_opening_min_attachment_level": 0.35,
+        "refine_body_transition_width_outliers": True,
+        "body_transition_max_crypt_to_host_width_ratio": 0.80,
+        "body_transition_host_width_quantile": 0.75,
+        "body_transition_min_second_derivative_score": 0.60,
+        "body_transition_min_attachment_level": 0.25,
     },
-    build_kwargs={},
+    build_kwargs={
+        "body_center": None,
+        "bend_strategy": "crypt_centroid",
+        "bend_max_dimensionless_curvature": 0.50,
+        "bend_curvature_penalty": 5.0,
+        "refine_body_center_from_necks": True,
+        "refine_branch_centers_from_necks": True,
+    },
 )
 
 PRIMITIVE_FIT_CONFIG = PrimitiveFitConfig(
     component_kwargs={},
-    body_kwargs={"primitive_type": "asymmetric_superellipsoid"},
+    body_branch_neck_kwargs={
+        "radius_quantile": 0.5,
+        "expansion_factor": 1.35,
+        "max_extent_fraction": 0.25,
+        "min_extent_radius_fraction": 0.35,
+    },
+    body_kwargs={
+        "primitive_type": "asymmetric_superellipsoid",
+        "add_attachment_cap_support": True,
+        "cap_support_points_per_attachment": 2 * 64,
+        "cap_support_radius_fraction": 0.5,
+    },
     branch_kwargs={"primitive_type": "asymmetric_superellipsoid"},
-    body_branch_neck_kwargs={},
-    crypt_tube_kwargs={},
+    crypt_tube_kwargs={
+        "smooth_centerline": True,
+        "smooth_bulged_centerlines": False,
+        "centerline_n_bands": 7,
+        "centerline_n_samples": 64,
+        "centerline_constriction_weight": 4.0,
+        "update_crypt_nodes": True,
+        "radius_quantile": 0.5,
+        "optimize_radius_profile": True,
+        "initial_body_position": 0.5,
+        "initial_taper_position": 0.85,
+        "body_position_bounds": (0.2, 0.7),
+        "min_taper_gap": 0.1,
+        "max_taper_position": 0.9,
+    },
 )
 
 
@@ -150,6 +240,58 @@ def resolve_paths(args) -> dict[str, Path | str | None]:
         "blacklist_path": args.blacklist_path,
         "whitelist_path": args.whitelist_path,
     }
+
+
+def _clamped_eigen_k(mesh, requested_k):
+    n_vertices = int(np.asarray(mesh.v).shape[0])
+    return max(2, min(int(requested_k), n_vertices - 2))
+
+
+def _reset_spectral_state(mesh):
+    mesh.laplacian = None
+    mesh.mass_matrix = None
+    mesh.eigvals = None
+    mesh.eigvecs = None
+    mesh.coeffs_v = None
+    mesh.lmax = None
+
+
+def _ensure_mesh_eigendecomposition(mesh, requested_k):
+    k = _clamped_eigen_k(mesh, requested_k)
+    if mesh.eigvals is None or mesh.eigvecs is None or mesh.eigvecs.shape[1] < k:
+        _reset_spectral_state(mesh)
+        mesh._eig_decomp(k=k)
+    return k
+
+
+def _smooth_mesh_low_pass(mesh):
+    lmax = int(SMOOTH_LMAX)
+    if lmax < 1:
+        raise ValueError("SMOOTH_LMAX must be at least 1")
+
+    coeff_k = int(lmax**2)
+    _ensure_mesh_eigendecomposition(mesh, max(EIGEN_K, coeff_k))
+    mesh.compute_spectral_coefficients(lmax=lmax)
+    mesh.v = np.asarray(
+        mesh.reconstruct_from_coeffs(mesh.coeffs_v, lmax=lmax),
+        dtype=float,
+    )
+
+    _reset_spectral_state(mesh)
+    _ensure_mesh_eigendecomposition(mesh, SMOOTH_EIGEN_K or EIGEN_K)
+    return mesh
+
+
+def prepare_mesh_for_skeleton_export(mesh):
+    """Match the mesh preparation cell in notebooks/tutorial_skeleton.ipynb."""
+    if NORMALIZE_MESH:
+        mesh.normalize_inplace(scale=NORMALIZE_SCALE, center="mean")
+
+    if SMOOTH_MESH:
+        _smooth_mesh_low_pass(mesh)
+    else:
+        _ensure_mesh_eigendecomposition(mesh, EIGEN_K)
+    return mesh
 
 
 def output_exists(organoid_dir: Path) -> bool:
@@ -321,9 +463,8 @@ def main(argv: list[str] | None = None) -> int:
                 continue
 
             mesh = OrganoidMesh(str(mesh_path))
-            mesh.normalize_inplace()
             mesh.label_uid = label_uid
-            mesh._eig_decomp()
+            prepare_mesh_for_skeleton_export(mesh)
 
             metadata = {
                 "dataset": args.dataset,
@@ -334,13 +475,25 @@ def main(argv: list[str] | None = None) -> int:
                 "mesh_path": str(mesh_path),
                 "vocab_path": str(paths["vocab_path"]),
             }
+            build_kwargs = dict(SKELETONIZATION_CONFIG.build_kwargs)
+            build_kwargs["metadata"] = {
+                "label_uid": label_uid,
+                "mesh_path": str(mesh_path),
+                "timepoint": timepoint,
+                "well": rec.get("well"),
+                "organoid_id": rec.get("organoid_id"),
+            }
+            skeleton_config = SkeletonizationConfig(
+                detection_kwargs=dict(SKELETONIZATION_CONFIG.detection_kwargs),
+                build_kwargs=build_kwargs,
+            )
             t0 = time.perf_counter()
             skeleton_result = skeletonize_organoid(
                 mesh,
                 vocab,
                 geodesic_fn=compute_geodesics_dijkstra,
-                config=SKELETONIZATION_CONFIG,
-                metadata=metadata,
+                config=skeleton_config,
+                metadata={"record": dict(metadata)},
             )
             primitive_result = fit_primitives_for_skeletonization_result(
                 skeleton_result,
@@ -418,9 +571,18 @@ def main(argv: list[str] | None = None) -> int:
                 "max_meshes": args.max_meshes,
                 "include_intermediates": bool(args.include_intermediates),
                 "include_components": bool(args.include_components),
+                "mesh_preparation": {
+                    "normalize_mesh": NORMALIZE_MESH,
+                    "normalize_scale": NORMALIZE_SCALE,
+                    "eigen_k": EIGEN_K,
+                    "smooth_mesh": SMOOTH_MESH,
+                    "smooth_lmax": SMOOTH_LMAX,
+                    "smooth_eigen_k": SMOOTH_EIGEN_K,
+                },
                 "geodesic_fn": "compute_geodesics_dijkstra",
                 "skeletonization_config": SKELETONIZATION_CONFIG.to_dict(),
                 "primitive_fit_config": PRIMITIVE_FIT_CONFIG.to_dict(),
+                "filter_kwargs": FILTER_KWARGS,
                 "filters": FILTER_NAMES,
             },
             "stats": stats,

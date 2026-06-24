@@ -101,7 +101,9 @@ def graph_summary(graph: SkeletonGraph) -> dict[str, Any]:
     for node in graph.nodes.values():
         node_type_counts[node.node_type] = node_type_counts.get(node.node_type, 0) + 1
     primitive_type_counts: dict[str, int] = {}
-    for attachment in graph.primitive_attachments.values():
+    primitive_attachments = all_primitive_attachment_records(graph)
+    for item in primitive_attachments:
+        attachment = item["attachment"]
         primitive_type_counts[attachment.primitive_type] = (
             primitive_type_counts.get(attachment.primitive_type, 0) + 1
         )
@@ -109,7 +111,14 @@ def graph_summary(graph: SkeletonGraph) -> dict[str, Any]:
         "n_nodes": int(len(graph.nodes)),
         "n_edges": int(len(graph.edges)),
         "n_crypts": int(len(graph.crypt_ids())),
-        "n_primitive_attachments": int(len(graph.primitive_attachments)),
+        "n_primitive_attachments": int(len(primitive_attachments)),
+        "n_graph_primitive_attachments": int(len(graph.primitive_attachments)),
+        "n_node_primitive_attachments": int(
+            sum(node.primitive_attachment is not None for node in graph.nodes.values())
+        ),
+        "n_edge_primitive_attachments": int(
+            sum(edge.primitive_attachment is not None for edge in graph.edges.values())
+        ),
         "node_type_counts": node_type_counts,
         "primitive_type_counts": primitive_type_counts,
     }
@@ -158,17 +167,57 @@ def edge_records(graph: SkeletonGraph) -> list[dict[str, Any]]:
     return rows
 
 
+def all_primitive_attachment_records(graph: SkeletonGraph) -> list[dict[str, Any]]:
+    """Return primitive attachments from nodes, edges, and graph-level paths."""
+    rows = []
+    for node_id, node in graph.nodes.items():
+        if node.primitive_attachment is None:
+            continue
+        rows.append(
+            {
+                "attachment_scope": "node",
+                "owner_id": str(node_id),
+                "attachment_id": node.primitive_attachment.attachment_id or str(node_id),
+                "attachment": node.primitive_attachment,
+            }
+        )
+    for edge_id, edge in graph.edges.items():
+        if edge.primitive_attachment is None:
+            continue
+        rows.append(
+            {
+                "attachment_scope": "edge",
+                "owner_id": str(edge_id),
+                "attachment_id": edge.primitive_attachment.attachment_id or str(edge_id),
+                "attachment": edge.primitive_attachment,
+            }
+        )
+    for attachment_id, attachment in graph.primitive_attachments.items():
+        rows.append(
+            {
+                "attachment_scope": "graph",
+                "owner_id": str(attachment_id),
+                "attachment_id": str(attachment_id),
+                "attachment": attachment,
+            }
+        )
+    return rows
+
+
 def primitive_records(graph: SkeletonGraph) -> list[dict[str, Any]]:
-    """Return graph-level primitive attachment rows.
+    """Return primitive attachment rows from all graph locations.
 
     Individual primitive parameters stay in JSON columns so new primitive
     families do not require schema changes.
     """
     rows = []
-    for attachment_id, attachment in graph.primitive_attachments.items():
+    for item in all_primitive_attachment_records(graph):
+        attachment = item["attachment"]
         rows.append(
             {
-                "attachment_id": str(attachment_id),
+                "attachment_scope": item["attachment_scope"],
+                "owner_id": item["owner_id"],
+                "attachment_id": str(item["attachment_id"]),
                 "attachment_type": "" if attachment.attachment_type is None else str(attachment.attachment_type),
                 "primitive_type": str(attachment.primitive_type),
                 "target_ids_json": _json_string(attachment.target_ids),
@@ -298,7 +347,7 @@ def graph_arrays(graph: SkeletonGraph) -> dict[str, np.ndarray]:
     node_ids = list(graph.nodes)
     node_index = {node_id: i for i, node_id in enumerate(node_ids)}
     edge_ids = list(graph.edges)
-    primitive_ids = list(graph.primitive_attachments)
+    primitive_items = all_primitive_attachment_records(graph)
 
     edge_index = np.full((len(edge_ids), 2), -1, dtype=np.int64)
     for i, edge_id in enumerate(edge_ids):
@@ -306,9 +355,9 @@ def graph_arrays(graph: SkeletonGraph) -> dict[str, np.ndarray]:
         edge_index[i, 0] = node_index.get(edge.source, -1)
         edge_index[i, 1] = node_index.get(edge.target, -1)
 
-    fit_error = np.full(len(primitive_ids), np.nan, dtype=np.float64)
-    for i, attachment_id in enumerate(primitive_ids):
-        error = graph.primitive_attachments[attachment_id].fit_error
+    fit_error = np.full(len(primitive_items), np.nan, dtype=np.float64)
+    for i, item in enumerate(primitive_items):
+        error = item["attachment"].fit_error
         if error is not None:
             fit_error[i] = float(error)
 
@@ -350,50 +399,59 @@ def graph_arrays(graph: SkeletonGraph) -> dict[str, np.ndarray]:
             dtype=str,
         ),
         "edge_index": edge_index,
-        "primitive_attachment_ids": np.asarray(primitive_ids, dtype=str),
+        "primitive_attachment_ids": np.asarray(
+            [str(item["attachment_id"]) for item in primitive_items],
+            dtype=str,
+        ),
+        "primitive_attachment_scopes": np.asarray(
+            [str(item["attachment_scope"]) for item in primitive_items],
+            dtype=str,
+        ),
+        "primitive_owner_ids": np.asarray(
+            [str(item["owner_id"]) for item in primitive_items],
+            dtype=str,
+        ),
         "primitive_types": np.asarray(
             [
-                graph.primitive_attachments[attachment_id].primitive_type
-                for attachment_id in primitive_ids
+                item["attachment"].primitive_type
+                for item in primitive_items
             ],
             dtype=str,
         ),
         "primitive_attachment_types": np.asarray(
             [
                 ""
-                if graph.primitive_attachments[attachment_id].attachment_type is None
-                else str(graph.primitive_attachments[attachment_id].attachment_type)
-                for attachment_id in primitive_ids
+                if item["attachment"].attachment_type is None
+                else str(item["attachment"].attachment_type)
+                for item in primitive_items
             ],
             dtype=str,
         ),
         "primitive_target_ids_json": np.asarray(
             [
-                _json_string(graph.primitive_attachments[attachment_id].target_ids)
-                for attachment_id in primitive_ids
+                _json_string(item["attachment"].target_ids)
+                for item in primitive_items
             ],
             dtype=str,
         ),
         "primitive_parameters_json": np.asarray(
             [
-                _json_string(graph.primitive_attachments[attachment_id].parameters)
-                for attachment_id in primitive_ids
+                _json_string(item["attachment"].parameters)
+                for item in primitive_items
             ],
             dtype=str,
         ),
         "primitive_derived_parameters_json": np.asarray(
             [
-                _json_string(
-                    graph.primitive_attachments[attachment_id].derived_parameters
-                )
-                for attachment_id in primitive_ids
+                _json_string(item["attachment"].derived_parameters)
+                for item in primitive_items
             ],
             dtype=str,
         ),
         "primitive_residuals_json": np.asarray(
             [
-                _json_string(graph.primitive_attachments[attachment_id].residuals)
-                for attachment_id in primitive_ids
+                _json_string(item["attachment"].residuals)
+                for item in primitive_items
             ],
             dtype=str,
         ),
@@ -484,6 +542,9 @@ Each organoid directory contains:
 - `shape_edges.csv`: edge table with `edge_id`, `source`, `target`,
   `edge_type`, `crypt_id`, and JSON metadata columns.
 - `shape_primitives.csv`: one row per graph-level primitive attachment.  The
+  `attachment_scope` column identifies whether the primitive is attached to a
+  node, edge, or graph-level path.  Body and branch blobs are usually node
+  attachments, while crypt tubes are usually graph-level path attachments.  The
   `parameters_json`, `derived_parameters_json`, `residuals_json`, and
   `metadata_json` columns intentionally keep primitive-specific content generic.
 - `shape_arrays.npz`: NumPy arrays for quick loading of node positions, edge

@@ -14,6 +14,11 @@ from organograph.skeleton.detection.mesh_regions import _boundary_edges_for_regi
 from organograph.skeleton.detection.neck_profiles import _add_neck_profile_geometry
 from organograph.skeleton.detection.region_refinement import _refine_body_transition_width_outliers, _refine_broad_transition_opening
 from organograph.skeleton.detection.tips import _select_hks_tips_from_axis
+from organograph.skeleton.barrier_ellipsoid import (
+    fit_soft_barrier_ellipsoid_sampled,
+    protect_patches_from_mask,
+    villus_mask_from_ellipsoid,
+)
 
 def detect_crypts_for_skeleton(
     mesh,
@@ -61,6 +66,12 @@ def detect_crypts_for_skeleton(
     body_transition_host_width_quantile: float = 0.75,
     body_transition_min_second_derivative_score: float = 0.6,
     body_transition_min_attachment_level: float = 0.25,
+    body_barrier_ellipsoid: bool = False,
+    body_barrier_config: dict[str, Any] | None = None,
+    body_barrier_relative_height_threshold: float = 1.05,
+    body_barrier_min_candidate_vertices: int = 4,
+    body_barrier_sample_fraction: float = 1.0,
+    body_barrier_sample_seed: int | None = 0,
     smooth_mesh: bool = False,
     smooth_lmax: int = 5,
     smooth_recompute_eigen: bool = True,
@@ -131,6 +142,54 @@ def detect_crypts_for_skeleton(
         )
         seg_vars["filter_info_initial"] = filter_info
         seg_vars["keep_idx_initial"] = keep_idx
+
+    body_barrier_info = None
+    if body_barrier_ellipsoid:
+        raw_candidate_sizes = [int(len(patch)) for patch in parents]
+        body_barrier_fit = fit_soft_barrier_ellipsoid_sampled(
+            detection_mesh.v,
+            detection_mesh.f,
+            config=body_barrier_config,
+            require_inside_center=True,
+            sample_fraction=body_barrier_sample_fraction,
+            random_seed=body_barrier_sample_seed,
+        )
+        body_barrier_mask = villus_mask_from_ellipsoid(
+            detection_mesh.v,
+            body_barrier_fit,
+            relative_height_threshold=body_barrier_relative_height_threshold,
+        )
+        parents, body_barrier_patch_info = protect_patches_from_mask(
+            parents,
+            body_barrier_mask,
+            min_vertices=body_barrier_min_candidate_vertices,
+        )
+        body_barrier_info = {
+            "enabled": True,
+            "fit": body_barrier_fit,
+            "mask": body_barrier_mask,
+            "relative_height_threshold": float(body_barrier_relative_height_threshold),
+            "min_candidate_vertices": int(body_barrier_min_candidate_vertices),
+            "sample_fraction": float(body_barrier_sample_fraction),
+            "sample_seed": body_barrier_sample_seed,
+            "raw_candidate_sizes": raw_candidate_sizes,
+            "patch_filter_info": body_barrier_patch_info,
+        }
+        seg_vars["body_barrier_ellipsoid"] = body_barrier_info
+
+    if len(parents) == 0:
+        intermediates = {
+            "initial_patches": parents,
+            "refined_by_parent": [],
+            "encoding": enc_vars,
+            "detection_mesh_smoothed": bool(smooth_mesh),
+            **seg_vars,
+        }
+        if body_barrier_info is not None:
+            intermediates["body_barrier_ellipsoid"] = body_barrier_info
+        if return_intermediates:
+            return [], intermediates
+        return []
 
     dnorm_parent, L_parent, bottom_parent = compute_crypt_axis(
         detection_mesh,
@@ -497,4 +556,3 @@ def build_skeleton_from_segmentation_parameters(
         crypt_detections=detections,
         **build_kwargs,
     )
-

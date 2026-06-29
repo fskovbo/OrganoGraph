@@ -32,6 +32,8 @@ from organograph.skeleton import (
     crypt_straight_distance,
     crypt_terminal_paths,
     crypt_tortuosity,
+    fit_soft_barrier_ellipsoid,
+    fit_soft_barrier_ellipsoid_sampled,
     estimate_smooth_crypt_centerline,
     fit_asymmetric_superellipsoid_to_points,
     fit_crypt_tube_to_points,
@@ -40,8 +42,13 @@ from organograph.skeleton import (
     load_skeleton_json,
     number_of_crypts,
     number_of_split_crypts,
+    protect_detection_regions_from_mask,
+    protect_patches_from_mask,
     primitive_components_from_crypt_detections,
+    relative_height_field,
+    sampled_vertex_indices,
     save_skeleton_json,
+    villus_mask_from_ellipsoid,
 )
 from organograph.skeleton.primitive.blobs import blob_surface_radius
 
@@ -1017,6 +1024,147 @@ class SkeletonTests(unittest.TestCase):
             np.sort(axes),
             atol=0.08,
         )
+
+    def test_soft_barrier_ellipsoid_point_cloud_fit_is_sane(self):
+        center = np.array([0.5, -0.25, 0.1])
+        axes = np.array([2.0, 1.0, 0.6])
+        points = make_ellipsoid_points(center, axes, n_u=32, n_v=15)
+
+        fit = fit_soft_barrier_ellipsoid(
+            points,
+            config={
+                "barrier_weight": 20.0,
+                "underfill_weight": 1.0,
+                "center_regularization": 0.01,
+                "maxiter": 300,
+            },
+            require_inside_center=False,
+        )
+        field = relative_height_field(points, fit)
+
+        self.assertEqual(fit.radii.shape, (3,))
+        self.assertTrue(np.all(fit.radii > 0.0))
+        np.testing.assert_allclose(fit.center, center, atol=0.15)
+        np.testing.assert_allclose(
+            np.sort(fit.radii),
+            np.sort(axes),
+            rtol=0.2,
+            atol=0.12,
+        )
+        self.assertAlmostEqual(float(np.median(field["level"])), 1.0, delta=0.08)
+        self.assertGreater(np.count_nonzero(villus_mask_from_ellipsoid(points, fit)), 0)
+
+    def test_soft_barrier_ellipsoid_anisotropy_penalty_reduces_axis_ratio(self):
+        center = np.zeros(3)
+        axes = np.array([3.0, 1.0, 0.7])
+        points = make_ellipsoid_points(center, axes, n_u=36, n_v=16)
+
+        free_fit = fit_soft_barrier_ellipsoid(
+            points,
+            config={
+                "barrier_weight": 20.0,
+                "underfill_weight": 1.0,
+                "center_regularization": 0.01,
+                "maxiter": 300,
+            },
+            require_inside_center=False,
+        )
+        penalized_fit = fit_soft_barrier_ellipsoid(
+            points,
+            config={
+                "barrier_weight": 20.0,
+                "underfill_weight": 1.0,
+                "center_regularization": 0.01,
+                "anisotropy_regularization": 5.0,
+                "maxiter": 300,
+            },
+            require_inside_center=False,
+        )
+
+        free_ratio = float(np.max(free_fit.radii) / np.min(free_fit.radii))
+        penalized_ratio = float(np.max(penalized_fit.radii) / np.min(penalized_fit.radii))
+        self.assertLess(penalized_ratio, free_ratio)
+
+    def test_sampled_soft_barrier_ellipsoid_records_sample_metadata(self):
+        center = np.array([0.2, 0.1, -0.1])
+        axes = np.array([2.0, 1.2, 0.8])
+        points = make_ellipsoid_points(center, axes, n_u=40, n_v=20)
+
+        fit = fit_soft_barrier_ellipsoid_sampled(
+            points,
+            sample_fraction=0.2,
+            random_seed=12,
+            config={
+                "barrier_weight": 20.0,
+                "underfill_weight": 1.0,
+                "center_regularization": 0.01,
+                "maxiter": 300,
+            },
+            require_inside_center=False,
+        )
+
+        self.assertEqual(
+            fit.metadata["sample_n_vertices"],
+            int(np.ceil(0.2 * points.shape[0])),
+        )
+        self.assertEqual(fit.metadata["full_n_vertices"], points.shape[0])
+        np.testing.assert_allclose(fit.center, center, atol=0.25)
+        self.assertTrue(np.all(fit.radii > 0.0))
+
+    def test_sampled_vertex_indices_are_deterministic_and_fractional(self):
+        idx_a = sampled_vertex_indices(100, sample_fraction=0.2, random_seed=5)
+        idx_b = sampled_vertex_indices(100, sample_fraction=0.2, random_seed=5)
+        idx_c = sampled_vertex_indices(100, sample_fraction=0.2, random_seed=6)
+
+        self.assertEqual(idx_a.size, 20)
+        np.testing.assert_array_equal(idx_a, idx_b)
+        self.assertFalse(np.array_equal(idx_a, idx_c))
+
+    def test_protected_mask_filters_detection_regions_recursively(self):
+        detections = [
+            {
+                "crypt_id": "a",
+                "crypt_vertices": [0, 1, 2, 3],
+                "attachment_region_vertices": [1, 2, 3, 4],
+                "neck_side_vertices": [{0, 1}, {2, 3, 4}],
+                "daughters": [
+                    {
+                        "crypt_id": "a.0",
+                        "crypt_vertices": [2, 3, 5],
+                        "neck_region_vertices": [3, 5],
+                        "neck_side_vertices": ({2, 3}, {5}),
+                    }
+                ],
+            }
+        ]
+        protected = np.zeros(8, dtype=bool)
+        protected[[1, 3]] = True
+
+        filtered = protect_detection_regions_from_mask(detections, protected)
+
+        self.assertEqual(filtered[0]["crypt_vertices"], [0, 2])
+        self.assertEqual(filtered[0]["attachment_region_vertices"], [2, 4])
+        self.assertEqual(filtered[0]["neck_side_vertices"], [0, 2, 4])
+        self.assertEqual(filtered[0]["daughters"][0]["crypt_vertices"], [2, 5])
+        self.assertEqual(filtered[0]["daughters"][0]["neck_region_vertices"], [5])
+        self.assertEqual(filtered[0]["daughters"][0]["neck_side_vertices"], [2, 5])
+        self.assertEqual(
+            filtered[0]["metadata"]["protected_region_filter"]["n_protected_vertices"],
+            2,
+        )
+
+    def test_protected_mask_filters_candidate_patches_before_refinement(self):
+        protected = np.zeros(8, dtype=bool)
+        protected[[1, 3, 4, 6]] = True
+        patches, info = protect_patches_from_mask(
+            [[0, 1, 2, 3], [3, 4, 6], [5, 6, 7]],
+            protected,
+            min_vertices=2,
+        )
+
+        self.assertEqual([patch.tolist() for patch in patches], [[0, 2], [5, 7]])
+        self.assertEqual([record["kept"] for record in info], [True, False, True])
+        self.assertEqual([record["removed_size"] for record in info], [2, 3, 1])
 
     def test_body_blob_fit_is_constrained_before_descendant_tip(self):
         graph = SkeletonGraph()

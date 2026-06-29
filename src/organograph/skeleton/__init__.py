@@ -13,6 +13,19 @@ from organograph.skeleton.build import (
     normalize_crypt_detections,
 )
 from organograph.skeleton.blending import BlendAttachment, create_attachment_blends
+from organograph.skeleton.barrier_ellipsoid import (
+    SoftBarrierEllipsoidConfig,
+    SoftBarrierEllipsoidFit,
+    ellipsoid_vertices_like_mesh,
+    fit_soft_barrier_ellipsoid,
+    fit_soft_barrier_ellipsoid_sampled,
+    protect_detection_regions_from_mask,
+    protect_patches_from_mask,
+    relative_height_field,
+    sampled_vertex_indices,
+    solid_center_of_mass,
+    villus_mask_from_ellipsoid,
+)
 from organograph.skeleton.config import BlendConfig, PrimitiveFitConfig, SkeletonizationConfig
 from organograph.skeleton.datatypes import (
     NODE_TYPES,
@@ -91,6 +104,8 @@ __all__ = [
     "PrimitiveFit",
     "PrimitiveFitConfig",
     "PrimitiveFitResult",
+    "SoftBarrierEllipsoidConfig",
+    "SoftBarrierEllipsoidFit",
     "SkeletonEdge",
     "SkeletonGraph",
     "SkeletonNode",
@@ -120,7 +135,10 @@ __all__ = [
     "fit_crypt_tube_to_points",
     "fit_ellipsoid_to_points",
     "fit_primitives_for_skeletonization_result",
+    "fit_soft_barrier_ellipsoid",
+    "fit_soft_barrier_ellipsoid_sampled",
     "fit_straight_neck_cylinder",
+    "ellipsoid_vertices_like_mesh",
     "graph_arrays",
     "graph_summary",
     "load_skeleton_json",
@@ -132,12 +150,18 @@ __all__ = [
     "primitive_components_from_crypt_detections",
     "primitive_records",
     "primitive_attachments_to_dataframe",
+    "protect_detection_regions_from_mask",
+    "protect_patches_from_mask",
+    "relative_height_field",
     "save_shape_export",
     "save_skeleton_json",
     "shape_export_payload",
     "skeletonize_organoid",
     "sample_quadratic_bezier",
+    "sampled_vertex_indices",
     "skeleton_to_body_relative",
+    "solid_center_of_mass",
     "transform_points_body_relative",
+    "villus_mask_from_ellipsoid",
     "write_export_readme",
 ]

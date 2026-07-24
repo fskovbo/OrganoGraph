@@ -4,21 +4,23 @@ Project mesh-based crypt segmentations onto organoid cell graphs.
 
 Behavior
 --------
-For each mesh-based crypt segmentation (.npz):
-1. Load the saved crypt patches on the mesh.
-2. Try to load the corresponding precomputed cell graph.
-3. If the graph does not exist, build it on the fly from:
+For each mesh discovered from mesh_config.json:
+1. Resolve the corresponding mesh-based crypt segmentation saved by
+   run_crypt_segmentation.py.
+2. Try to load the corresponding precomputed cell graph saved by
+   run_graph_preprocess.py, using graph index.csv files when available.
+3. If the graph does not exist, optionally build it on the fly from:
       - the organoid mesh
       - the nuclei/cell CSV
 4. Project mesh crypt patches to graph nodes using each node's "proj_vertex".
 5. Optionally filter projected crypts by a minimum number of cells.
-6. Save the projected graph crypt patches as graph_crypts_ll (list of node-id lists).
+6. Save the projected graph crypt patches as crypts_ll (list of node-id lists).
 
 Primary storage choice
 ----------------------
 By default, projected crypts are stored as:
 
-    graph_crypts_ll : list[list[int]]
+    crypts_ll : list[list[int]]
 
 where each inner list contains the graph node ids belonging to one crypt.
 
@@ -32,7 +34,6 @@ more convenient primary representation for retrieving whole crypts.
 """
 
 import os
-import glob
 import time
 import numpy as np
 import pandas as pd
@@ -42,9 +43,10 @@ from organograph.mesh.OrganoidMesh import OrganoidMesh
 from organograph.io_utils.cells_table import (
     prepare_cells_table,
     make_nuclei_extractor,
-    suppress_marker_if_coexpressed,
 )
 from organograph.io_utils.dataset_config import load_mesh_dataset_config, load_cell_table_config
+from organograph.io_utils.path_parsing import parse_mesh_path, discover_mesh_paths
+from organograph.io_utils.blacklist import default_discard_labels_path, load_optional_blacklist
 from organograph.io_utils.run_metadata import write_run_settings
 from organograph.graph.build import build_organoid_graph, assign_mesh_patches_to_graph
 from organograph.io_utils.segmentation_io import load_mesh_crypt_segmentation
@@ -60,26 +62,30 @@ from organograph.graph.marker_postprocess import (
 # DATASET PATHS (EDIT THESE)
 # =============================================================================
 
-DATASET         = "20250929" # "20251201"  20250929
+DATASET         = "20251201" # "20251201"  20250929
 
 _SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT    = os.path.dirname(_SCRIPT_DIR)
 
-# Input: mesh-based segmentation results
-SEG_MESH_DIR    = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_mesh")
+DATASET_ROOT    = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET)
+MESH_DATA_DIR   = os.path.join(DATASET_ROOT, "fractal_output")
 
-# Input: nuclei/cell table used to build graphs if needed
-CELLS_CSV       = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_types_class.csv") # cell_types_class # cell_features_class
+# Input: mesh-based segmentation results from run_crypt_segmentation.py
+SEG_MESH_DIR    = os.path.join(DATASET_ROOT, "crypt_segmentations_mesh")
 
-# Optional existing graph directory; if graph missing here, it will be built on the fly
-GRAPHS_DIR      = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "graphs_preprocessed")
+# Input: nuclei/cell table used only when BUILD_GRAPHS_IF_MISSING=True
+CELLS_CSV       = os.path.join(DATASET_ROOT, "feature_tables", "cell_features_class.csv")
+
+# Optional existing graph directory from run_graph_preprocess.py
+GRAPHS_DIR      = os.path.join(DATASET_ROOT, "graphs_preprocessed")
 
 # Output: graph-based crypt projections
-GRAPH_SEG_DIR   = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "crypt_segmentations_graph")
+GRAPH_SEG_DIR   = os.path.join(DATASET_ROOT, "crypt_segmentations_graph")
 
 # config files with data structure
-MESH_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "mesh_config.json")
-CELL_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_table_config.json")
+MESH_CONFIG_PATH= os.path.join(DATASET_ROOT, "mesh_config.json")
+CELL_CONFIG_PATH= os.path.join(DATASET_ROOT, "cell_table_config.json")
+BLACKLIST_PATH  = default_discard_labels_path(DATASET_ROOT)
 
 
 
@@ -87,17 +93,18 @@ CELL_CONFIG_PATH= os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET, "cell_
 # OPTIONAL FILTERING / BEHAVIOR
 # =============================================================================
 
-TIMEPOINTS = ['day3p5', 'day4', 'day4p5', 'day4p5-more']   # or None for all timepoints found under SEG_MESH_DIR
+# Optional override. If None, use all timepoints from mesh_config.json
+TIMEPOINTS = None # ['day3', 'day3p5', 'day4', 'day4p5', 'day4p5-more']
 
 OVERWRITE = True
 VERBOSE = True
 DRY_RUN = False
-MAX_ORGANOIDS = None
+MAX_MESHES = None
 
 # Minimum number of graph nodes (cells) for a projected crypt to be kept
 MIN_CELLS_PER_CRYPT = 10   # e.g. 5, or None to disable
 
-# Whether to save a per-node crypt index vector in addition to graph_crypts_ll
+# Whether to save a per-node crypt index vector in addition to crypts_ll
 SAVE_CRYPT_INDEX_VECTOR = False
 
 # If a graph is missing and we build it on the fly, save it to GRAPHS_DIR
@@ -111,6 +118,11 @@ SAVE_BUILT_GRAPHS = False
 
 mesh_cfg = load_mesh_dataset_config(MESH_CONFIG_PATH)
 cell_cfg = load_cell_table_config(CELL_CONFIG_PATH)
+
+ZARR_NAME_BY_TP = mesh_cfg["zarr_name_by_tp"]
+ROUND_BY_TP = mesh_cfg["round_by_tp"]
+MESHNAME_BY_TP = mesh_cfg["meshname_by_tp"]
+WELLS_BY_TP = mesh_cfg.get("wells_by_tp", {})
 
 
 COORD_COLS = tuple(cell_cfg["coord_cols"])
@@ -216,6 +228,43 @@ def enabled_marker_postprocessing_functions():
     return steps
 
 
+def resolve_timepoints(timepoints_override, zarr_names, rounds, meshes):
+    """Return the configured timepoints unless a manual override is supplied."""
+    if timepoints_override is not None:
+        return list(timepoints_override)
+    return [tp for tp in zarr_names if tp in rounds and tp in meshes]
+
+
+def build_graph_index(graphs_dir, timepoints):
+    """Read graph index.csv files and map both label_uid and parsed_label_uid to graph paths."""
+    index = {}
+    for tp in timepoints:
+        idx_path = os.path.join(graphs_dir, tp, "index.csv")
+        if not os.path.exists(idx_path):
+            continue
+        try:
+            df = pd.read_csv(idx_path)
+        except Exception as exc:
+            if VERBOSE:
+                print(f"[warn] could not read graph index {idx_path}: {exc}")
+            continue
+        for _, row in df.iterrows():
+            graph_path = row.get("graph_path", None)
+            if pd.isna(graph_path):
+                continue
+            graph_path = str(graph_path)
+            if not os.path.isabs(graph_path):
+                graph_path = os.path.join(graphs_dir, tp, os.path.basename(graph_path))
+            keys = []
+            for col in ("label_uid", "parsed_label_uid"):
+                val = row.get(col, None)
+                if pd.notna(val):
+                    keys.append(str(val))
+            for key in keys:
+                index[(str(tp), key)] = graph_path
+    return index
+
+
 def patches_to_ll(patches):
     """list[set[int]] -> list[list[int]] for npz saving."""
     return [sorted(list(p)) for p in (patches or [])]
@@ -223,6 +272,36 @@ def patches_to_ll(patches):
 
 def graph_path_for(tp, label_uid):
     return os.path.join(GRAPHS_DIR, tp, f"{label_uid}.gpickle")
+
+
+def mesh_seg_path_for(tp, label_uid):
+    return os.path.join(SEG_MESH_DIR, tp, f"{label_uid}.npz")
+
+
+def resolve_graph_path(tp, label_uid, parsed_label_uid=None, graph_index=None, seg=None):
+    """Resolve a graph path using direct layout, graph index.csv, or segmentation metadata."""
+    candidates = []
+    for key in (label_uid, parsed_label_uid):
+        if key:
+            candidates.append(graph_path_for(tp, key))
+            if graph_index is not None:
+                indexed = graph_index.get((str(tp), str(key)))
+                if indexed:
+                    candidates.append(indexed)
+
+    if seg is not None:
+        seg_graph_path = seg.get("graph_path", None)
+        if seg_graph_path is not None:
+            candidates.append(str(seg_graph_path))
+
+    seen = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        if os.path.exists(candidate):
+            return candidate
+    return candidates[0] if candidates else graph_path_for(tp, label_uid)
 
 
 def output_path_for(tp, label_uid):
@@ -428,48 +507,95 @@ def project_mesh_field_to_graph(G, field_mesh, *, proj_field="proj_vertex"):
 def main():
     t_start = time.perf_counter()
     stats = {
+        "mesh_files_found": 0,
         "segmentations_found": 0,
         "projected_saved": 0,
         "graphs_built_on_the_fly": 0,
         "graphs_loaded": 0,
+        "skipped_blacklist": 0,
         "skipped_existing": 0,
+        "skipped_missing_segmentation": 0,
         "skipped_missing_graph": 0,
         "failed": 0,
         "dry_run": bool(DRY_RUN),
     }
 
-    if not os.path.exists(CELLS_CSV):
+    if BUILD_GRAPHS_IF_MISSING and not os.path.exists(CELLS_CSV):
         raise FileNotFoundError(f"CELLS_CSV not found: {CELLS_CSV}")
 
-    # load + prepare nuclei table once
-    cells_df = pd.read_csv(CELLS_CSV)
-    cells_df = prepare_cells_table(cells_df, label_col="label_uid")
+    extractor = None
+    if BUILD_GRAPHS_IF_MISSING:
+        # load + prepare nuclei table once
+        cells_df = pd.read_csv(CELLS_CSV)
+        cells_df = prepare_cells_table(cells_df, label_col="label_uid")
 
-    extractor = make_nuclei_extractor(
-        cells_df,
-        label_col="label_uid",
-        xyz_cols=COORD_COLS,
-        marker_cols=MARKER_COLS,
-        marker_alias=MARKER_ALIAS,
-        marker_postprocess_fn=marker_postprocess,
-        return_marker_intensity=True,
+        extractor = make_nuclei_extractor(
+            cells_df,
+            label_col="label_uid",
+            xyz_cols=COORD_COLS,
+            marker_cols=MARKER_COLS,
+            marker_alias=MARKER_ALIAS,
+            marker_postprocess_fn=marker_postprocess,
+            return_marker_intensity=True,
+        )
+
+    search_timepoints = resolve_timepoints(
+        TIMEPOINTS,
+        ZARR_NAME_BY_TP,
+        ROUND_BY_TP,
+        MESHNAME_BY_TP,
+    )
+    blacklist = load_optional_blacklist(BLACKLIST_PATH, label="blacklist", verbose=VERBOSE)
+    graph_index = build_graph_index(GRAPHS_DIR, search_timepoints)
+
+    mesh_paths = discover_mesh_paths(
+        data_dir=MESH_DATA_DIR,
+        timepoints=search_timepoints,
+        zarr_names=ZARR_NAME_BY_TP,
+        rounds=ROUND_BY_TP,
+        meshes=MESHNAME_BY_TP,
+        wells=WELLS_BY_TP,
     )
 
-    # discover segmentation files
-    if TIMEPOINTS is None:
-        seg_paths = sorted(glob.glob(os.path.join(SEG_MESH_DIR, "*", "*.npz")))
-    else:
-        seg_paths = []
-        for tp in TIMEPOINTS:
-            seg_paths.extend(sorted(glob.glob(os.path.join(SEG_MESH_DIR, tp, "*.npz"))))
-
     if VERBOSE:
-        print(f"[graph-proj] found {len(seg_paths)} mesh segmentations")
-    stats["segmentations_found"] = int(len(seg_paths))
+        print(f"[graph-proj] searching timepoints: {search_timepoints}")
+        print(f"[graph-proj] found {len(mesh_paths)} mesh files (pre-filter)")
+        print(f"[graph-proj] loaded graph index entries: {len(graph_index)}")
+    stats["mesh_files_found"] = int(len(mesh_paths))
 
     n_done = 0
 
-    for seg_path in seg_paths:
+    for mesh_path in mesh_paths:
+        try:
+            rec = parse_mesh_path(mesh_path)
+        except Exception as e:
+            if VERBOSE:
+                print(f"[skip] cannot parse mesh path: {mesh_path} ({e})")
+            stats["failed"] += 1
+            continue
+
+        tp = rec.get("timepoint", None)
+        parsed_label_uid = rec.get("label_uid", None)
+
+        if not tp or not parsed_label_uid:
+            if VERBOSE:
+                print(f"[skip] missing timepoint/label_uid for: {mesh_path}")
+            continue
+
+        if parsed_label_uid in blacklist:
+            if VERBOSE:
+                print(f"[skip] {parsed_label_uid} is blacklisted")
+            stats["skipped_blacklist"] += 1
+            continue
+
+        seg_path = mesh_seg_path_for(tp, parsed_label_uid)
+        if not os.path.exists(seg_path):
+            if VERBOSE:
+                print(f"[skip] missing mesh segmentation for {tp}/{parsed_label_uid}: {seg_path}")
+            stats["skipped_missing_segmentation"] += 1
+            continue
+        stats["segmentations_found"] += 1
+
         try:
             seg = load_mesh_crypt_segmentation(seg_path)
         except Exception as e:
@@ -478,18 +604,33 @@ def main():
             stats["failed"] += 1
             continue
 
-        tp = seg["timepoint"]
-        label_uid = seg["label_uid"]
-        mesh_path = seg["mesh_path"]
+        tp = str(seg.get("timepoint", tp))
+        mesh_seg_label_uid = str(seg.get("label_uid", parsed_label_uid))
+        mesh_path = str(seg.get("mesh_path", mesh_path))
         crypts_mesh = seg["crypts_mesh"]
 
 
-        if not tp or not label_uid or not mesh_path:
+        if not tp or not mesh_seg_label_uid or not mesh_path:
             if VERBOSE:
                 print(f"[skip] missing timepoint/label_uid/mesh_path in {seg_path}")
             continue
 
-        out_path = output_path_for(tp, label_uid)
+        gpath = resolve_graph_path(
+            tp,
+            mesh_seg_label_uid,
+            parsed_label_uid=parsed_label_uid,
+            graph_index=graph_index,
+            seg=seg,
+        )
+        graph_label_uid = os.path.splitext(os.path.basename(gpath))[0] if gpath else mesh_seg_label_uid
+
+        if graph_label_uid in blacklist and graph_label_uid != parsed_label_uid:
+            if VERBOSE:
+                print(f"[skip] {graph_label_uid} is blacklisted")
+            stats["skipped_blacklist"] += 1
+            continue
+
+        out_path = output_path_for(tp, graph_label_uid)
         os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
         if (not OVERWRITE) and os.path.exists(out_path):
@@ -498,16 +639,14 @@ def main():
             stats["skipped_existing"] += 1
             continue
 
-        gpath = graph_path_for(tp, label_uid)
-
         if DRY_RUN:
-            print(f"[DRY_RUN] would project: tp={tp} label_uid={label_uid}")
+            print(f"[DRY_RUN] would project: tp={tp} parsed_label_uid={parsed_label_uid} graph_label_uid={graph_label_uid}")
             print(f"          seg  : {seg_path}")
             print(f"          mesh : {mesh_path}")
             print(f"          graph: {gpath}")
             print(f"          out  : {out_path}")
             n_done += 1
-            if MAX_ORGANOIDS is not None and n_done >= int(MAX_ORGANOIDS):
+            if MAX_MESHES is not None and n_done >= int(MAX_MESHES):
                 break
             continue
 
@@ -518,7 +657,7 @@ def main():
                 G = load_cell_graph(gpath)
                 stats["graphs_loaded"] += 1
                 if VERBOSE:
-                    print(f"[graph-proj] loaded existing graph for {tp}/{label_uid}")
+                    print(f"[graph-proj] loaded existing graph for {tp}/{graph_label_uid}")
             except Exception as e:
                 if VERBOSE:
                     print(f"[warn] failed loading graph {gpath}: {e}")
@@ -526,13 +665,13 @@ def main():
 
         if G is None and BUILD_GRAPHS_IF_MISSING:
             try:
-                G = build_graph_for_organoid(mesh_path, label_uid, extractor)
+                G = build_graph_for_organoid(mesh_path, graph_label_uid, extractor)
                 stats["graphs_built_on_the_fly"] += 1
                 if VERBOSE:
-                    print(f"[graph-proj] built graph on the fly for {tp}/{label_uid}")
+                    print(f"[graph-proj] built graph on the fly for {tp}/{graph_label_uid}")
             except Exception as e:
                 if VERBOSE:
-                    print(f"[{tp}] graph build failed for {label_uid}: {e}")
+                    print(f"[{tp}] graph build failed for {graph_label_uid}: {e}")
                 stats["failed"] += 1
                 continue
 
@@ -542,12 +681,12 @@ def main():
                     save_cell_graph(gpath, G)
                 except Exception as e:
                     if VERBOSE:
-                        print(f"[warn] could not save built graph for {tp}/{label_uid}: {e}")
+                        print(f"[warn] could not save built graph for {tp}/{graph_label_uid}: {e}")
         
         # --- skip if still missing ---
         if G is None:
             if VERBOSE:
-                print(f"[skip] Graph missing for {tp}/{label_uid}")
+                print(f"[skip] Graph missing for {tp}/{mesh_seg_label_uid} (parsed={parsed_label_uid}, resolved={gpath})")
             stats["skipped_missing_graph"] += 1
             continue
 
@@ -562,7 +701,7 @@ def main():
             )
         except Exception as e:
             if VERBOSE:
-                print(f"[{tp}] graph projection failed for {label_uid}: {e}")
+                print(f"[{tp}] graph projection failed for {graph_label_uid}: {e}")
             stats["failed"] += 1
             continue
 
@@ -594,7 +733,10 @@ def main():
         graph_patch_sizes = np.array([len(p) for p in graph_patches], dtype=np.int64)
 
         save_dict = {
-            "label_uid": str(label_uid),
+            "label_uid": str(graph_label_uid),
+            "graph_label_uid": str(graph_label_uid),
+            "mesh_seg_label_uid": str(mesh_seg_label_uid),
+            "parsed_label_uid": str(parsed_label_uid),
             "timepoint": str(tp),
             "mesh_seg_path": str(seg_path),
             "mesh_path": str(mesh_path),
@@ -628,11 +770,11 @@ def main():
         np.savez_compressed(out_path, **save_dict)
 
         if VERBOSE:
-            print(f"[graph-proj] saved {tp}/{label_uid} -> {out_path} (n_crypts={len(graph_patches)})")
+            print(f"[graph-proj] saved {tp}/{graph_label_uid} -> {out_path} (n_crypts={len(graph_patches)})")
         stats["projected_saved"] += 1
 
         n_done += 1
-        if MAX_ORGANOIDS is not None and n_done >= int(MAX_ORGANOIDS):
+        if MAX_MESHES is not None and n_done >= int(MAX_MESHES):
             break
 
     elapsed_s = time.perf_counter() - t_start
@@ -642,24 +784,33 @@ def main():
 
 
 def write_map_run_settings(*, elapsed_s, stats):
+    timepoints = resolve_timepoints(
+        TIMEPOINTS,
+        ZARR_NAME_BY_TP,
+        ROUND_BY_TP,
+        MESHNAME_BY_TP,
+    )
     write_run_settings(
         GRAPH_SEG_DIR,
         script_name=os.path.basename(__file__),
         payload={
             "dataset": DATASET,
-            "timepoints": TIMEPOINTS,
+            "timepoints": timepoints,
             "paths": {
+                "dataset_root": DATASET_ROOT,
+                "mesh_data_dir": MESH_DATA_DIR,
                 "seg_mesh_dir": SEG_MESH_DIR,
                 "cells_csv": CELLS_CSV,
                 "graphs_dir": GRAPHS_DIR,
                 "graph_seg_dir": GRAPH_SEG_DIR,
                 "mesh_config_path": MESH_CONFIG_PATH,
                 "cell_config_path": CELL_CONFIG_PATH,
+                "blacklist_path": BLACKLIST_PATH,
             },
             "parameters": {
                 "overwrite": OVERWRITE,
                 "dry_run": DRY_RUN,
-                "max_organoids": MAX_ORGANOIDS,
+                "max_meshes": MAX_MESHES,
                 "min_cells_per_crypt": MIN_CELLS_PER_CRYPT,
                 "save_crypt_index_vector": SAVE_CRYPT_INDEX_VECTOR,
                 "build_graphs_if_missing": BUILD_GRAPHS_IF_MISSING,

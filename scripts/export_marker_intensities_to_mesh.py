@@ -29,8 +29,10 @@ Summary files:
     {OUT_DIR}/marker_names.json
     {OUT_DIR}/README.md
 
-The occurrence CSV counts processed marker-positive cells from graph
-``markers_bin``. The VTP intensity fields use processed ``markers_int``.
+The occurrence CSV counts marker-positive cells in the exported marker space.
+By default, the VTP intensity fields use processed graph ``markers_int``.
+Optionally, collaborator-style mutually exclusive cell-type intensities can be
+derived from the graph marker intensities before export.
 """
 
 from __future__ import annotations
@@ -66,7 +68,7 @@ PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 DATASET_ROOT = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET)
 
 GRAPHS_DIR = os.path.join(DATASET_ROOT, "graphs_preprocessed")
-OUT_DIR = os.path.join(DATASET_ROOT, "marker_intensities_mesh")
+OUT_DIR = os.path.join(DATASET_ROOT, "marker_intensities_mesh_exclusive")
 CELLS_CSV = os.path.join(DATASET_ROOT, "feature_tables", "cell_features_class.csv")
 CELL_CONFIG_PATH = os.path.join(DATASET_ROOT, "cell_table_config.json")
 
@@ -85,6 +87,86 @@ UNASSIGNED_OWNER = -1
 PROJECTED_COL = "projected_to_mesh"
 PROJECTED_VERTEX_COL = "proj_vertex"
 ENRICHED_CELL_TABLE_NAME = "cell_features_class_with_projection.csv"
+
+# Optional collaborator-style marker exclusivity. Graphs loaded from
+# ``graphs_preprocessed`` should use the processed ``markers_int`` field. Keep
+# the raw-marker option disabled unless deliberately auditing the stored raw
+# provenance fields.
+APPLY_COLLABORATOR_EXCLUSIVITY = True
+COLLABORATOR_EXCLUSIVITY_USE_RAW_GRAPH_MARKERS = False
+# TA markers differ between panels. In "auto" mode, TA uses Cyclin D/A when
+# available and falls back to KI67 when the panel has no Cyclin D/A columns.
+COLLABORATOR_TA_MARKER_MODE = "auto"  # "auto", "cyclins", "ki67", or "all"
+COLLABORATOR_INCLUDE_KI67_AS_TA = True
+RAW_MARKERS_INT_FIELD = "markers_int_raw"
+
+COLLABORATOR_CLASSES = {
+    "LGR": "0.C02",
+    "CHROMA": "0.C03",
+    "CYCD": "0.C04",
+    "MUC": "1.C03",
+    "ALDOB": "1.C04",
+    "GLUC": "2.C02",
+    "CYCA": "2.C03",
+    "AGR": "2.C04",
+    "SERO": "3.C02",
+    "LYZ": "3.C03",
+}
+
+COLLABORATOR_MARKER_PREFIXES = {
+    # Prefixes are only fallbacks; marker-name aliases are preferred. Some
+    # channel prefixes differ between panels, and some are ambiguous across
+    # panels, so the graph/cell-table marker names remain the primary signal.
+    "LGR": ["0.C02"],
+    "CHROMA": ["0.C03"],
+    "CYCD": ["0.C04"],
+    "MUC": ["1.C03"],
+    "ALDOB": ["1.C04", "0.C04"],
+    "GLUC": ["2.C02"],
+    "CYCA": ["2.C03"],
+    "AGR": ["2.C04", "1.C04"],
+    "SERO": ["3.C02", "1.C02"],
+    "LYZ": ["3.C03", "1.C03"],
+    "KI67": ["2.C04"],
+}
+
+COLLABORATOR_MARKER_ALIASES = {
+    "LGR": ["LGR5", "LGR"],
+    "CHROMA": ["Chroma", "CHROMA"],
+    "CYCD": ["Cyclin D", "CYCD"],
+    "MUC": ["Mucin 2", "MUC"],
+    "ALDOB": ["AldoB", "ALDOB"],
+    "GLUC": ["Glucagon", "GLUC"],
+    "CYCA": ["Cyclin A", "CYCA"],
+    "AGR": ["Agr2", "AGR"],
+    "SERO": ["Serotonin", "SERO"],
+    "LYZ": ["Lysozyme", "LYZ"],
+    "KI67": ["KI67"],
+}
+
+COLLABORATOR_MUTUALLY_INCLUDE = {
+    "STEM": ["LGR"],
+    "EEPROG": ["CHROMA"],
+    "GOBLET": ["MUC"],
+    "ABS": ["ALDOB"],
+    "EE": ["GLUC"],
+    "SECPROG": ["AGR"],
+    "EC": ["SERO"],
+    "PANETH": ["LYZ"],
+    "TA": ["CYCD", "CYCA"],
+}
+
+COLLABORATOR_MUTUALLY_EXCLUDE = {
+    "STEM": ["CHROMA", "MUC", "ALDOB", "GLUC", "AGR", "SERO", "LYZ"],
+    "EEPROG": ["MUC", "GLUC", "SERO", "LYZ"],
+    "GOBLET": ["CHROMA", "GLUC", "SERO", "LYZ"],
+    "ABS": ["CHROMA", "MUC", "GLUC", "AGR", "SERO", "LYZ"],
+    "EE": ["SERO"],
+    "SECPROG": ["CHROMA", "MUC", "GLUC", "SERO", "LYZ"],
+    "EC": [],
+    "PANETH": ["CHROMA", "GLUC", "SERO"],
+    "TA": ["LGR", "CHROMA", "MUC", "ALDOB", "GLUC", "AGR", "SERO", "LYZ"],
+}
 
 
 # =============================================================================
@@ -155,6 +237,171 @@ def marker_field_names(marker_names: list[str]) -> list[str]:
         used.add(field)
         fields.append(field)
     return fields
+
+
+def graph_has_node_field(G, field: str) -> bool:
+    return G.number_of_nodes() > 0 and field in G.nodes[0]
+
+
+def graph_dir_is_preprocessed(graphs_dir: str) -> bool:
+    return os.path.basename(os.path.normpath(str(graphs_dir))) == "graphs_preprocessed"
+
+
+def collaborator_ta_include_markers(
+    marker_index_by_code: dict[str, list[int]] | None = None,
+) -> list[str]:
+    mode = str(COLLABORATOR_TA_MARKER_MODE).strip().lower()
+    if mode not in {"auto", "cyclins", "ki67", "all"}:
+        raise ValueError(
+            "COLLABORATOR_TA_MARKER_MODE must be one of "
+            "'auto', 'cyclins', 'ki67', or 'all'"
+        )
+
+    if mode == "cyclins":
+        markers = ["CYCD", "CYCA"]
+    elif mode == "ki67":
+        markers = ["KI67"]
+    elif mode == "all":
+        markers = ["CYCD", "CYCA", "KI67"]
+    else:
+        marker_index_by_code = marker_index_by_code or {}
+        has_cyclins = bool(marker_index_by_code.get("CYCD")) or bool(marker_index_by_code.get("CYCA"))
+        has_ki67 = bool(marker_index_by_code.get("KI67"))
+        if has_cyclins:
+            markers = [
+                code
+                for code in ("CYCD", "CYCA")
+                if bool(marker_index_by_code.get(code))
+            ]
+            if COLLABORATOR_INCLUDE_KI67_AS_TA and has_ki67:
+                markers.append("KI67")
+        elif has_ki67:
+            markers = ["KI67"]
+        else:
+            markers = ["CYCD", "CYCA"]
+
+    if COLLABORATOR_INCLUDE_KI67_AS_TA and mode == "cyclins":
+        markers = list(markers) + ["KI67"]
+    return list(dict.fromkeys(markers))
+
+
+def collaborator_include_rules(
+    marker_index_by_code: dict[str, list[int]] | None = None,
+) -> dict[str, list[str]]:
+    rules = {
+        cell_type: list(markers)
+        for cell_type, markers in COLLABORATOR_MUTUALLY_INCLUDE.items()
+    }
+    rules["TA"] = collaborator_ta_include_markers(marker_index_by_code)
+    return rules
+
+
+def resolve_collaborator_marker_indices(
+    marker_names: list[str],
+    marker_cols: list[str],
+) -> dict[str, list[int]]:
+    """Resolve collaborator marker codes to graph marker columns."""
+    norm_name_to_idx = {
+        str(name).strip().lower(): i
+        for i, name in enumerate(marker_names)
+    }
+    alias_owner = {}
+    for alias_code, aliases in COLLABORATOR_MARKER_ALIASES.items():
+        for alias in aliases:
+            alias_owner[str(alias).strip().lower()] = alias_code
+    out = {}
+
+    all_codes = list(dict.fromkeys([
+        *COLLABORATOR_CLASSES,
+        *COLLABORATOR_MARKER_PREFIXES,
+        *COLLABORATOR_MARKER_ALIASES,
+    ]))
+    for code in all_codes:
+        indices = []
+        for alias in COLLABORATOR_MARKER_ALIASES.get(code, [code]):
+            idx = norm_name_to_idx.get(str(alias).strip().lower())
+            if idx is not None:
+                indices.append(idx)
+
+        if not indices:
+            prefixes = COLLABORATOR_MARKER_PREFIXES.get(
+                code,
+                [COLLABORATOR_CLASSES[code]] if code in COLLABORATOR_CLASSES else [],
+            )
+            for i, col in enumerate(marker_cols):
+                col = str(col)
+                if not any(col == prefix or col.startswith(f"{prefix}.") for prefix in prefixes):
+                    continue
+                name_owner = alias_owner.get(str(marker_names[i]).strip().lower())
+                if name_owner is None or name_owner == code:
+                    indices.append(i)
+        out[code] = list(dict.fromkeys(indices))
+
+    return out
+
+
+def collaborator_marker_codes_to_indices(
+    codes: list[str],
+    marker_index_by_code: dict[str, list[int]],
+) -> list[int]:
+    indices = []
+    for code in codes:
+        indices.extend(marker_index_by_code.get(code, []))
+    return list(dict.fromkeys(indices))
+
+
+def apply_collaborator_exclusivity_to_intensities(
+    markers_int: np.ndarray,
+    marker_names: list[str],
+    marker_cols: list[str],
+) -> tuple[np.ndarray, np.ndarray, list[str], list[str]]:
+    """
+    Convert marker intensities to collaborator-defined cell-type intensities.
+
+    For each cell type, a cell is included when any include marker has intensity
+    > 0 and all available exclude markers have intensity == 0. The exported
+    value is the mean intensity across the available include-marker columns.
+    """
+    X = np.asarray(markers_int, dtype=float)
+    if X.ndim != 2:
+        raise ValueError(f"markers_int must be 2D (N,K); got shape {X.shape}")
+    if X.shape[1] != len(marker_names) or len(marker_cols) != len(marker_names):
+        raise ValueError(
+            "markers_int, marker_names, and marker_cols must describe the same marker columns"
+        )
+
+    marker_index_by_code = resolve_collaborator_marker_indices(marker_names, marker_cols)
+    include_rules = collaborator_include_rules(marker_index_by_code)
+    output_names = list(include_rules)
+    output = np.zeros((X.shape[0], len(output_names)), dtype=float)
+
+    for out_idx, cell_type in enumerate(output_names):
+        include_idx = collaborator_marker_codes_to_indices(
+            include_rules[cell_type],
+            marker_index_by_code,
+        )
+        exclude_idx = collaborator_marker_codes_to_indices(
+            COLLABORATOR_MUTUALLY_EXCLUDE.get(cell_type, []),
+            marker_index_by_code,
+        )
+
+        if include_idx:
+            include_values = X[:, include_idx]
+            include_mask = np.any(include_values > 0, axis=1)
+        else:
+            include_values = np.zeros((X.shape[0], 0), dtype=float)
+            include_mask = np.zeros(X.shape[0], dtype=bool)
+
+        if exclude_idx:
+            exclude_mask = np.all(X[:, exclude_idx] == 0, axis=1)
+        else:
+            exclude_mask = np.ones(X.shape[0], dtype=bool)
+
+        final_mask = include_mask & exclude_mask
+        if np.any(final_mask):
+            output[final_mask, out_idx] = np.mean(include_values[final_mask], axis=1)
+
+    return output, output > 0, output_names, output_names
 
 
 def selected_timepoints() -> list[str]:
@@ -335,6 +582,35 @@ def write_readme(out_dir: str, marker_names: list[str], vtp_fields: list[str]) -
         f"| {i} | `{marker}` | `{field}` |"
         for i, (marker, field) in enumerate(zip(marker_names, vtp_fields))
     )
+    if APPLY_COLLABORATOR_EXCLUSIVITY:
+        marker_source_text = (
+            "The VTP fields contain collaborator-exclusivity cell-type intensities "
+            "derived from graph marker intensities. A cell type is positive when any "
+            "included marker is > 0 and all available excluded markers are == 0; the "
+            "exported value is the mean of the available included-marker intensities."
+        )
+        marker_positive_text = (
+            "Marker positivity is defined by the exported class intensity being greater than zero."
+        )
+        enriched_marker_text = (
+            f"- `<cell-type>_filtered`: exported collaborator-exclusivity class intensity "
+            f"for each projected cell."
+        )
+    else:
+        marker_source_text = (
+            "The VTP fields contain processed marker intensities, not raw unfiltered table values. "
+            "Graph-level postprocessing may set selected marker intensities to zero, for example "
+            "when coexpression suppression is enabled in `run_graph_preprocess.py`."
+        )
+        marker_positive_text = (
+            "Marker positivity is defined by processed graph `markers_bin`, where a cell is "
+            "positive if its processed marker intensity is greater than zero after graph-level postprocessing."
+        )
+        enriched_marker_text = (
+            f"- `<marker-prefix>.percentile99_class_filtered`: processed marker intensity after "
+            f"graph preprocessing and filtering. These columns use the same marker column prefixes "
+            f"as `cell_table_config.json`."
+        )
     text = f"""# Marker Intensity Mesh Export
 
 This folder contains processed cell marker intensities projected onto the original organoid surface meshes.
@@ -373,7 +649,7 @@ The marker intensity fields are ordered as follows:
 - `n_owned_mesh_vertices`: number of vertices with a non-negative `{OWNER_FIELD_NAME}`.
 - `<marker>_n_pos`: number of processed graph cells positive for that marker.
 
-Marker positivity is defined by processed graph `markers_bin`, where a cell is positive if its processed marker intensity is greater than zero after graph-level postprocessing.
+{marker_positive_text}
 
 ## Enriched Cell Feature Table
 
@@ -381,13 +657,13 @@ Marker positivity is defined by processed graph `markers_bin`, where a cell is p
 
 - `{PROJECTED_COL}`: `True` when the cell was retained in the processed graph and projected to the mesh, otherwise `False`.
 - `{PROJECTED_VERTEX_COL}`: mesh vertex id that the cell/nucleus was projected to, or `-1` when not projected.
-- `<marker-prefix>.percentile99_class_filtered`: processed marker intensity after graph preprocessing and filtering. These columns use the same marker column prefixes as `cell_table_config.json`.
+{enriched_marker_text}
 
 Rows for cells that were filtered out during projection/graph construction keep `{PROJECTED_COL}=False`, `{PROJECTED_VERTEX_COL}=-1`, and filtered marker intensity columns as missing values.
 
 ## Notes
 
-The VTP fields contain processed marker intensities, not raw unfiltered table values. Graph-level postprocessing may set selected marker intensities to zero, for example when coexpression suppression is enabled in `run_graph_preprocess.py`.
+{marker_source_text}
 """
     with open(os.path.join(out_dir, "README.md"), "w") as f:
         f.write(text)
@@ -413,12 +689,7 @@ def process_one(
         raise FileNotFoundError(f"Vertex-owner sidecar not found: {vertex_owner_path}")
 
     G = load_cell_graph(graph_path)
-    marker_names = [str(x) for x in G.graph.get("marker_names", [])]
-    if expected_marker_names is not None and marker_names != expected_marker_names:
-        raise ValueError(
-            f"Marker names differ for {label_uid}. "
-            f"Expected {expected_marker_names}, got {marker_names}"
-        )
+    graph_marker_names = [str(x) for x in G.graph.get("marker_names", [])]
 
     markers_int = graph_get(G, "markers_int", dtype=float)
     markers_bin = graph_get(G, "markers_bin") > 0
@@ -426,18 +697,43 @@ def process_one(
         raise ValueError(
             f"markers_int shape {markers_int.shape} != markers_bin shape {markers_bin.shape}"
         )
-    if markers_int.shape[1] != len(marker_names):
+    if markers_int.shape[1] != len(graph_marker_names):
         raise ValueError(
-            f"Marker matrix has {markers_int.shape[1]} columns but marker_names has {len(marker_names)}"
+            f"Marker matrix has {markers_int.shape[1]} columns but marker_names has {len(graph_marker_names)}"
         )
-    if len(marker_cols) != len(marker_names):
+    if len(marker_cols) != len(graph_marker_names):
         raise ValueError(
-            f"cell_table_config marker_cols has {len(marker_cols)} entries but graph marker_names has {len(marker_names)}"
+            f"cell_table_config marker_cols has {len(marker_cols)} entries but graph marker_names has {len(graph_marker_names)}"
         )
-    if [str(x) for x in config_marker_names] != marker_names:
+    if [str(x) for x in config_marker_names] != graph_marker_names:
         raise ValueError(
             f"cell_table_config marker_names order does not match graph marker_names for {label_uid}. "
-            f"Config={config_marker_names}; graph={marker_names}"
+            f"Config={config_marker_names}; graph={graph_marker_names}"
+        )
+
+    marker_source_field = "markers_int"
+    output_marker_cols = marker_cols
+    marker_names = graph_marker_names
+    if APPLY_COLLABORATOR_EXCLUSIVITY:
+        if COLLABORATOR_EXCLUSIVITY_USE_RAW_GRAPH_MARKERS:
+            if graph_dir_is_preprocessed(GRAPHS_DIR):
+                raise ValueError(
+                    "Refusing to use raw marker fields from graphs_preprocessed. "
+                    "Set COLLABORATOR_EXCLUSIVITY_USE_RAW_GRAPH_MARKERS = False."
+                )
+            if graph_has_node_field(G, RAW_MARKERS_INT_FIELD):
+                markers_int = graph_get(G, RAW_MARKERS_INT_FIELD, dtype=float)
+                marker_source_field = RAW_MARKERS_INT_FIELD
+        markers_int, markers_bin, marker_names, output_marker_cols = apply_collaborator_exclusivity_to_intensities(
+            markers_int,
+            graph_marker_names,
+            marker_cols,
+        )
+
+    if expected_marker_names is not None and marker_names != expected_marker_names:
+        raise ValueError(
+            f"Exported marker names differ for {label_uid}. "
+            f"Expected {expected_marker_names}, got {marker_names}"
         )
 
     mesh = OrganoidMesh(mesh_path)
@@ -478,7 +774,7 @@ def process_one(
     for marker, count in zip(marker_names, counts):
         occurrence[f"{marker}_n_pos"] = int(count)
 
-    cell_updates = build_cell_projection_updates(G, markers_int, marker_cols)
+    cell_updates = build_cell_projection_updates(G, markers_int, output_marker_cols)
 
     vtp_status = "exported"
     if (not OVERWRITE) and os.path.exists(out_path):
@@ -488,10 +784,11 @@ def process_one(
     else:
         write_mesh_vtp(Path(out_path), mesh.v, mesh.f, point_fields)
 
-    return marker_names, vtp_fields, occurrence, cell_updates, {
+    return marker_names, vtp_fields, output_marker_cols, occurrence, cell_updates, {
         "label_uid": label_uid,
         "timepoint": tp,
         "status": vtp_status,
+        "marker_source_field": marker_source_field,
     }
 
 
@@ -507,6 +804,7 @@ def main():
     status_rows = []
     marker_names_ref = None
     vtp_fields_ref = None
+    output_marker_cols_ref = None
     stats = {
         "planned": 0,
         "exported": 0,
@@ -521,7 +819,7 @@ def main():
             break
 
         try:
-            marker_names, vtp_fields, occurrence, cell_updates, status = process_one(
+            marker_names, vtp_fields, output_marker_cols, occurrence, cell_updates, status = process_one(
                 row,
                 marker_names_ref,
                 marker_cols,
@@ -530,6 +828,7 @@ def main():
             if marker_names_ref is None:
                 marker_names_ref = marker_names
                 vtp_fields_ref = vtp_fields
+                output_marker_cols_ref = output_marker_cols
             status_rows.append(status)
             occurrence_rows.append(occurrence)
             cell_projection_updates.update(cell_updates)
@@ -557,6 +856,8 @@ def main():
 
     if marker_names_ref is None:
         raise RuntimeError("No organoids were exported; no marker names found.")
+    if output_marker_cols_ref is None:
+        raise RuntimeError("No organoids were exported; no output marker columns found.")
 
     write_marker_name_files(OUT_DIR, marker_names_ref, vtp_fields_ref)
     write_readme(OUT_DIR, marker_names_ref, vtp_fields_ref)
@@ -565,7 +866,7 @@ def main():
         path=os.path.join(OUT_DIR, ENRICHED_CELL_TABLE_NAME),
         source_csv=CELLS_CSV,
         updates=cell_projection_updates,
-        marker_cols=marker_cols,
+        marker_cols=output_marker_cols_ref,
     )
     write_occurrence_csv(os.path.join(OUT_DIR, "export_status.csv"), status_rows)
     stats["occurrence_rows_written"] = int(len(occurrence_rows))
@@ -591,9 +892,13 @@ def main():
                 "max_organoids": MAX_ORGANOIDS,
                 "owner_field_name": OWNER_FIELD_NAME,
                 "marker_field_suffix": MARKER_FIELD_SUFFIX,
+                "apply_collaborator_exclusivity": APPLY_COLLABORATOR_EXCLUSIVITY,
+                "collaborator_exclusivity_use_raw_graph_markers": COLLABORATOR_EXCLUSIVITY_USE_RAW_GRAPH_MARKERS,
+                "collaborator_include_ki67_as_ta": COLLABORATOR_INCLUDE_KI67_AS_TA,
             },
             "marker_names": marker_names_ref,
             "vtp_marker_fields": vtp_fields_ref,
+            "output_marker_cols": output_marker_cols_ref,
             "stats": stats,
             "elapsed_s": float(elapsed_s),
         },

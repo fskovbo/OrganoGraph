@@ -397,6 +397,28 @@ def _branch_position(vertices, detection: dict[str, Any], neck, daughter_tips) -
     daughter_mean = centroid(np.vstack(daughter_tips))
     return 0.5 * (np.asarray(neck, dtype=float) + daughter_mean)
 
+
+def _branch_center_override(
+    branch_center_overrides: dict[Any, Any] | None,
+    *,
+    branch_node_id: str,
+    crypt_id,
+) -> np.ndarray | None:
+    """Resolve an externally fitted center for one branch node."""
+    if not branch_center_overrides:
+        return None
+    candidates = (branch_node_id, crypt_id, str(crypt_id))
+    for key in candidates:
+        if key not in branch_center_overrides:
+            continue
+        center = np.asarray(branch_center_overrides[key], dtype=float)
+        if center.shape != (3,) or not np.all(np.isfinite(center)):
+            raise ValueError(
+                f"Branch center override for {branch_node_id!r} must be a finite 3-vector"
+            )
+        return center
+    return None
+
 def _daughter_detections(detection: dict[str, Any]) -> list[dict[str, Any]]:
     daughters = _first_present(detection, ("daughters", "daughter_tips", "branches", "children"))
     if daughters is None:
@@ -488,6 +510,7 @@ def build_skeleton_from_crypt_detections(
     body_vertices=None,
     body_faces=None,
     body_center=None,
+    branch_center_overrides: dict[Any, Any] | None = None,
     bend_strategy: str = "none",
     bend_max_dimensionless_curvature: float | None = 0.5,
     bend_curvature_penalty: float = 5.0,
@@ -505,7 +528,12 @@ def build_skeleton_from_crypt_detections(
     Optional crypt waypoints are softly straightened when their bend is too
     sharp for the path length and estimated crypt radius.
 
-    When enabled, body and branch node positions are refined from mesh regions:
+    An explicit ``body_center`` and entries in ``branch_center_overrides`` take
+    precedence over region-derived centers. This allows an upstream component
+    primitive, such as a soft-barrier ellipsoid, to define the corresponding
+    skeleton node center.
+
+    When enabled, body and branch node positions are otherwise refined from mesh regions:
     root necks bound crypt-side regions that are excluded from the villus body,
     and split branches are placed at the centroid of the parent region after
     subtracting daughter crypt-side regions.
@@ -537,6 +565,13 @@ def build_skeleton_from_crypt_detections(
         metadata={
             "role": "villus_body_center",
             "center_refined_from_neck_regions": body_refined,
+            "center_source": (
+                "explicit_override"
+                if body_center is not None
+                else "neck_bounded_region"
+                if body_refined
+                else "mesh_centroid"
+            ),
         },
     )
 
@@ -572,9 +607,15 @@ def build_skeleton_from_crypt_detections(
         daughters = _daughter_detections(detection)
         if daughters:
             daughter_tips = [_tip_position(vertices, daughter) for daughter in daughters]
+            branch_id = f"{crypt_prefix}_branch"
             branch_region = np.empty(0, dtype=np.int64)
-            branch = None
-            if refine_branch_centers_from_necks:
+            branch = _branch_center_override(
+                branch_center_overrides,
+                branch_node_id=branch_id,
+                crypt_id=crypt_id,
+            )
+            branch_center_overridden = branch is not None
+            if branch is None and refine_branch_centers_from_necks:
                 branch, branch_region = _branch_position_from_regions(vertices, detection, daughters)
             if branch is None:
                 branch = _branch_position(
@@ -583,7 +624,6 @@ def build_skeleton_from_crypt_detections(
                     root_source_position,
                     daughter_tips,
                 )
-            branch_id = f"{crypt_prefix}_branch"
             graph.add_node(
                 branch_id,
                 "branch",
@@ -593,6 +633,13 @@ def build_skeleton_from_crypt_detections(
                     **common_meta,
                     "n_daughters": len(daughters),
                     "center_refined_from_neck_regions": bool(branch_region.size),
+                    "center_source": (
+                        "explicit_override"
+                        if branch_center_overridden
+                        else "neck_bounded_region"
+                        if branch_region.size
+                        else "detection_or_geometric_fallback"
+                    ),
                     "n_branch_region_vertices": int(branch_region.size),
                     "branch_region_vertices": branch_region.tolist(),
                 },
@@ -687,4 +734,3 @@ def build_skeleton_from_crypt_detections(
         )
 
     return graph
-

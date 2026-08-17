@@ -93,7 +93,7 @@ def local_blob_cross_section_radius(attachment, axis_direction, *, default_radiu
     axis = unit_vector(axis_direction)
     params = attachment.parameters
     primitive_type = attachment.primitive_type
-    if primitive_type in {"ellipsoid", "superellipsoid_placeholder"}:
+    if primitive_type in {"ellipsoid", "superellipsoid", "superellipsoid_placeholder"}:
         orientation = np.asarray(params["orientation"], dtype=float)
         axes = np.asarray(params["axis_lengths"], dtype=float)
     elif primitive_type == "asymmetric_superellipsoid":
@@ -256,11 +256,14 @@ def local_blob_radius_at_point(
             )
             if distance is not None and np.isfinite(distance):
                 distances.append(distance)
-    elif primitive_type == "asymmetric_superellipsoid":
+    elif primitive_type in {"superellipsoid", "asymmetric_superellipsoid"}:
         center = np.asarray(params["center"], dtype=float)
         orientation = np.asarray(params["orientation"], dtype=float)
-        negative = np.asarray(params["axis_lengths_negative"], dtype=float)
-        positive = np.asarray(params["axis_lengths_positive"], dtype=float)
+        if primitive_type == "superellipsoid":
+            negative = positive = np.asarray(params["axis_lengths"], dtype=float)
+        else:
+            negative = np.asarray(params["axis_lengths_negative"], dtype=float)
+            positive = np.asarray(params["axis_lengths_positive"], dtype=float)
         point_local = (point - center) @ orientation
         for direction in directions:
             distance = _superellipsoid_ray_intersection_distance(
@@ -293,10 +296,13 @@ def local_blob_surface_radius(attachment, direction, *, default_radius: float) -
         local = direction @ orientation
         denom = float(np.sqrt(np.sum((local / np.maximum(axes, 1e-12)) ** 2)))
         return 1.0 / max(denom, 1e-12)
-    if primitive_type == "asymmetric_superellipsoid":
+    if primitive_type in {"superellipsoid", "asymmetric_superellipsoid"}:
         orientation = np.asarray(params["orientation"], dtype=float)
-        negative = np.asarray(params["axis_lengths_negative"], dtype=float)
-        positive = np.asarray(params["axis_lengths_positive"], dtype=float)
+        if primitive_type == "superellipsoid":
+            negative = positive = np.asarray(params["axis_lengths"], dtype=float)
+        else:
+            negative = np.asarray(params["axis_lengths_negative"], dtype=float)
+            positive = np.asarray(params["axis_lengths_positive"], dtype=float)
         epsilon_1 = float(params.get("epsilon_1", 1.0))
         epsilon_2 = float(params.get("epsilon_2", 1.0))
         local = direction @ orientation

@@ -56,7 +56,7 @@ from organograph.crypts.vocab import compute_vocabulary_encoding
 # DATASET CONFIG
 # =============================================================================
 
-DATASET         = "perturbations" # "20251201" 20250929
+DATASET         = "perturbations2" # "20251201" 20250929
 
 # Absolute path to this script file
 _SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
@@ -84,7 +84,7 @@ MAX_PROJ_DIST = 2.0  # max accepted distance between nuclei and membrane for pro
 # Dev/UX options
 OVERWRITE = True
 VERBOSE = True
-DRY_RUN = False       # If True: do not load meshes, do not write outputs; just print what would happen
+DRY_RUN = False      # If True: do not load meshes, do not write outputs; just print what would happen
 MAX_MESHES = None     # e.g. 10 for quick testing; None means no limit
 PRINT_TRACEBACKS = True  # Print full exception tracebacks when a mesh/graph step fails.
 
@@ -144,11 +144,11 @@ COEXP_MARKERS = tuple(marker_config_name_to_alias(m) for m in cell_cfg["coexp_ma
 # Graph-level marker postprocessing. These steps run after graph construction,
 # so they can use graph adjacency before co-expression suppression is applied.
 STORE_RAW_GRAPH_MARKERS = True  # Preserve original per-node markers in markers_int_raw and markers_bin_raw.
-ENABLE_LYSOZYME_AGR2_ABLATION = True  # Remove Lysozyme from clustered Lysozyme+ cells unless they are Agr2+.
+ENABLE_LYSOZYME_AGR2_ABLATION = False  # Remove Lysozyme from clustered Lysozyme+ cells unless they are Agr2+.
 LYSOZYME_MARKER = marker_config_name_to_alias("Lysozyme")
 AGR2_MARKER = marker_config_name_to_alias("Agr2")
 LYSOZYME_ABLATION_MIN_CLUSTER_SIZE = 2  # Only process connected Lysozyme+ components with at least this many cells.
-ENABLE_MUCIN2_AGR2_ABLATION = True  # Remove Mucin 2 from clustered Mucin 2+ cells unless they are Agr2+.
+ENABLE_MUCIN2_AGR2_ABLATION = False  # Remove Mucin 2 from clustered Mucin 2+ cells unless they are Agr2+.
 MUCIN2_MARKER = optional_marker_config_name_to_alias("Mucin 2")
 MUCIN2_ABLATION_MIN_CLUSTER_SIZE = 2  # Only process connected Mucin 2+ components with at least this many cells.
 ENABLE_GRAPH_COEXPRESSION_SUPPRESSION = True  # Apply the LGR5-vs-forbidden-marker rule after cluster cleanup.

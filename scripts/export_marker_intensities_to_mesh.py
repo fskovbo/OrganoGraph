@@ -61,14 +61,14 @@ from organograph.io_utils.run_metadata import write_run_settings
 # CONFIG
 # =============================================================================
 
-DATASET = "20251201"  # "20250929" or "20251201"
+DATASET = "perturbations2"  # "20250929" or "20251201"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)
 DATASET_ROOT = os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET)
 
 GRAPHS_DIR = os.path.join(DATASET_ROOT, "graphs_preprocessed")
-OUT_DIR = os.path.join(DATASET_ROOT, "marker_intensities_mesh_exclusive")
+OUT_DIR = os.path.join(DATASET_ROOT, "marker_intensities_mesh")
 CELLS_CSV = os.path.join(DATASET_ROOT, "feature_tables", "cell_features_class.csv")
 CELL_CONFIG_PATH = os.path.join(DATASET_ROOT, "cell_table_config.json")
 
@@ -92,12 +92,12 @@ ENRICHED_CELL_TABLE_NAME = "cell_features_class_with_projection.csv"
 # ``graphs_preprocessed`` should use the processed ``markers_int`` field. Keep
 # the raw-marker option disabled unless deliberately auditing the stored raw
 # provenance fields.
-APPLY_COLLABORATOR_EXCLUSIVITY = True
+APPLY_COLLABORATOR_EXCLUSIVITY = False
 COLLABORATOR_EXCLUSIVITY_USE_RAW_GRAPH_MARKERS = False
 # TA markers differ between panels. In "auto" mode, TA uses Cyclin D/A when
 # available and falls back to KI67 when the panel has no Cyclin D/A columns.
 COLLABORATOR_TA_MARKER_MODE = "auto"  # "auto", "cyclins", "ki67", or "all"
-COLLABORATOR_INCLUDE_KI67_AS_TA = True
+COLLABORATOR_INCLUDE_KI67_AS_TA = False
 RAW_MARKERS_INT_FIELD = "markers_int_raw"
 
 COLLABORATOR_CLASSES = {

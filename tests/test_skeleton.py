@@ -19,8 +19,10 @@ from organograph.skeleton.build import (
 from organograph.skeleton import (
     BlendConfig,
     PrimitiveAttachment,
+    SoftBarrierEllipsoidFit,
     SkeletonGraph,
     analyze_neck_circumference_profile,
+    assign_crypt_attachments_from_barrier_crossings,
     attach_body_primitive,
     attach_body_branch_neck_primitives,
     attach_branch_primitives,
@@ -32,25 +34,30 @@ from organograph.skeleton import (
     crypt_straight_distance,
     crypt_terminal_paths,
     crypt_tortuosity,
+    detect_crypts_for_skeleton,
     fit_soft_barrier_ellipsoid,
     fit_soft_barrier_ellipsoid_sampled,
     estimate_smooth_crypt_centerline,
     fit_asymmetric_superellipsoid_to_points,
     fit_crypt_tube_to_points,
     fit_ellipsoid_to_points,
+    fit_soft_barrier_primitive,
     fit_straight_neck_cylinder,
+    find_barrier_boundary_crossing,
     load_skeleton_json,
     number_of_crypts,
     number_of_split_crypts,
     protect_detection_regions_from_mask,
     protect_patches_from_mask,
     primitive_components_from_crypt_detections,
+    project_crypt_attachments_to_barrier_surfaces,
     relative_height_field,
     sampled_vertex_indices,
     save_skeleton_json,
     villus_mask_from_ellipsoid,
 )
 from organograph.skeleton.primitive.blobs import blob_surface_radius
+from organograph.plotting.skeletons import _primitive_mesh
 
 
 VERTICES = np.array(
@@ -127,6 +134,32 @@ def make_ellipsoid_points(center, axes, n_u=24, n_v=13):
                 )
             )
     return np.asarray(pts, dtype=float)
+
+
+def make_axis_ring_mesh(n_rings=5, n_theta=16):
+    """Tube-like mesh whose ring centers move from x=3 to x=-1."""
+    axis_levels = np.linspace(0.0, 2.0, int(n_rings))
+    x_centers = 3.0 - 2.0 * axis_levels
+    theta = np.linspace(0.0, 2.0 * np.pi, int(n_theta), endpoint=False)
+    vertices = []
+    distance_field = []
+    for level, x_center in zip(axis_levels, x_centers):
+        for angle in theta:
+            vertices.append([x_center, 0.2 * np.cos(angle), 0.2 * np.sin(angle)])
+            distance_field.append(level)
+    faces = []
+    for ring in range(int(n_rings) - 1):
+        for j in range(int(n_theta)):
+            a = ring * int(n_theta) + j
+            b = ring * int(n_theta) + (j + 1) % int(n_theta)
+            c = (ring + 1) * int(n_theta) + j
+            d = (ring + 1) * int(n_theta) + (j + 1) % int(n_theta)
+            faces.extend(([a, b, c], [b, d, c]))
+    return (
+        np.asarray(vertices, dtype=float),
+        np.asarray(faces, dtype=np.int64),
+        np.asarray(distance_field, dtype=float),
+    )
 
 
 def make_tube_points(
@@ -342,6 +375,51 @@ class SkeletonTests(unittest.TestCase):
         self.assertEqual(
             graph.edge("crypt_bulged_attachment_to_tip").source,
             "crypt_bulged_attachment",
+        )
+
+    def test_explicit_body_and_branch_centers_override_region_centroids(self):
+        body_center = np.array([-2.0, -1.0, -0.5])
+        branch_center = np.array([0.4, 0.5, 0.6])
+        graph = build_skeleton_from_crypt_detections(
+            VERTICES,
+            FACES,
+            [
+                {
+                    "crypt_id": "split",
+                    "crypt_vertices": [0, 1, 2, 3, 4, 5],
+                    "neck_position": [0.0, 0.0, 0.0],
+                    "daughters": [
+                        {
+                            "crypt_vertices": [0, 1, 3],
+                            "neck_position": [0.2, 0.0, 0.2],
+                            "tip_position": [0.0, 0.0, 1.5],
+                        },
+                        {
+                            "crypt_vertices": [2, 4, 5],
+                            "neck_position": [0.8, 0.8, 0.2],
+                            "tip_position": [1.0, 1.0, 1.5],
+                        },
+                    ],
+                }
+            ],
+            body_center=body_center,
+            branch_center_overrides={"crypt_split_branch": branch_center},
+            refine_body_center_from_necks=True,
+            refine_branch_centers_from_necks=True,
+        )
+
+        np.testing.assert_allclose(graph.body_node().position, body_center)
+        np.testing.assert_allclose(
+            graph.node("crypt_split_branch").position,
+            branch_center,
+        )
+        self.assertEqual(
+            graph.body_node().metadata["center_source"],
+            "explicit_override",
+        )
+        self.assertEqual(
+            graph.node("crypt_split_branch").metadata["center_source"],
+            "explicit_override",
         )
 
     def test_parent_patch_growth_accepts_boundary_minimum(self):
@@ -1084,6 +1162,270 @@ class SkeletonTests(unittest.TestCase):
         free_ratio = float(np.max(free_fit.radii) / np.min(free_fit.radii))
         penalized_ratio = float(np.max(penalized_fit.radii) / np.min(penalized_fit.radii))
         self.assertLess(penalized_ratio, free_ratio)
+
+    def test_soft_barrier_superellipsoid_recovers_flattened_body_shape(self):
+        center = np.array([0.3, -0.2, 0.1])
+        radii = np.array([2.2, 1.5, 0.75])
+        expected_epsilon = 0.55
+        u = np.linspace(-np.pi, np.pi, 48, endpoint=False)
+        v = np.linspace(-0.5 * np.pi, 0.5 * np.pi, 25)
+        uu, vv = np.meshgrid(u, v)
+
+        def signed_power(values, exponent):
+            return np.sign(values) * np.abs(values) ** exponent
+
+        points = np.stack(
+            [
+                radii[0] * signed_power(np.cos(vv), expected_epsilon) * np.cos(uu),
+                radii[1] * signed_power(np.cos(vv), expected_epsilon) * np.sin(uu),
+                radii[2] * signed_power(np.sin(vv), expected_epsilon),
+            ],
+            axis=-1,
+        ).reshape(-1, 3)
+        points += center
+
+        fit = fit_soft_barrier_primitive(
+            points,
+            config={
+                "primitive_type": "superellipsoid",
+                "barrier_weight": 1.0,
+                "underfill_weight": 1.0,
+                "center_regularization": 0.01,
+                "initial_radius_quantile": 0.9,
+                "initial_radius_scale": 1.0,
+                "initial_epsilon_1": 0.9,
+                "epsilon_1_bounds": (0.35, 1.0),
+                "epsilon_1_regularization": 0.001,
+                "maxiter": 600,
+            },
+            require_inside_center=False,
+        )
+        field = relative_height_field(points, fit)
+
+        self.assertEqual(fit.primitive_type, "superellipsoid")
+        self.assertAlmostEqual(fit.epsilon_1, expected_epsilon, delta=0.08)
+        np.testing.assert_allclose(fit.center, center, atol=0.05)
+        np.testing.assert_allclose(
+            np.sort(fit.radii),
+            np.sort(radii),
+            rtol=0.08,
+            atol=0.05,
+        )
+        self.assertAlmostEqual(float(np.median(field["level"])), 1.0, delta=0.02)
+        self.assertEqual(fit.to_primitive_parameters()["fit_family"], "soft_barrier_superellipsoid")
+
+        attachment = PrimitiveAttachment(
+            primitive_type=fit.primitive_type,
+            parameters=fit.to_primitive_parameters(),
+        )
+        surface_vertices, surface_faces = _primitive_mesh(
+            attachment,
+            n_s=16,
+            n_theta=12,
+        )
+        self.assertGreater(surface_vertices.shape[0], 0)
+        self.assertGreater(surface_faces.shape[0], 0)
+        self.assertTrue(np.all(np.isfinite(surface_vertices)))
+
+    def test_crypt_attachments_project_to_body_and_branch_barrier_surfaces(self):
+        body_fit = SoftBarrierEllipsoidFit(
+            center=np.zeros(3),
+            axes=np.eye(3),
+            radii=np.array([2.0, 2.0, 2.0]),
+            primitive_type="superellipsoid",
+            epsilon_1=0.6,
+            epsilon_2=1.0,
+        )
+        branch_fit = SoftBarrierEllipsoidFit(
+            center=np.array([5.0, 0.0, 0.0]),
+            axes=np.eye(3),
+            radii=np.ones(3),
+        )
+        detections = [
+            {
+                "crypt_id": "body_crypt",
+                "attachment_position": [1.0, 0.0, 0.0],
+                "neck_position": [1.0, 0.0, 0.0],
+                "neck_profile": {"kind": "transition"},
+            },
+            {
+                "crypt_id": "budded",
+                "attachment_position": [0.0, 1.0, 0.0],
+                "neck_position": [0.0, 1.5, 0.0],
+                "constriction_position": [0.0, 1.5, 0.0],
+                "neck_profile": {"kind": "constriction"},
+            },
+            {
+                "crypt_id": "split",
+                "daughters": [
+                    {
+                        "attachment_position": [5.5, 0.0, 0.0],
+                        "neck_position": [5.5, 0.0, 0.0],
+                        "neck_profile": {"kind": "transition"},
+                    }
+                ],
+            },
+        ]
+
+        refined = project_crypt_attachments_to_barrier_surfaces(
+            detections,
+            body_fit,
+            branch_fits={"crypt_split_branch": branch_fit},
+        )
+
+        np.testing.assert_allclose(
+            refined[0]["attachment_position"],
+            [2.0, 0.0, 0.0],
+        )
+        np.testing.assert_allclose(refined[0]["neck_position"], [2.0, 0.0, 0.0])
+        np.testing.assert_allclose(
+            refined[1]["attachment_position"],
+            [0.0, 2.0, 0.0],
+        )
+        np.testing.assert_allclose(refined[1]["neck_position"], [0.0, 1.5, 0.0])
+        np.testing.assert_allclose(
+            refined[2]["daughters"][0]["attachment_position"],
+            [6.0, 0.0, 0.0],
+        )
+        self.assertTrue(
+            refined[0]["metadata"]["barrier_attachment_projection"]["moved"]
+        )
+        self.assertEqual(detections[0]["attachment_position"], [1.0, 0.0, 0.0])
+
+    def test_barrier_crossing_follows_geodesic_ring_centers(self):
+        vertices, faces, distance_field = make_axis_ring_mesh()
+        host_fit = SoftBarrierEllipsoidFit(
+            center=np.zeros(3),
+            axes=np.eye(3),
+            radii=np.ones(3),
+        )
+
+        crossing = find_barrier_boundary_crossing(
+            vertices,
+            faces,
+            distance_field,
+            host_fit,
+            prefer_vertices=np.arange(vertices.shape[0]),
+            n_samples=32,
+            persistence=2,
+        )
+
+        self.assertTrue(crossing["found"])
+        self.assertAlmostEqual(crossing["axis_level"], 1.0, delta=0.02)
+        np.testing.assert_allclose(crossing["position"], [1.0, 0.0, 0.0], atol=0.03)
+        self.assertAlmostEqual(crossing["primitive_level"], 1.0, delta=0.03)
+
+    def test_barrier_crossing_replaces_inside_and_outside_attachments(self):
+        vertices, faces, distance_field = make_axis_ring_mesh()
+        host_fit = SoftBarrierEllipsoidFit(
+            center=np.zeros(3),
+            axes=np.eye(3),
+            radii=np.ones(3),
+        )
+        detections = [
+            {
+                "crypt_id": "inside",
+                "crypt_vertices": np.arange(vertices.shape[0]),
+                "bottom_vertex_id": 0,
+                "d_crypt": distance_field,
+                "attachment_level": 1.5,
+                "attachment_position": [0.0, 0.0, 0.0],
+                "neck_position": [0.0, 0.0, 0.0],
+                "neck_profile": {"kind": "transition", "attachment_level": 1.5},
+            },
+            {
+                "crypt_id": "outside",
+                "crypt_vertices": np.arange(vertices.shape[0]),
+                "bottom_vertex_id": 0,
+                "d_crypt": distance_field,
+                "attachment_level": 0.5,
+                "attachment_position": [2.0, 0.0, 0.0],
+                "neck_position": [2.0, 0.0, 0.0],
+                "neck_profile": {"kind": "transition", "attachment_level": 0.5},
+            },
+        ]
+
+        refined = assign_crypt_attachments_from_barrier_crossings(
+            vertices,
+            faces,
+            detections,
+            host_fit,
+            crossing_kwargs={"n_samples": 32, "persistence": 2},
+        )
+
+        for detection in refined:
+            np.testing.assert_allclose(
+                detection["attachment_position"],
+                [1.0, 0.0, 0.0],
+                atol=0.03,
+            )
+            np.testing.assert_allclose(
+                detection["neck_position"],
+                detection["attachment_position"],
+            )
+            self.assertTrue(
+                detection["metadata"]["barrier_boundary_crossing"]["found"]
+            )
+        self.assertEqual(detections[0]["attachment_position"], [0.0, 0.0, 0.0])
+
+    def test_body_barrier_fit_precedes_hks_candidate_detection(self):
+        events = []
+        mesh = SimpleNamespace(
+            v=np.array(
+                [
+                    [-1.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, -1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                ]
+            ),
+            f=np.array([[0, 1, 2], [0, 1, 3]], dtype=np.int64),
+            vertex_areas=lambda: np.ones(4),
+        )
+        fit = SoftBarrierEllipsoidFit(
+            center=np.zeros(3),
+            axes=np.eye(3),
+            radii=np.ones(3),
+        )
+
+        def fit_body(*args, **kwargs):
+            events.append("body_fit")
+            return fit
+
+        def detect_candidates(*args, **kwargs):
+            events.append("hks_candidates")
+            return [], {
+                "encoding": None,
+                "ts_mesh": None,
+                "ts_vocab": None,
+                "hks": None,
+                "norm_hks": None,
+            }
+
+        with patch(
+            "organograph.skeleton.detection.pipeline.fit_soft_barrier_primitive_sampled",
+            side_effect=fit_body,
+        ), patch(
+            "organograph.skeleton.detection.pipeline.villus_mask_from_barrier_primitive",
+            return_value=np.zeros(4, dtype=bool),
+        ), patch(
+            "organograph.crypts.vocab.detect_crypts_by_encoding",
+            side_effect=detect_candidates,
+        ):
+            detections, intermediates = detect_crypts_for_skeleton(
+                mesh,
+                vocab=object(),
+                geodesic_fn=lambda *args, **kwargs: None,
+                body_barrier_ellipsoid=True,
+                return_intermediates=True,
+            )
+
+        self.assertEqual(events, ["body_fit", "hks_candidates"])
+        self.assertEqual(detections, [])
+        self.assertEqual(
+            intermediates["body_barrier_ellipsoid"]["fit_stage"],
+            "before_hks_candidate_detection",
+        )
 
     def test_sampled_soft_barrier_ellipsoid_records_sample_metadata(self):
         center = np.array([0.2, 0.1, -0.1])

@@ -35,6 +35,20 @@ def blob_surface_radius(parameters: dict[str, Any], primitive_type: str, directi
         denom = float(np.sqrt(np.sum((local / np.maximum(axes, 1e-12)) ** 2)))
         return 1.0 / max(denom, 1e-12)
 
+    if primitive_type == "superellipsoid":
+        axes = np.asarray(parameters["axis_lengths"], dtype=float)
+        epsilon_1 = float(parameters.get("epsilon_1", 1.0))
+        epsilon_2 = float(parameters.get("epsilon_2", 1.0))
+        scaled = np.abs(local) / np.maximum(axes, 1e-12)
+        xy = (
+            scaled[0] ** (2.0 / epsilon_2)
+            + scaled[1] ** (2.0 / epsilon_2)
+        ) ** (epsilon_2 / epsilon_1)
+        denom = float(
+            (xy + scaled[2] ** (2.0 / epsilon_1)) ** (epsilon_1 / 2.0)
+        )
+        return 1.0 / max(denom, 1e-12)
+
     if primitive_type == "asymmetric_superellipsoid":
         negative = np.asarray(parameters["axis_lengths_negative"], dtype=float)
         positive = np.asarray(parameters["axis_lengths_positive"], dtype=float)

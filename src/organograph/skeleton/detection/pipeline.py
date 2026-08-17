@@ -15,9 +15,13 @@ from organograph.skeleton.detection.neck_profiles import _add_neck_profile_geome
 from organograph.skeleton.detection.region_refinement import _refine_body_transition_width_outliers, _refine_broad_transition_opening
 from organograph.skeleton.detection.tips import _select_hks_tips_from_axis
 from organograph.skeleton.barrier_ellipsoid import (
-    fit_soft_barrier_ellipsoid_sampled,
+    fit_branch_barrier_primitives,
+    fit_soft_barrier_primitive_sampled,
     protect_patches_from_mask,
-    villus_mask_from_ellipsoid,
+    villus_mask_from_barrier_primitive,
+)
+from organograph.skeleton.detection.barrier_crossings import (
+    assign_crypt_attachments_from_barrier_crossings,
 )
 
 def detect_crypts_for_skeleton(
@@ -72,6 +76,11 @@ def detect_crypts_for_skeleton(
     body_barrier_min_candidate_vertices: int = 4,
     body_barrier_sample_fraction: float = 1.0,
     body_barrier_sample_seed: int | None = 0,
+    barrier_boundary_attachments: bool = True,
+    barrier_crossing_kwargs: dict[str, Any] | None = None,
+    branch_barrier_config: dict[str, Any] | None = None,
+    branch_barrier_relative_height_threshold: float = 1.05,
+    branch_barrier_min_candidate_vertices: int = 20,
     smooth_mesh: bool = False,
     smooth_lmax: int = 5,
     smooth_recompute_eigen: bool = True,
@@ -80,21 +89,21 @@ def detect_crypts_for_skeleton(
 ) -> list[dict[str, Any]] | tuple[list[dict[str, Any]], dict[str, Any]]:
     """Run crypt detection pieces needed for skeleton construction.
 
-    This adapter intentionally starts from a fresh HKS candidate screen.  Parent
-    candidate patches are kept as skeleton crypt trunks; if local refinement
-    splits a parent into multiple child patches, the output marks that parent as
-    a split crypt with daughter tips.  This preserves stem/neck regions that may
-    later be grouped with the villus in final saved segmentations.
+    With body-barrier fitting enabled, the body primitive and ownership field
+    are computed before the fresh HKS candidate screen. Parent candidate patches
+    are then kept as skeleton crypt trunks; if local refinement splits a parent
+    into multiple child patches, the output marks that parent as a split crypt
+    with daughter tips.
 
     The geodesic axis and neckline are computed from the original
     boundary-distance bottom.  The skeleton tip is then updated to the max-HKS
     vertex near ``final_tip_hks_time`` in the bottom fraction of the refined
     crypt axis, provided the HKS increase over the initial tip clears
-    ``final_tip_min_hks_percent_increase``. Transition-type crypt openings can
-    then be shortened from that updated tip if their circumference is too
-    broad relative to the crypt body. Split branches are retained only when
-    the accepted growth-ring neck is both narrower and deep enough to define a
-    distinct component.
+    ``final_tip_min_hks_percent_increase``. Circumference profiles classify
+    transitions and genuine constrictions. For barrier-aware runs, final
+    host-side boundaries come from the first persistent geodesic-ring crossing
+    of the body or branch primitive; the resulting tip-connected regions then
+    drive graph and primitive construction.
     """
     from organograph.crypts.axis import compute_crypt_axis, normalize_crypt_axis_to_neckline
     from organograph.crypts.filters import apply_filters
@@ -113,6 +122,35 @@ def detect_crypts_for_skeleton(
         if smooth_mesh
         else mesh
     )
+
+    # The body estimate is deliberately independent of HKS candidates. Fitting
+    # it first avoids candidate-dependent circularity and lets the resulting
+    # ownership field constrain every subsequent segmentation stage.
+    body_barrier_info = None
+    if body_barrier_ellipsoid:
+        body_barrier_fit = fit_soft_barrier_primitive_sampled(
+            detection_mesh.v,
+            detection_mesh.f,
+            config=body_barrier_config,
+            require_inside_center=True,
+            sample_fraction=body_barrier_sample_fraction,
+            random_seed=body_barrier_sample_seed,
+        )
+        body_barrier_mask = villus_mask_from_barrier_primitive(
+            detection_mesh.v,
+            body_barrier_fit,
+            relative_height_threshold=body_barrier_relative_height_threshold,
+        )
+        body_barrier_info = {
+            "enabled": True,
+            "fit_stage": "before_hks_candidate_detection",
+            "fit": body_barrier_fit,
+            "mask": body_barrier_mask,
+            "relative_height_threshold": float(body_barrier_relative_height_threshold),
+            "min_candidate_vertices": int(body_barrier_min_candidate_vertices),
+            "sample_fraction": float(body_barrier_sample_fraction),
+            "sample_seed": body_barrier_sample_seed,
+        }
 
     parents, enc_vars = detect_crypts_by_encoding(
         vocab,
@@ -133,6 +171,8 @@ def detect_crypts_for_skeleton(
         "normalised_hks_segment": enc_vars.get("norm_hks"),
         "vertex_areas": np.asarray(detection_mesh.vertex_areas(), float),
     }
+    if body_barrier_info is not None:
+        seg_vars["body_barrier_ellipsoid"] = body_barrier_info
     if filter_fn_list is not None:
         parents, filter_info, keep_idx = apply_filters(
             parents,
@@ -143,39 +183,19 @@ def detect_crypts_for_skeleton(
         seg_vars["filter_info_initial"] = filter_info
         seg_vars["keep_idx_initial"] = keep_idx
 
-    body_barrier_info = None
-    if body_barrier_ellipsoid:
+    if body_barrier_info is not None:
         raw_candidate_sizes = [int(len(patch)) for patch in parents]
-        body_barrier_fit = fit_soft_barrier_ellipsoid_sampled(
-            detection_mesh.v,
-            detection_mesh.f,
-            config=body_barrier_config,
-            require_inside_center=True,
-            sample_fraction=body_barrier_sample_fraction,
-            random_seed=body_barrier_sample_seed,
-        )
-        body_barrier_mask = villus_mask_from_ellipsoid(
-            detection_mesh.v,
-            body_barrier_fit,
-            relative_height_threshold=body_barrier_relative_height_threshold,
-        )
         parents, body_barrier_patch_info = protect_patches_from_mask(
             parents,
-            body_barrier_mask,
+            body_barrier_info["mask"],
             min_vertices=body_barrier_min_candidate_vertices,
         )
-        body_barrier_info = {
-            "enabled": True,
-            "fit": body_barrier_fit,
-            "mask": body_barrier_mask,
-            "relative_height_threshold": float(body_barrier_relative_height_threshold),
-            "min_candidate_vertices": int(body_barrier_min_candidate_vertices),
-            "sample_fraction": float(body_barrier_sample_fraction),
-            "sample_seed": body_barrier_sample_seed,
-            "raw_candidate_sizes": raw_candidate_sizes,
-            "patch_filter_info": body_barrier_patch_info,
-        }
-        seg_vars["body_barrier_ellipsoid"] = body_barrier_info
+        body_barrier_info.update(
+            {
+                "raw_candidate_sizes": raw_candidate_sizes,
+                "patch_filter_info": body_barrier_patch_info,
+            }
+        )
 
     if len(parents) == 0:
         intermediates = {
@@ -510,6 +530,59 @@ def detect_crypts_for_skeleton(
             min_attachment_level=body_transition_min_attachment_level,
             window_length=neck_window_length,
             polyorder=neck_polyorder,
+        )
+
+    if body_barrier_info is not None:
+        crossing_config = dict(barrier_crossing_kwargs or {})
+        crossing_config.setdefault("max_axis_level", float(extend_max))
+        if barrier_boundary_attachments:
+            detections = assign_crypt_attachments_from_barrier_crossings(
+                detection_mesh.v,
+                detection_mesh.f,
+                detections,
+                body_barrier_info["fit"],
+                crossing_kwargs=crossing_config,
+                assign_body_roots=True,
+                assign_branch_daughters=False,
+            )
+
+        branch_fits, branch_masks, branch_fit_info = fit_branch_barrier_primitives(
+            detection_mesh.v,
+            detections,
+            body_barrier_info["mask"],
+            config=branch_barrier_config,
+            relative_height_threshold=branch_barrier_relative_height_threshold,
+            min_vertices=branch_barrier_min_candidate_vertices,
+            sample_fraction=body_barrier_sample_fraction,
+            random_seed=body_barrier_sample_seed,
+        )
+        protected_mask = np.asarray(body_barrier_info["mask"], dtype=bool).copy()
+        for branch_mask in branch_masks.values():
+            protected_mask |= np.asarray(branch_mask, dtype=bool)
+
+        if barrier_boundary_attachments:
+            detections = assign_crypt_attachments_from_barrier_crossings(
+                detection_mesh.v,
+                detection_mesh.f,
+                detections,
+                body_barrier_info["fit"],
+                branch_fits=branch_fits,
+                crossing_kwargs=crossing_config,
+                assign_body_roots=False,
+                assign_branch_daughters=True,
+            )
+        body_barrier_info.update(
+            {
+                "branch_fits": branch_fits,
+                "branch_masks": branch_masks,
+                "branch_fit_info": branch_fit_info,
+                "branch_relative_height_threshold": float(
+                    branch_barrier_relative_height_threshold
+                ),
+                "protected_mask": protected_mask,
+                "boundary_attachments_enabled": bool(barrier_boundary_attachments),
+                "crossing_config": crossing_config,
+            }
         )
 
     intermediates = {

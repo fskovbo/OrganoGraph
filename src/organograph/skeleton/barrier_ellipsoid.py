@@ -1,10 +1,10 @@
-"""Soft-barrier ellipsoid helpers for experimental body/branch ownership.
+"""Soft-barrier blob helpers for experimental body/branch ownership.
 
-The fitted ellipsoid is intended as an initial body/branch estimate before the
-more expressive primitive layer.  It treats the mesh as a soft barrier: placing
-the ellipsoid outside the observed surface is penalized more strongly than
-underfilling it.  The resulting relative radial height field can protect body
-or branch vertices from later crypt component assignment.
+The fitted ellipsoid or superellipsoid is intended as an initial body/branch
+estimate before the more expressive primitive layer. It treats the mesh as a
+soft barrier: placing the primitive outside the observed surface is penalized
+more strongly than underfilling it. The resulting relative radial height field
+can protect body or branch vertices from later crypt component assignment.
 """
 
 from __future__ import annotations
@@ -21,8 +21,14 @@ from organograph.skeleton.geometry import as_points, face_areas
 
 @dataclass
 class SoftBarrierEllipsoidConfig:
-    """Settings for PCA-frame soft-barrier ellipsoid fitting."""
+    """Settings for PCA-frame soft-barrier blob fitting.
 
+    ``primitive_type="superellipsoid"`` releases one axial shape exponent
+    while keeping the equatorial exponent fixed. Values of ``epsilon_1`` below
+    one create fuller sides and flatter ends than an ellipsoid.
+    """
+
+    primitive_type: str = "ellipsoid"
     barrier_weight: float = 100.0
     underfill_weight: float = 0.4
     center_regularization: float = 0.02
@@ -33,6 +39,10 @@ class SoftBarrierEllipsoidConfig:
     min_radius_span_fraction: float = 0.02
     radius_lower_frac: float = 0.25
     radius_upper_max_frac: float = 1.35
+    initial_epsilon_1: float = 1.0
+    epsilon_1_bounds: tuple[float, float] = (0.35, 1.0)
+    epsilon_1_regularization: float = 0.05
+    epsilon_2: float = 1.0
     maxiter: int = 1200
     use_powell_retry: bool = True
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -40,11 +50,15 @@ class SoftBarrierEllipsoidConfig:
 
 @dataclass
 class SoftBarrierEllipsoidFit:
-    """Fitted ellipsoid plus diagnostic fields."""
+    """Fitted soft-barrier ellipsoid or symmetric superellipsoid."""
 
     center: np.ndarray
     axes: np.ndarray
     radii: np.ndarray
+    primitive_type: str = "ellipsoid"
+    epsilon_1: float = 1.0
+    epsilon_2: float = 1.0
+    initial_epsilon_1: float = 1.0
     solid_center_of_mass: np.ndarray | None = None
     solid_volume: float | None = None
     center0: np.ndarray | None = None
@@ -60,13 +74,21 @@ class SoftBarrierEllipsoidFit:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_primitive_parameters(self) -> dict[str, Any]:
-        return {
+        parameters = {
             "center": self.center,
             "orientation": self.axes,
             "axis_lengths": self.radii,
             "axis_quantile": self.metadata.get("initial_radius_quantile"),
-            "fit_family": "soft_barrier_ellipsoid",
+            "fit_family": f"soft_barrier_{self.primitive_type}",
         }
+        if self.primitive_type == "superellipsoid":
+            parameters.update(
+                {
+                    "epsilon_1": float(self.epsilon_1),
+                    "epsilon_2": float(self.epsilon_2),
+                }
+            )
+        return parameters
 
     def to_dict(self) -> dict[str, Any]:
         def convert(value):
@@ -82,6 +104,10 @@ class SoftBarrierEllipsoidFit:
             "center": convert(self.center),
             "axes": convert(self.axes),
             "radii": convert(self.radii),
+            "primitive_type": self.primitive_type,
+            "epsilon_1": float(self.epsilon_1),
+            "epsilon_2": float(self.epsilon_2),
+            "initial_epsilon_1": float(self.initial_epsilon_1),
             "solid_center_of_mass": convert(self.solid_center_of_mass),
             "solid_volume": convert(self.solid_volume),
             "center0": convert(self.center0),
@@ -239,6 +265,45 @@ def ellipsoid_level(points, center, axes, radii) -> np.ndarray:
     return np.sqrt(np.sum((local / np.maximum(radii[None, :], 1e-12)) ** 2, axis=1))
 
 
+def superellipsoid_level(
+    points,
+    center,
+    axes,
+    radii,
+    *,
+    epsilon_1: float,
+    epsilon_2: float = 1.0,
+) -> np.ndarray:
+    """Return the homogeneous radial level of a symmetric superellipsoid."""
+    local = (
+        as_points(points) - np.asarray(center, dtype=float)[None, :]
+    ) @ np.asarray(axes, dtype=float)
+    scaled = np.abs(local) / np.maximum(np.asarray(radii, dtype=float)[None, :], 1e-12)
+    epsilon_1 = max(float(epsilon_1), 1e-6)
+    epsilon_2 = max(float(epsilon_2), 1e-6)
+    xy = (
+        scaled[:, 0] ** (2.0 / epsilon_2)
+        + scaled[:, 1] ** (2.0 / epsilon_2)
+    ) ** (epsilon_2 / epsilon_1)
+    return (
+        xy + scaled[:, 2] ** (2.0 / epsilon_1)
+    ) ** (epsilon_1 / 2.0)
+
+
+def barrier_primitive_level(points, fit: SoftBarrierEllipsoidFit) -> np.ndarray:
+    """Evaluate the fitted primitive's dimensionless radial level."""
+    if fit.primitive_type == "superellipsoid":
+        return superellipsoid_level(
+            points,
+            fit.center,
+            fit.axes,
+            fit.radii,
+            epsilon_1=fit.epsilon_1,
+            epsilon_2=fit.epsilon_2,
+        )
+    return ellipsoid_level(points, fit.center, fit.axes, fit.radii)
+
+
 def project_points_to_ellipsoid(points, center, axes, radii) -> tuple[np.ndarray, np.ndarray]:
     points = as_points(points)
     center = np.asarray(center, dtype=float)
@@ -251,14 +316,22 @@ def project_points_to_ellipsoid(points, center, axes, radii) -> tuple[np.ndarray
     return center[None, :] + projected_local @ axes.T, level
 
 
+def barrier_primitive_vertices_like_mesh(
+    vertices,
+    fit: SoftBarrierEllipsoidFit,
+) -> np.ndarray:
+    """Radially project mesh vertices onto a fitted barrier primitive."""
+    vertices = as_points(vertices)
+    center = np.asarray(fit.center, dtype=float)
+    local = (vertices - center[None, :]) @ np.asarray(fit.axes, dtype=float)
+    level = np.maximum(barrier_primitive_level(vertices, fit), np.finfo(float).eps)
+    projected_local = local / level[:, None]
+    return center[None, :] + projected_local @ np.asarray(fit.axes, dtype=float).T
+
+
 def ellipsoid_vertices_like_mesh(vertices, fit: SoftBarrierEllipsoidFit) -> np.ndarray:
-    projected, _ = project_points_to_ellipsoid(
-        vertices,
-        fit.center,
-        fit.axes,
-        fit.radii,
-    )
-    return projected
+    """Backward-compatible alias for barrier primitive projection."""
+    return barrier_primitive_vertices_like_mesh(vertices, fit)
 
 
 def sampled_vertex_indices(
@@ -380,14 +453,10 @@ def fit_soft_barrier_ellipsoid_sampled(
 
 
 def relative_height_field(vertices, fit: SoftBarrierEllipsoidFit) -> dict[str, np.ndarray]:
-    """Return relative radial level and signed height over the ellipsoid."""
-    projected, level = project_points_to_ellipsoid(
-        vertices,
-        fit.center,
-        fit.axes,
-        fit.radii,
-    )
+    """Return relative radial level and signed height over the fitted blob."""
     vertices = as_points(vertices)
+    level = barrier_primitive_level(vertices, fit)
+    projected = barrier_primitive_vertices_like_mesh(vertices, fit)
     signed_height = np.sign(level - 1.0) * np.linalg.norm(vertices - projected, axis=1)
     return {
         "level": level,
@@ -406,12 +475,17 @@ def fit_soft_barrier_ellipsoid(
     center0=None,
     axes=None,
 ) -> SoftBarrierEllipsoidFit:
-    """Fit a soft-barrier ellipsoid to mesh vertices or a point component."""
+    """Fit a soft-barrier ellipsoid or superellipsoid to a component."""
     vertices = as_points(vertices)
     if vertices.shape[0] < 4:
         raise ValueError("At least four points are required for ellipsoid fitting")
     if not isinstance(config, SoftBarrierEllipsoidConfig):
         config = SoftBarrierEllipsoidConfig(**dict(config or {}))
+    primitive_type = str(config.primitive_type).lower()
+    if primitive_type not in {"ellipsoid", "superellipsoid"}:
+        raise ValueError(
+            "Soft barrier primitive_type must be 'ellipsoid' or 'superellipsoid'"
+        )
     if weights is None:
         if faces is not None:
             weights = vertex_areas_from_faces(vertices, faces)
@@ -465,15 +539,40 @@ def fit_soft_barrier_ellipsoid(
     area_weights = weights / max(float(np.sum(weights)), np.finfo(float).eps)
     shift_limit = float(config.center_shift_limit_frac) * initial_radii
 
+    epsilon_lo, epsilon_hi = map(float, config.epsilon_1_bounds)
+    if not (0.0 < epsilon_lo <= epsilon_hi):
+        raise ValueError("epsilon_1_bounds must satisfy 0 < lower <= upper")
+    initial_epsilon_1 = float(
+        np.clip(config.initial_epsilon_1, epsilon_lo, epsilon_hi)
+    )
+    epsilon_2 = float(config.epsilon_2)
+    if not np.isfinite(epsilon_2) or epsilon_2 <= 0.0:
+        raise ValueError("epsilon_2 must be finite and positive")
+
     def unpack(params):
         shift_local = params[:3]
-        radii = np.exp(params[3:])
+        radii = np.exp(params[3:6])
+        epsilon_1 = (
+            float(params[6])
+            if primitive_type == "superellipsoid"
+            else 1.0
+        )
         center = center0 + shift_local @ axes.T
-        return center, radii, shift_local
+        return center, radii, shift_local, epsilon_1
 
     def objective(params):
-        center, radii, shift_local = unpack(params)
-        level = ellipsoid_level(vertices, center, axes, radii)
+        center, radii, shift_local, epsilon_1 = unpack(params)
+        if primitive_type == "superellipsoid":
+            level = superellipsoid_level(
+                vertices,
+                center,
+                axes,
+                radii,
+                epsilon_1=epsilon_1,
+                epsilon_2=epsilon_2,
+            )
+        else:
+            level = ellipsoid_level(vertices, center, axes, radii)
         residual = level - 1.0
         residual_weights = np.where(
             residual < 0.0,
@@ -489,7 +588,12 @@ def fit_soft_barrier_ellipsoid(
         anisotropy_loss = float(config.anisotropy_regularization) * float(
             np.mean((log_radii - np.mean(log_radii)) ** 2)
         )
-        return float(data_loss + shift_loss + anisotropy_loss)
+        exponent_loss = 0.0
+        if primitive_type == "superellipsoid":
+            exponent_loss = float(config.epsilon_1_regularization) * (
+                epsilon_1 - 1.0
+            ) ** 2
+        return float(data_loss + shift_loss + anisotropy_loss + exponent_loss)
 
     x0 = np.r_[np.zeros(3), np.log(initial_radii)]
     bounds = [(-shift_limit[i], shift_limit[i]) for i in range(3)]
@@ -500,6 +604,9 @@ def fit_soft_barrier_ellipsoid(
         )
         for i in range(3)
     ]
+    if primitive_type == "superellipsoid":
+        x0 = np.r_[x0, initial_epsilon_1]
+        bounds.append((epsilon_lo, epsilon_hi))
     result = minimize(
         objective,
         x0,
@@ -517,11 +624,15 @@ def fit_soft_barrier_ellipsoid(
         )
         if retry.success or retry.fun <= result.fun * (1.0 + 1e-5):
             result = retry
-    center, radii, shift_local = unpack(result.x)
+    center, radii, shift_local, epsilon_1 = unpack(result.x)
     return SoftBarrierEllipsoidFit(
         center=center,
         axes=axes,
         radii=radii,
+        primitive_type=primitive_type,
+        epsilon_1=epsilon_1,
+        epsilon_2=epsilon_2 if primitive_type == "superellipsoid" else 1.0,
+        initial_epsilon_1=initial_epsilon_1,
         solid_center_of_mass=solid_com,
         solid_volume=solid_volume,
         center0=center0,
@@ -535,14 +646,27 @@ def fit_soft_barrier_ellipsoid(
         nfev=getattr(result, "nfev", None),
         nit=getattr(result, "nit", None),
         metadata={
-            "fit_method": "soft_barrier_ellipsoid",
+            "fit_method": f"soft_barrier_{primitive_type}",
+            "primitive_type": primitive_type,
             "initial_radius_quantile": q,
             "anisotropy_regularization": float(config.anisotropy_regularization),
+            "epsilon_1_regularization": float(config.epsilon_1_regularization),
+            "epsilon_1_bounds": (epsilon_lo, epsilon_hi),
             "n_points": int(vertices.shape[0]),
             "has_faces": faces is not None,
             **dict(config.metadata),
         },
     )
+
+
+def fit_soft_barrier_primitive(*args, **kwargs) -> SoftBarrierEllipsoidFit:
+    """Fit the barrier primitive family selected by the supplied config."""
+    return fit_soft_barrier_ellipsoid(*args, **kwargs)
+
+
+def fit_soft_barrier_primitive_sampled(*args, **kwargs) -> SoftBarrierEllipsoidFit:
+    """Sampled variant of :func:`fit_soft_barrier_primitive`."""
+    return fit_soft_barrier_ellipsoid_sampled(*args, **kwargs)
 
 
 def villus_mask_from_ellipsoid(
@@ -551,9 +675,241 @@ def villus_mask_from_ellipsoid(
     *,
     relative_height_threshold: float = 1.05,
 ) -> np.ndarray:
-    """Return vertices whose radial level is within the ellipsoid threshold."""
+    """Return vertices within a fitted barrier primitive threshold."""
     level = relative_height_field(vertices, fit)["level"]
     return np.isfinite(level) & (level <= float(relative_height_threshold))
+
+
+def villus_mask_from_barrier_primitive(
+    vertices,
+    fit: SoftBarrierEllipsoidFit,
+    *,
+    relative_height_threshold: float = 1.05,
+) -> np.ndarray:
+    """Family-neutral alias for the protected body/branch mask."""
+    return villus_mask_from_ellipsoid(
+        vertices,
+        fit,
+        relative_height_threshold=relative_height_threshold,
+    )
+
+
+def fit_branch_barrier_primitives(
+    vertices,
+    detections: list[dict[str, Any]],
+    body_mask,
+    *,
+    config: SoftBarrierEllipsoidConfig | dict[str, Any] | None = None,
+    relative_height_threshold: float = 1.05,
+    min_vertices: int = 20,
+    sample_fraction: float = 1.0,
+    random_seed: int | None = 0,
+) -> tuple[
+    dict[str, SoftBarrierEllipsoidFit],
+    dict[str, np.ndarray],
+    list[dict[str, Any]],
+]:
+    """Fit one barrier primitive to each accepted split-branch component.
+
+    The initial split parent supplies the branch support. Daughter candidate
+    patches and body-owned vertices are removed before fitting, so the branch
+    estimate is not inflated by the crypts it hosts. If that strict support is
+    too small, the body-trimmed parent region is used as a documented fallback.
+    """
+    from organograph.skeleton.primitive.components import (
+        component_region_from_detection,
+    )
+
+    vertices = as_points(vertices)
+    n_vertices = int(vertices.shape[0])
+    body_mask = np.asarray(body_mask, dtype=bool).reshape(-1)
+    if body_mask.size != n_vertices:
+        raise ValueError("body_mask must contain one value per mesh vertex")
+
+    fits: dict[str, SoftBarrierEllipsoidFit] = {}
+    masks: dict[str, np.ndarray] = {}
+    diagnostics: list[dict[str, Any]] = []
+    for detection in detections:
+        daughters = detection.get("daughters") or []
+        if not daughters:
+            continue
+        crypt_id = detection.get("crypt_id")
+        branch_id = f"crypt_{crypt_id}_branch"
+        parent_region = component_region_from_detection(detection, n_vertices)
+        parent_region = parent_region[
+            (parent_region >= 0) & (parent_region < n_vertices)
+        ]
+        body_trimmed = parent_region[~body_mask[parent_region]]
+
+        daughter_vertices: set[int] = set()
+        for daughter in daughters:
+            patch = _coerce_indices(daughter.get("crypt_vertices"))
+            daughter_vertices.update(
+                int(vertex)
+                for vertex in patch
+                if 0 <= int(vertex) < n_vertices
+            )
+        candidate = np.asarray(
+            [
+                int(vertex)
+                for vertex in body_trimmed
+                if int(vertex) not in daughter_vertices
+            ],
+            dtype=np.int64,
+        )
+        support_source = "parent_minus_body_and_daughter_candidates"
+        if candidate.size < int(min_vertices):
+            candidate = np.unique(body_trimmed).astype(np.int64)
+            support_source = "body_trimmed_parent_fallback"
+
+        record = {
+            "branch_id": branch_id,
+            "fit": False,
+            "reason": "insufficient_branch_vertices",
+            "support_source": support_source,
+            "n_parent_vertices": int(parent_region.size),
+            "n_body_trimmed_vertices": int(body_trimmed.size),
+            "n_candidate_vertices": int(candidate.size),
+        }
+        if candidate.size < int(min_vertices):
+            diagnostics.append(record)
+            continue
+
+        fit = fit_soft_barrier_primitive_sampled(
+            vertices[candidate],
+            faces=None,
+            config=config,
+            require_inside_center=False,
+            sample_fraction=sample_fraction,
+            random_seed=random_seed,
+        )
+        candidate_level = barrier_primitive_level(vertices[candidate], fit)
+        local_mask = np.isfinite(candidate_level) & (
+            candidate_level <= float(relative_height_threshold)
+        )
+        branch_mask = np.zeros(n_vertices, dtype=bool)
+        branch_mask[candidate[local_mask]] = True
+        fits[branch_id] = fit
+        masks[branch_id] = branch_mask
+        record.update(
+            {
+                "fit": True,
+                "reason": "fit_complete",
+                "n_mask_vertices": int(np.count_nonzero(branch_mask)),
+                "fit_success": bool(fit.success),
+            }
+        )
+        diagnostics.append(record)
+    return fits, masks, diagnostics
+
+
+def project_crypt_attachments_to_barrier_surfaces(
+    detections: list[dict[str, Any]],
+    body_fit: SoftBarrierEllipsoidFit,
+    *,
+    branch_fits: dict[str, SoftBarrierEllipsoidFit] | None = None,
+    surface_level: float = 1.0,
+    inside_tolerance: float = 1e-6,
+    metadata_key: str = "barrier_attachment_projection",
+) -> list[dict[str, Any]]:
+    """Move terminal crypt attachments out to their host primitive surface.
+
+    Top-level terminal crypts use ``body_fit``. Daughters of an accepted split
+    use the branch fit keyed by their parent branch node id. Split-parent
+    body-to-branch junctions are intentionally left unchanged. Constriction and
+    tip positions remain fixed; subsequent graph and primitive construction
+    recomputes crypt waypoints and smooth centerlines from the corrected
+    attachment geometry.
+    """
+    level_target = float(surface_level)
+    if not np.isfinite(level_target) or level_target <= 0.0:
+        raise ValueError("surface_level must be finite and positive")
+    tolerance = max(float(inside_tolerance), 0.0)
+    branch_fits = dict(branch_fits or {})
+    out = copy.deepcopy(detections)
+
+    def refine_terminal(det, host_fit, *, host_id: str):
+        metadata = dict(det.get("metadata", {}))
+        attachment = det.get("attachment_position")
+        diagnostics = {
+            "applied": False,
+            "moved": False,
+            "reason": "not_evaluated",
+            "host_id": str(host_id),
+            "host_primitive_type": None if host_fit is None else host_fit.primitive_type,
+            "surface_level": level_target,
+            "original_level": None,
+            "final_level": None,
+            "displacement": 0.0,
+        }
+        if host_fit is None:
+            diagnostics["reason"] = "missing_host_barrier_primitive"
+            metadata[metadata_key] = diagnostics
+            det["metadata"] = metadata
+            return
+        if attachment is None:
+            diagnostics["reason"] = "missing_attachment_position"
+            metadata[metadata_key] = diagnostics
+            det["metadata"] = metadata
+            return
+
+        point = np.asarray(attachment, dtype=float)
+        if point.shape != (3,) or not np.all(np.isfinite(point)):
+            diagnostics["reason"] = "invalid_attachment_position"
+            metadata[metadata_key] = diagnostics
+            det["metadata"] = metadata
+            return
+        level = float(barrier_primitive_level(point[None, :], host_fit)[0])
+        diagnostics.update({"applied": True, "original_level": level})
+        if not np.isfinite(level):
+            diagnostics["reason"] = "invalid_barrier_level"
+        elif level >= level_target - tolerance:
+            diagnostics.update(
+                {
+                    "reason": "attachment_not_inside_host_primitive",
+                    "final_level": level,
+                }
+            )
+        elif level <= np.finfo(float).eps:
+            diagnostics["reason"] = "attachment_at_host_center"
+        else:
+            center = np.asarray(host_fit.center, dtype=float)
+            projected = center + (level_target / level) * (point - center)
+            final_level = float(
+                barrier_primitive_level(projected[None, :], host_fit)[0]
+            )
+            det["attachment_position"] = projected
+            profile = det.get("neck_profile")
+            if not isinstance(profile, dict) or profile.get("kind") != "constriction":
+                det["neck_position"] = projected
+            diagnostics.update(
+                {
+                    "moved": True,
+                    "reason": "projected_to_host_primitive_surface",
+                    "final_level": final_level,
+                    "original_position": point,
+                    "projected_position": projected,
+                    "displacement": float(np.linalg.norm(projected - point)),
+                }
+            )
+        metadata[metadata_key] = diagnostics
+        det["metadata"] = metadata
+
+    for detection in out:
+        daughters = detection.get("daughters") or []
+        if daughters:
+            crypt_id = detection.get("crypt_id")
+            branch_node_id = f"crypt_{crypt_id}_branch"
+            branch_fit = branch_fits.get(branch_node_id)
+            for daughter in daughters:
+                refine_terminal(
+                    daughter,
+                    branch_fit,
+                    host_id=branch_node_id,
+                )
+            continue
+        refine_terminal(detection, body_fit, host_id="body")
+    return out
 
 
 def protect_patches_from_mask(

@@ -49,6 +49,7 @@ EDGE_COLORS = {
 
 PRIMITIVE_COLORS = {
     "ellipsoid": "#4c78a8",
+    "superellipsoid": "#4c78a8",
     "superellipsoid_placeholder": "#4c78a8",
     "asymmetric_superellipsoid": "#4c78a8",
     "tapered_capped_tube": "#72b7b2",
@@ -484,6 +485,17 @@ def _asymmetric_superellipsoid_surface(parameters, *, n_u=32, n_v=16):
     return xyz, np.asarray(faces, dtype=np.int64)
 
 
+def _superellipsoid_surface(parameters, *, n_u=32, n_v=16):
+    """Render a centered superellipsoid with symmetric directional axes."""
+    axes = np.asarray(parameters["axis_lengths"], dtype=float)
+    symmetric = {
+        **parameters,
+        "axis_lengths_negative": axes,
+        "axis_lengths_positive": axes,
+    }
+    return _asymmetric_superellipsoid_surface(symmetric, n_u=n_u, n_v=n_v)
+
+
 def _polyline_point_at_s(centerline, s):
     centerline = np.asarray(centerline, dtype=float)
     lengths, cumulative, total = polyline_lengths(centerline)
@@ -679,6 +691,12 @@ def _primitive_mesh(attachment, *, n_s=32, n_theta=16):
     primitive_type = attachment.primitive_type
     if primitive_type in {"ellipsoid", "superellipsoid_placeholder"}:
         return _ellipsoid_surface(attachment.parameters, n_u=n_theta * 2, n_v=n_s)
+    if primitive_type == "superellipsoid":
+        return _superellipsoid_surface(
+            attachment.parameters,
+            n_u=n_theta * 2,
+            n_v=n_s,
+        )
     if primitive_type == "asymmetric_superellipsoid":
         return _asymmetric_superellipsoid_surface(
             attachment.parameters,

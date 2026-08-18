@@ -54,4 +54,20 @@ host-boundary crossings are available through `skeleton.failed_attachments`;
 they are never hidden by the workflow.
 
 `notebooks/tutorial_skeleton.ipynb` is the maintained interactive example.
-`scripts/export_skeleton_primitives.py` applies the same workflow to datasets.
+`scripts/export_skeleton_primitives.py` applies the same workflow to the
+datasets and timepoints declared in its `DATASET_TIMEPOINTS` configuration. It
+writes one combined export beneath its configurable `EXPORT_ROOT`, retaining
+the source dataset in every sample path and manifest row.
+
+## Reconstructive export
+
+The tutorial and batch script share the maintained factories in `profiles.py`.
+`save_shape_export` writes the strict, compact `organograph_shape_v2` schema:
+sample identity and branch eligibility, reversible original/prepared coordinate
+transforms, graph nodes and edges, and only the primitive parameters needed to
+reconstruct the final visualization. Fit errors, detections, component masks,
+and derived descriptors are not exported.
+
+Crypt order is explicitly non-semantic. Downstream models must use graph
+identity and permutation-invariant crypt handling rather than PCA-angle slots.
+See `VAE_EXPORT_V2.md` for the OrganoidVAE integration contract.

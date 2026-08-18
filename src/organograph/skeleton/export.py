@@ -1,27 +1,30 @@
-"""Portable exports for skeleton and primitive fitting results.
+"""Minimal, reconstructive exports for final skeleton and primitive fits.
 
-The functions in this module deliberately keep two views of the same shape:
+The v2 export contains only identity/context, reversible coordinate transforms,
+graph topology, node positions, and the primitive degrees of freedom required
+to recreate the final visualization. Detection arrays, component ownership,
+residuals, and fitting objectives are intentionally excluded.
 
-1. a faithful JSON payload built from the graph/result containers; and
-2. flat CSV/NPZ tables that are easy to consume in a separate VAE project.
-
-The export schema avoids hard-coding individual primitive parameters.  New
-node fields, edge fields, primitive families, or metadata can be carried
-through JSON columns without changing the table layout.
+Crypt list order has no biological meaning. Consumers must use ``crypt_id`` and
+graph connectivity, or a permutation-invariant model, rather than list index.
 """
 
 from __future__ import annotations
 
-import csv
 import json
+import math
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from organograph.skeleton.datatypes import SkeletonGraph
+from organograph.skeleton.primitive_geometry import (
+    sample_cubic_bezier,
+    sample_quadratic_bezier,
+)
+from organograph.skeleton.primitives import PrimitiveAttachment
 from organograph.skeleton.results import (
     OrganoidShapeResult,
     PrimitiveFitResult,
@@ -29,41 +32,30 @@ from organograph.skeleton.results import (
 )
 
 
-SHAPE_EXPORT_SCHEMA_VERSION = "organograph_skeleton_primitives_v1"
-
-
-def json_safe(value: Any) -> Any:
-    """Convert common scientific Python values into JSON-compatible values."""
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
-    if isinstance(value, np.generic):
-        return value.item()
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, dict):
-        return {str(key): json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [json_safe(item) for item in value]
-    if callable(value):
-        return getattr(value, "__name__", str(value))
-    if hasattr(value, "to_dict"):
-        return json_safe(value.to_dict())
-    return str(value)
-
-
-def _json_string(value: Any) -> str:
-    return json.dumps(json_safe(value), sort_keys=True, separators=(",", ":"))
-
-
-def _now_utc() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+SHAPE_EXPORT_SCHEMA_VERSION = "organograph_shape_v2"
+_SAMPLE_FIELDS = (
+    "dataset",
+    "timepoint",
+    "well",
+    "organoid_id",
+    "label_uid",
+    "condition",
+    "replicate",
+    "age",
+    "cell_count",
+    "mesh_path",
+    "source_units",
+)
+_TUBE_TYPE = "tapered_capped_tube"
+_NECK_TYPE = "straight_cylinder"
 
 
 @dataclass
 class _CoercedShape:
     graph: SkeletonGraph
-    skeleton: SkeletonizationResult | None = None
-    primitives: PrimitiveFitResult | None = None
+    skeleton: SkeletonizationResult | None
+    primitives: PrimitiveFitResult | None
+    metadata: dict[str, Any]
 
 
 def _coerce_shape_result(
@@ -71,18 +63,22 @@ def _coerce_shape_result(
     *,
     primitive_result: PrimitiveFitResult | None = None,
 ) -> _CoercedShape:
+    result_metadata: dict[str, Any] = {}
     if isinstance(result, PrimitiveFitResult):
         primitives = result
         skeleton = result.skeleton
         graph = result.graph
+        result_metadata.update(result.metadata)
     elif isinstance(result, SkeletonizationResult):
         skeleton = result
         primitives = primitive_result
         graph = primitives.graph if primitives is not None else result.graph
+        result_metadata.update(result.metadata)
     elif isinstance(result, OrganoidShapeResult):
         skeleton = result.skeleton
         primitives = primitive_result if primitive_result is not None else result.primitives
         graph = primitives.graph if primitives is not None else result.graph
+        result_metadata.update(result.metadata)
     elif isinstance(result, SkeletonGraph):
         skeleton = None
         primitives = primitive_result
@@ -92,170 +88,280 @@ def _coerce_shape_result(
             "result must be a SkeletonGraph, SkeletonizationResult, "
             "PrimitiveFitResult, or OrganoidShapeResult"
         )
-    return _CoercedShape(graph=graph, skeleton=skeleton, primitives=primitives)
+    if skeleton is not None:
+        result_metadata.update(skeleton.metadata)
+    if primitives is not None:
+        result_metadata.update(primitives.metadata)
+    return _CoercedShape(graph, skeleton, primitives, result_metadata)
 
 
-def graph_summary(graph: SkeletonGraph) -> dict[str, Any]:
-    """Return small, stable counts useful for manifests and quick filtering."""
-    node_type_counts: dict[str, int] = {}
-    for node in graph.nodes.values():
-        node_type_counts[node.node_type] = node_type_counts.get(node.node_type, 0) + 1
-    primitive_type_counts: dict[str, int] = {}
-    primitive_attachments = all_primitive_attachment_records(graph)
-    for item in primitive_attachments:
-        attachment = item["attachment"]
-        primitive_type_counts[attachment.primitive_type] = (
-            primitive_type_counts.get(attachment.primitive_type, 0) + 1
+def _finite_json(value: Any, *, path: str = "root") -> Any:
+    """Return strict JSON values and reject every NaN or infinite number."""
+    if isinstance(value, np.generic):
+        value = value.item()
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError(f"Non-finite value at {path}: {value!r}")
+        return value
+    if isinstance(value, np.ndarray):
+        return _finite_json(value.tolist(), path=path)
+    if isinstance(value, dict):
+        return {
+            str(key): _finite_json(item, path=f"{path}.{key}")
+            for key, item in value.items()
+        }
+    if isinstance(value, set):
+        value = sorted(value, key=str)
+    if isinstance(value, (list, tuple)):
+        return [
+            _finite_json(item, path=f"{path}[{index}]")
+            for index, item in enumerate(value)
+        ]
+    raise TypeError(f"Unsupported export value at {path}: {type(value).__name__}")
+
+
+def _metadata_sources(coerced: _CoercedShape, metadata: dict[str, Any] | None):
+    sources = [coerced.metadata]
+    for source in list(sources):
+        record = source.get("record") if isinstance(source, dict) else None
+        if isinstance(record, dict):
+            sources.insert(0, record)
+        skeleton_metadata = source.get("skeleton_metadata") if isinstance(source, dict) else None
+        if isinstance(skeleton_metadata, dict):
+            nested_record = skeleton_metadata.get("record")
+            if isinstance(nested_record, dict):
+                sources.insert(0, nested_record)
+    if metadata:
+        sources.append(metadata)
+    return sources
+
+
+def _sample_record(
+    coerced: _CoercedShape,
+    metadata: dict[str, Any] | None,
+) -> dict[str, Any]:
+    sample: dict[str, Any] = {}
+    for source in _metadata_sources(coerced, metadata):
+        for key in _SAMPLE_FIELDS:
+            if key in source and source[key] is not None:
+                sample[key] = source[key]
+    n_branches = sum(node.node_type == "branch" for node in coerced.graph.nodes.values())
+    sample.update(
+        {
+            "has_branches": bool(n_branches),
+            "vae_eligible": not bool(n_branches),
+        }
+    )
+    return _finite_json(sample, path="sample")
+
+
+def _mesh_from_shape(coerced: _CoercedShape):
+    if coerced.primitives is not None and coerced.primitives.mesh is not None:
+        return coerced.primitives.mesh
+    if coerced.skeleton is not None:
+        return coerced.skeleton.mesh
+    return None
+
+
+def _coordinate_transform(coerced: _CoercedShape, sample: dict[str, Any]) -> dict[str, Any]:
+    mesh = _mesh_from_shape(coerced)
+    transform = getattr(mesh, "coord_transform", None) if mesh is not None else None
+    transform = dict(transform or {})
+
+    center = np.asarray(transform.get("center", np.zeros(3)), dtype=float)
+    center_applied = center.shape == (3,) and np.all(np.isfinite(center))
+    if not center_applied:
+        center = np.zeros(3, dtype=float)
+    scale = float(transform.get("scale", 1.0)) if center_applied else 1.0
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError("Mesh coordinate transform scale must be finite and positive")
+    rotation = np.asarray(transform.get("rotation", np.eye(3)), dtype=float)
+    rotation_applied = rotation.shape == (3, 3) and np.all(np.isfinite(rotation))
+    if not rotation_applied:
+        rotation = np.eye(3, dtype=float)
+    if not np.allclose(rotation @ rotation.T, np.eye(3), atol=1e-7):
+        raise ValueError("Mesh coordinate transform rotation must be orthonormal")
+
+    source_to_fitted = np.eye(4, dtype=float)
+    source_to_fitted[:3, :3] = rotation / scale
+    source_to_fitted[:3, 3] = -(rotation @ center) / scale
+    fitted_to_source = np.linalg.inv(source_to_fitted)
+    source_units = str(sample.get("source_units", "source_mesh_units"))
+    return _finite_json(
+        {
+            "source_coordinate_system": "original_mesh",
+            "fitted_coordinate_system": "prepared_mesh",
+            "center": center,
+            "scale": scale,
+            "rotation": rotation,
+            "center_applied": bool(center_applied),
+            "rotation_applied": bool(rotation_applied),
+            "source_to_fitted": source_to_fitted,
+            "fitted_to_source": fitted_to_source,
+            "source_units": source_units,
+            "fitted_units": "prepared_mesh_units",
+        },
+        path="coordinate_transform",
+    )
+
+
+def _skeleton_record(graph: SkeletonGraph) -> dict[str, Any]:
+    nodes = [
+        {
+            "node_id": node.node_id,
+            "node_type": node.node_type,
+            "crypt_id": node.crypt_id,
+            "position": node.position,
+        }
+        for node in graph.nodes.values()
+    ]
+    edges = [
+        {
+            "edge_id": edge.edge_id,
+            "source": edge.source,
+            "target": edge.target,
+            "edge_type": edge.edge_type,
+            "crypt_id": edge.crypt_id,
+        }
+        for edge in graph.edges.values()
+    ]
+    return _finite_json({"nodes": nodes, "edges": edges}, path="skeleton")
+
+
+def _all_attachments(graph: SkeletonGraph):
+    for node_id, node in graph.nodes.items():
+        if node.primitive_attachment is not None:
+            yield "node", node_id, node.primitive_attachment
+    for edge_id, edge in graph.edges.items():
+        if edge.primitive_attachment is not None:
+            yield "edge", edge_id, edge.primitive_attachment
+    for attachment_id, attachment in graph.primitive_attachments.items():
+        yield "graph", attachment_id, attachment
+
+
+def _curve_record(attachment: PrimitiveAttachment) -> dict[str, Any]:
+    parameters = attachment.parameters
+    metadata = attachment.metadata
+    centerline = np.asarray(parameters.get("centerline_points"), dtype=float)
+    controls = np.asarray(
+        metadata.get("centerline_control_points", centerline),
+        dtype=float,
+    )
+    method = str(metadata.get("centerline_method", ""))
+    if "cubic_bezier" in method or controls.shape[0] == 4:
+        curve_type = "cubic_bezier"
+    elif "quadratic_bezier" in method or controls.shape[0] == 3:
+        curve_type = "quadratic_bezier"
+    elif controls.shape[0] == 2:
+        curve_type = "line"
+    else:
+        curve_type = "polyline"
+    if controls.ndim != 2 or controls.shape[1] != 3 or controls.shape[0] < 2:
+        raise ValueError(
+            f"Primitive {attachment.attachment_id!r} has invalid centerline controls"
         )
+    n_samples = int(centerline.shape[0]) if centerline.ndim == 2 else 64
     return {
-        "n_nodes": int(len(graph.nodes)),
-        "n_edges": int(len(graph.edges)),
-        "n_crypts": int(len(graph.crypt_ids())),
-        "n_primitive_attachments": int(len(primitive_attachments)),
-        "n_graph_primitive_attachments": int(len(graph.primitive_attachments)),
-        "n_node_primitive_attachments": int(
-            sum(node.primitive_attachment is not None for node in graph.nodes.values())
-        ),
-        "n_edge_primitive_attachments": int(
-            sum(edge.primitive_attachment is not None for edge in graph.edges.values())
-        ),
-        "node_type_counts": node_type_counts,
-        "primitive_type_counts": primitive_type_counts,
+        "centerline_type": curve_type,
+        "centerline_control_points": controls,
+        "centerline_samples": max(2, n_samples),
     }
 
 
-def node_records(graph: SkeletonGraph) -> list[dict[str, Any]]:
-    """Return node rows with generic JSON columns for future extensibility."""
-    rows = []
-    for node in graph.nodes.values():
-        attachment = node.primitive_attachment
-        rows.append(
+def _compact_parameters(attachment: PrimitiveAttachment) -> dict[str, Any]:
+    primitive_type = str(attachment.primitive_type)
+    source = attachment.parameters
+    if primitive_type in {"ellipsoid", "superellipsoid"}:
+        out = {
+            "center": source["center"],
+            "orientation": source["orientation"],
+            "axis_lengths": source["axis_lengths"],
+        }
+        if primitive_type == "superellipsoid":
+            out["epsilon_1"] = source["epsilon_1"]
+            out["epsilon_2"] = source["epsilon_2"]
+        return out
+    if primitive_type == "asymmetric_superellipsoid":
+        return {
+            "center": source["center"],
+            "orientation": source["orientation"],
+            "axis_lengths_negative": source["axis_lengths_negative"],
+            "axis_lengths_positive": source["axis_lengths_positive"],
+            "epsilon_1": source["epsilon_1"],
+            "epsilon_2": source["epsilon_2"],
+        }
+    if primitive_type == _TUBE_TYPE:
+        r_tip = source["r_taper"] if "r_taper" in source else source["r_tip"]
+        return {
+            **_curve_record(attachment),
+            "r_neck": source["r_neck"],
+            "r_body": source["r_body"],
+            "r_tip": r_tip,
+            "s_body": source.get("s_body", 0.5),
+            "s_taper": source.get("s_taper", source.get("distal_taper_start", 0.85)),
+            "r_constriction": source.get("r_constriction"),
+            "s_constriction": source.get("s_constriction"),
+            "radius_profile": "shape_preserving_cubic_squared_radius_v1",
+        }
+    if primitive_type == _NECK_TYPE:
+        centerline = np.asarray(source["centerline_points"], dtype=float)
+        return {
+            "centerline_type": "line" if centerline.shape[0] == 2 else "polyline",
+            "centerline_control_points": centerline,
+            "radius": source["radius"],
+        }
+    raise ValueError(
+        f"Unsupported reconstructive primitive type {primitive_type!r}; "
+        "add an explicit v2 parameter adapter before exporting it"
+    )
+
+
+def _primitive_role(graph: SkeletonGraph, scope: str, owner_id: str, primitive_type: str) -> str:
+    if scope == "node" and owner_id in graph.nodes:
+        node_type = graph.node(owner_id).node_type
+        if node_type in {"body", "branch"}:
+            return node_type
+    if primitive_type == _TUBE_TYPE:
+        return "crypt"
+    if primitive_type == _NECK_TYPE:
+        return "body_branch_neck"
+    return "other"
+
+
+def _primitive_records(graph: SkeletonGraph) -> list[dict[str, Any]]:
+    records = []
+    for scope, owner_id, attachment in _all_attachments(graph):
+        primitive_id = attachment.attachment_id or str(owner_id)
+        records.append(
             {
-                "node_id": node.node_id,
-                "node_type": node.node_type,
-                "crypt_id": "" if node.crypt_id is None else str(node.crypt_id),
-                "x": float(node.position[0]),
-                "y": float(node.position[1]),
-                "z": float(node.position[2]),
-                "metadata_json": _json_string(node.metadata),
-                "primitive_attachment_json": _json_string(
-                    None if attachment is None else attachment.to_dict()
-                ),
-            }
-        )
-    return rows
-
-
-def edge_records(graph: SkeletonGraph) -> list[dict[str, Any]]:
-    """Return edge rows with generic JSON columns for future extensibility."""
-    rows = []
-    for edge in graph.edges.values():
-        attachment = edge.primitive_attachment
-        rows.append(
-            {
-                "edge_id": edge.edge_id,
-                "source": edge.source,
-                "target": edge.target,
-                "edge_type": edge.edge_type,
-                "crypt_id": "" if edge.crypt_id is None else str(edge.crypt_id),
-                "metadata_json": _json_string(edge.metadata),
-                "primitive_attachment_json": _json_string(
-                    None if attachment is None else attachment.to_dict()
-                ),
-            }
-        )
-    return rows
-
-
-def all_primitive_attachment_records(graph: SkeletonGraph) -> list[dict[str, Any]]:
-    """Return primitive attachments from nodes, edges, and graph-level paths."""
-    rows = []
-    for node_id, node in graph.nodes.items():
-        if node.primitive_attachment is None:
-            continue
-        rows.append(
-            {
-                "attachment_scope": "node",
-                "owner_id": str(node_id),
-                "attachment_id": node.primitive_attachment.attachment_id or str(node_id),
-                "attachment": node.primitive_attachment,
-            }
-        )
-    for edge_id, edge in graph.edges.items():
-        if edge.primitive_attachment is None:
-            continue
-        rows.append(
-            {
-                "attachment_scope": "edge",
-                "owner_id": str(edge_id),
-                "attachment_id": edge.primitive_attachment.attachment_id or str(edge_id),
-                "attachment": edge.primitive_attachment,
-            }
-        )
-    for attachment_id, attachment in graph.primitive_attachments.items():
-        rows.append(
-            {
-                "attachment_scope": "graph",
-                "owner_id": str(attachment_id),
-                "attachment_id": str(attachment_id),
-                "attachment": attachment,
-            }
-        )
-    return rows
-
-
-def primitive_records(graph: SkeletonGraph) -> list[dict[str, Any]]:
-    """Return primitive attachment rows from all graph locations.
-
-    Individual primitive parameters stay in JSON columns so new primitive
-    families do not require schema changes.
-    """
-    rows = []
-    for item in all_primitive_attachment_records(graph):
-        attachment = item["attachment"]
-        rows.append(
-            {
-                "attachment_scope": item["attachment_scope"],
-                "owner_id": item["owner_id"],
-                "attachment_id": str(item["attachment_id"]),
-                "attachment_type": "" if attachment.attachment_type is None else str(attachment.attachment_type),
+                "primitive_id": str(primitive_id),
                 "primitive_type": str(attachment.primitive_type),
-                "target_ids_json": _json_string(attachment.target_ids),
-                "fit_error": "" if attachment.fit_error is None else float(attachment.fit_error),
-                "parameters_json": _json_string(attachment.parameters),
-                "derived_parameters_json": _json_string(attachment.derived_parameters),
-                "residuals_json": _json_string(attachment.residuals),
-                "metadata_json": _json_string(attachment.metadata),
+                "role": _primitive_role(
+                    graph,
+                    scope,
+                    str(owner_id),
+                    str(attachment.primitive_type),
+                ),
+                "attachment_scope": scope,
+                "owner_id": str(owner_id),
+                "target_node_ids": [str(item) for item in attachment.target_ids],
+                "parameters": _compact_parameters(attachment),
             }
         )
-    return rows
+    return _finite_json(records, path="primitives")
 
 
-def component_summary(value: Any) -> Any:
-    """Compact component/intermediate arrays without exporting large meshes."""
-    if value is None:
-        return None
-    if isinstance(value, np.ndarray):
-        return {"shape": list(value.shape), "dtype": str(value.dtype)}
-    if isinstance(value, dict):
-        return {str(key): component_summary(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        if not value:
-            return []
-        if all(isinstance(item, (set, list, tuple, np.ndarray)) for item in value):
-            lengths = []
-            for item in value:
-                try:
-                    lengths.append(int(len(item)))
-                except TypeError:
-                    lengths.append(None)
-            return {"n_items": len(value), "item_lengths": lengths}
-        return [component_summary(item) for item in value]
-    if isinstance(value, set):
-        return {"n_items": len(value)}
-    if isinstance(value, (str, int, float, bool, np.generic)):
-        return json_safe(value)
-    return str(type(value).__name__)
+def graph_summary(graph: SkeletonGraph) -> dict[str, int]:
+    """Return stable counts for manifests and eligibility checks."""
+    return {
+        "n_nodes": len(graph.nodes),
+        "n_edges": len(graph.edges),
+        "n_crypts": sum(node.node_type == "tip" for node in graph.nodes.values()),
+        "n_branches": sum(node.node_type == "branch" for node in graph.nodes.values()),
+        "n_primitives": sum(1 for _ in _all_attachments(graph)),
+    }
 
 
 def shape_export_payload(
@@ -263,200 +369,315 @@ def shape_export_payload(
     *,
     primitive_result: PrimitiveFitResult | None = None,
     metadata: dict[str, Any] | None = None,
-    include_detections: bool = True,
-    include_intermediates: bool = False,
-    include_components: bool = False,
-    schema_version: str = SHAPE_EXPORT_SCHEMA_VERSION,
 ) -> dict[str, Any]:
-    """Build a portable JSON payload for one skeleton/primitive result."""
+    """Build one compact v2 payload from the final fitted primitive graph."""
     coerced = _coerce_shape_result(result, primitive_result=primitive_result)
-    graph = coerced.graph
-    skeleton = coerced.skeleton
-    primitives = coerced.primitives
-
-    merged_metadata: dict[str, Any] = {}
-    if skeleton is not None:
-        merged_metadata.update(skeleton.metadata)
-    if primitives is not None:
-        merged_metadata.update(primitives.metadata)
-    if metadata:
-        merged_metadata.update(metadata)
-
-    skeleton_payload: dict[str, Any] | None = None
-    if skeleton is not None:
-        skeleton_payload = {
-            "config": skeleton.config.to_dict(),
-            "metadata": dict(skeleton.metadata),
-        }
-        if include_detections:
-            skeleton_payload["detections"] = skeleton.detections
-        if include_intermediates:
-            skeleton_payload["intermediates"] = skeleton.intermediates
-
-    primitive_payload: dict[str, Any] | None = None
-    if primitives is not None:
-        primitive_payload = {
-            "config": primitives.config.to_dict(),
-            "metadata": dict(primitives.metadata),
-            "attachments": primitives.attachments,
-        }
-        if include_components:
-            primitive_payload["components"] = primitives.components
-        else:
-            primitive_payload["component_summary"] = component_summary(
-                primitives.components
-            )
-
-    return json_safe(
-        {
-            "schema_version": schema_version,
-            "created_at_utc": _now_utc(),
-            "metadata": merged_metadata,
-            "summary": graph_summary(graph),
-            "graph": graph.to_dict(),
-            "tables": {
-                "nodes": node_records(graph),
-                "edges": edge_records(graph),
-                "primitives": primitive_records(graph),
-            },
-            "skeletonization": skeleton_payload,
-            "primitive_fit": primitive_payload,
-        }
-    )
-
-
-def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    if not rows:
-        path.write_text("", encoding="utf-8")
-        return
-    fieldnames: list[str] = []
-    seen = set()
-    for row in rows:
-        for key in row:
-            if key not in seen:
-                fieldnames.append(key)
-                seen.add(key)
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def graph_arrays(graph: SkeletonGraph) -> dict[str, np.ndarray]:
-    """Return portable arrays for quick loading from NumPy."""
-    node_ids = list(graph.nodes)
-    node_index = {node_id: i for i, node_id in enumerate(node_ids)}
-    edge_ids = list(graph.edges)
-    primitive_items = all_primitive_attachment_records(graph)
-
-    edge_index = np.full((len(edge_ids), 2), -1, dtype=np.int64)
-    for i, edge_id in enumerate(edge_ids):
-        edge = graph.edge(edge_id)
-        edge_index[i, 0] = node_index.get(edge.source, -1)
-        edge_index[i, 1] = node_index.get(edge.target, -1)
-
-    fit_error = np.full(len(primitive_items), np.nan, dtype=np.float64)
-    for i, item in enumerate(primitive_items):
-        error = item["attachment"].fit_error
-        if error is not None:
-            fit_error[i] = float(error)
-
-    return {
-        "node_ids": np.asarray(node_ids, dtype=str),
-        "node_types": np.asarray(
-            [graph.node(node_id).node_type for node_id in node_ids],
-            dtype=str,
-        ),
-        "node_crypt_ids": np.asarray(
-            [
-                "" if graph.node(node_id).crypt_id is None else str(graph.node(node_id).crypt_id)
-                for node_id in node_ids
-            ],
-            dtype=str,
-        ),
-        "node_positions": np.asarray(
-            [graph.node(node_id).position for node_id in node_ids],
-            dtype=np.float64,
-        ).reshape(len(node_ids), 3),
-        "edge_ids": np.asarray(edge_ids, dtype=str),
-        "edge_sources": np.asarray(
-            [graph.edge(edge_id).source for edge_id in edge_ids],
-            dtype=str,
-        ),
-        "edge_targets": np.asarray(
-            [graph.edge(edge_id).target for edge_id in edge_ids],
-            dtype=str,
-        ),
-        "edge_types": np.asarray(
-            [graph.edge(edge_id).edge_type for edge_id in edge_ids],
-            dtype=str,
-        ),
-        "edge_crypt_ids": np.asarray(
-            [
-                "" if graph.edge(edge_id).crypt_id is None else str(graph.edge(edge_id).crypt_id)
-                for edge_id in edge_ids
-            ],
-            dtype=str,
-        ),
-        "edge_index": edge_index,
-        "primitive_attachment_ids": np.asarray(
-            [str(item["attachment_id"]) for item in primitive_items],
-            dtype=str,
-        ),
-        "primitive_attachment_scopes": np.asarray(
-            [str(item["attachment_scope"]) for item in primitive_items],
-            dtype=str,
-        ),
-        "primitive_owner_ids": np.asarray(
-            [str(item["owner_id"]) for item in primitive_items],
-            dtype=str,
-        ),
-        "primitive_types": np.asarray(
-            [
-                item["attachment"].primitive_type
-                for item in primitive_items
-            ],
-            dtype=str,
-        ),
-        "primitive_attachment_types": np.asarray(
-            [
-                ""
-                if item["attachment"].attachment_type is None
-                else str(item["attachment"].attachment_type)
-                for item in primitive_items
-            ],
-            dtype=str,
-        ),
-        "primitive_target_ids_json": np.asarray(
-            [
-                _json_string(item["attachment"].target_ids)
-                for item in primitive_items
-            ],
-            dtype=str,
-        ),
-        "primitive_parameters_json": np.asarray(
-            [
-                _json_string(item["attachment"].parameters)
-                for item in primitive_items
-            ],
-            dtype=str,
-        ),
-        "primitive_derived_parameters_json": np.asarray(
-            [
-                _json_string(item["attachment"].derived_parameters)
-                for item in primitive_items
-            ],
-            dtype=str,
-        ),
-        "primitive_residuals_json": np.asarray(
-            [
-                _json_string(item["attachment"].residuals)
-                for item in primitive_items
-            ],
-            dtype=str,
-        ),
-        "primitive_fit_error": fit_error,
+    sample = _sample_record(coerced, metadata)
+    payload = {
+        "schema_version": SHAPE_EXPORT_SCHEMA_VERSION,
+        "sample": sample,
+        "coordinate_transform": _coordinate_transform(coerced, sample),
+        "summary": graph_summary(coerced.graph),
+        "skeleton": _skeleton_record(coerced.graph),
+        "primitives": _primitive_records(coerced.graph),
     }
+    payload = _finite_json(payload)
+    validate_shape_export_payload(payload)
+    return payload
+
+
+def validate_shape_export_payload(payload: dict[str, Any]) -> None:
+    """Validate topology, transforms, primitive targets, and finite geometry."""
+    _finite_json(payload)
+    if payload.get("schema_version") != SHAPE_EXPORT_SCHEMA_VERSION:
+        raise ValueError(f"Expected schema {SHAPE_EXPORT_SCHEMA_VERSION!r}")
+    skeleton = payload.get("skeleton") or {}
+    nodes = skeleton.get("nodes") or []
+    edges = skeleton.get("edges") or []
+    node_ids = [str(node["node_id"]) for node in nodes]
+    if len(node_ids) != len(set(node_ids)):
+        raise ValueError("Skeleton export contains duplicate node IDs")
+    if sum(node.get("node_type") == "body" for node in nodes) != 1:
+        raise ValueError("Skeleton export must contain exactly one body node")
+    node_id_set = set(node_ids)
+    for node in nodes:
+        position = np.asarray(node["position"], dtype=float)
+        if position.shape != (3,) or not np.all(np.isfinite(position)):
+            raise ValueError(f"Node {node['node_id']!r} has an invalid position")
+    for edge in edges:
+        if str(edge["source"]) not in node_id_set or str(edge["target"]) not in node_id_set:
+            raise ValueError(f"Edge {edge['edge_id']!r} references a missing node")
+    primitives = payload.get("primitives") or []
+    primitive_ids = [str(item["primitive_id"]) for item in primitives]
+    if len(primitive_ids) != len(set(primitive_ids)):
+        raise ValueError("Shape export contains duplicate primitive IDs")
+    body_primitives = [item for item in primitives if item.get("role") == "body"]
+    if len(body_primitives) != 1:
+        raise ValueError("Final shape export must contain exactly one body primitive")
+    crypt_primitives = [item for item in primitives if item.get("role") == "crypt"]
+    tip_ids = {
+        str(node["node_id"])
+        for node in nodes
+        if node.get("node_type") == "tip"
+    }
+    targeted_tips = {
+        str(target)
+        for primitive in crypt_primitives
+        for target in primitive.get("target_node_ids") or []
+        if str(target) in tip_ids
+    }
+    if targeted_tips != tip_ids:
+        raise ValueError(
+            "Every crypt tip must be targeted by exactly one reconstructive crypt primitive"
+        )
+    if len(crypt_primitives) != len(tip_ids):
+        raise ValueError("Final shape export must contain one crypt primitive per tip")
+    for primitive in crypt_primitives:
+        primitive_tips = tip_ids.intersection(
+            map(str, primitive.get("target_node_ids") or [])
+        )
+        if len(primitive_tips) != 1:
+            raise ValueError(
+                f"Crypt primitive {primitive['primitive_id']!r} must target one tip"
+            )
+    for primitive in primitives:
+        missing = set(map(str, primitive.get("target_node_ids") or [])) - node_id_set
+        if missing:
+            raise ValueError(
+                f"Primitive {primitive['primitive_id']!r} targets missing nodes {sorted(missing)}"
+            )
+        parameters = primitive.get("parameters") or {}
+        primitive_type = primitive.get("primitive_type")
+        if primitive_type in {"ellipsoid", "superellipsoid"}:
+            _validate_blob_parameters(primitive, parameters, asymmetric=False)
+        elif primitive_type == "asymmetric_superellipsoid":
+            _validate_blob_parameters(primitive, parameters, asymmetric=True)
+        elif primitive_type == _TUBE_TYPE:
+            _validate_tube_parameters(primitive, parameters)
+        elif primitive_type == _NECK_TYPE:
+            _validate_neck_parameters(primitive, parameters)
+        else:
+            raise ValueError(
+                f"Unsupported primitive type in v2 payload: {primitive_type!r}"
+            )
+    transform = payload.get("coordinate_transform") or {}
+    forward = np.asarray(transform.get("source_to_fitted"), dtype=float)
+    inverse = np.asarray(transform.get("fitted_to_source"), dtype=float)
+    if forward.shape != (4, 4) or inverse.shape != (4, 4):
+        raise ValueError("Coordinate transforms must be 4x4 matrices")
+    if not np.allclose(forward @ inverse, np.eye(4), atol=1e-8):
+        raise ValueError("Coordinate transform matrices are not inverses")
+
+
+def _validate_blob_parameters(
+    primitive: dict[str, Any],
+    parameters: dict[str, Any],
+    *,
+    asymmetric: bool,
+) -> None:
+    primitive_id = primitive["primitive_id"]
+    center = np.asarray(parameters.get("center"), dtype=float)
+    orientation = np.asarray(parameters.get("orientation"), dtype=float)
+    if center.shape != (3,):
+        raise ValueError(f"Blob {primitive_id!r} center must be a 3-vector")
+    if orientation.shape != (3, 3) or not np.allclose(
+        orientation @ orientation.T, np.eye(3), atol=1e-6
+    ):
+        raise ValueError(f"Blob {primitive_id!r} orientation must be orthonormal")
+    axis_keys = (
+        ("axis_lengths_negative", "axis_lengths_positive")
+        if asymmetric
+        else ("axis_lengths",)
+    )
+    for key in axis_keys:
+        axes = np.asarray(parameters.get(key), dtype=float)
+        if axes.shape != (3,) or np.any(axes <= 0.0):
+            raise ValueError(f"Blob {primitive_id!r} {key} must contain three positive values")
+    for key in ("epsilon_1", "epsilon_2"):
+        if key in parameters and float(parameters[key]) <= 0.0:
+            raise ValueError(f"Blob {primitive_id!r} {key} must be positive")
+
+
+def _validate_curve(primitive_id: str, parameters: dict[str, Any]) -> None:
+    controls = np.asarray(parameters.get("centerline_control_points"), dtype=float)
+    curve_type = parameters.get("centerline_type")
+    expected = {"line": 2, "quadratic_bezier": 3, "cubic_bezier": 4}
+    if controls.ndim != 2 or controls.shape[1:] != (3,) or controls.shape[0] < 2:
+        raise ValueError(f"Primitive {primitive_id!r} has invalid centerline controls")
+    if curve_type in expected and controls.shape[0] != expected[curve_type]:
+        raise ValueError(
+            f"Primitive {primitive_id!r} {curve_type} requires "
+            f"{expected[curve_type]} controls"
+        )
+    if curve_type not in {*expected, "polyline"}:
+        raise ValueError(f"Primitive {primitive_id!r} has unknown centerline type")
+
+
+def _validate_tube_parameters(
+    primitive: dict[str, Any],
+    parameters: dict[str, Any],
+) -> None:
+    primitive_id = primitive["primitive_id"]
+    _validate_curve(primitive_id, parameters)
+    for key in ("r_neck", "r_body", "r_tip"):
+        if float(parameters.get(key, 0.0)) <= 0.0:
+            raise ValueError(f"Crypt tube {primitive_id!r} {key} must be positive")
+    s_body = float(parameters.get("s_body", -1.0))
+    s_taper = float(parameters.get("s_taper", -1.0))
+    if not 0.0 < s_body < s_taper < 1.0:
+        raise ValueError(
+            f"Crypt tube {primitive_id!r} requires 0 < s_body < s_taper < 1"
+        )
+    r_constriction = parameters.get("r_constriction")
+    s_constriction = parameters.get("s_constriction")
+    if (r_constriction is None) != (s_constriction is None):
+        raise ValueError(
+            f"Crypt tube {primitive_id!r} constriction radius and position must "
+            "both be present or both be null"
+        )
+    if r_constriction is not None:
+        if float(r_constriction) <= 0.0 or not 0.0 <= float(s_constriction) <= 1.0:
+            raise ValueError(f"Crypt tube {primitive_id!r} has an invalid constriction")
+
+
+def _validate_neck_parameters(
+    primitive: dict[str, Any],
+    parameters: dict[str, Any],
+) -> None:
+    primitive_id = primitive["primitive_id"]
+    _validate_curve(primitive_id, parameters)
+    if float(parameters.get("radius", 0.0)) <= 0.0:
+        raise ValueError(f"Neck cylinder {primitive_id!r} radius must be positive")
+
+
+def _expanded_parameters(record: dict[str, Any]) -> dict[str, Any]:
+    primitive_type = str(record["primitive_type"])
+    compact = dict(record["parameters"])
+    if primitive_type not in {_TUBE_TYPE, _NECK_TYPE}:
+        return compact
+    controls = np.asarray(compact["centerline_control_points"], dtype=float)
+    curve_type = compact["centerline_type"]
+    n_samples = int(compact.get("centerline_samples", 64))
+    if curve_type == "quadratic_bezier":
+        centerline = sample_quadratic_bezier(*controls, n_samples=n_samples)
+    elif curve_type == "cubic_bezier":
+        centerline = sample_cubic_bezier(*controls, n_samples=n_samples)
+    else:
+        centerline = controls
+    expanded = {**compact, "centerline_points": centerline}
+    if primitive_type == _TUBE_TYPE:
+        expanded.update(
+            {
+                "r_attachment": compact["r_neck"],
+                "r_taper": compact["r_tip"],
+                "distal_taper_start": compact["s_taper"],
+            }
+        )
+    return expanded
+
+
+def graph_from_shape_export_payload(
+    payload: dict[str, Any],
+    *,
+    coordinate_system: str = "fitted",
+) -> SkeletonGraph:
+    """Reconstruct the final graph and primitive attachments from a v2 payload."""
+    validate_shape_export_payload(payload)
+    graph = SkeletonGraph(
+        metadata={"sample": dict(payload.get("sample") or {})},
+        coordinate_frame={"kind": "prepared_mesh"},
+    )
+    for node in payload["skeleton"]["nodes"]:
+        graph.add_node(
+            node["node_id"],
+            node["node_type"],
+            node["position"],
+            crypt_id=node.get("crypt_id"),
+        )
+    for edge in payload["skeleton"]["edges"]:
+        graph.add_edge(
+            edge["edge_id"],
+            edge["source"],
+            edge["target"],
+            edge_type=edge.get("edge_type", "skeleton"),
+            crypt_id=edge.get("crypt_id"),
+        )
+    for record in payload.get("primitives") or []:
+        attachment = PrimitiveAttachment(
+            primitive_type=record["primitive_type"],
+            parameters=_expanded_parameters(record),
+            attachment_type=(
+                "path" if record["attachment_scope"] == "graph" else record["attachment_scope"]
+            ),
+            attachment_id=record["primitive_id"],
+            target_ids=list(record.get("target_node_ids") or []),
+            metadata={"role": record.get("role")},
+        )
+        scope = record["attachment_scope"]
+        owner_id = str(record["owner_id"])
+        if scope == "node":
+            graph.node(owner_id).primitive_attachment = attachment
+        elif scope == "edge":
+            graph.edge(owner_id).primitive_attachment = attachment
+        elif scope == "graph":
+            graph.add_primitive_attachment(owner_id, attachment)
+        else:
+            raise ValueError(f"Unknown primitive attachment scope {scope!r}")
+    if coordinate_system == "source":
+        _transform_graph_to_source(graph, payload["coordinate_transform"])
+    elif coordinate_system != "fitted":
+        raise ValueError("coordinate_system must be 'fitted' or 'source'")
+    return graph
+
+
+def _transform_points(points, matrix: np.ndarray) -> np.ndarray:
+    points = np.asarray(points, dtype=float)
+    return points @ matrix[:3, :3].T + matrix[:3, 3]
+
+
+def _transform_graph_to_source(graph: SkeletonGraph, transform: dict[str, Any]) -> None:
+    matrix = np.asarray(transform["fitted_to_source"], dtype=float)
+    linear = matrix[:3, :3]
+    singular_values = np.linalg.svd(linear, compute_uv=False)
+    scale = float(np.mean(singular_values))
+    if not np.allclose(singular_values, scale, rtol=1e-7, atol=1e-9):
+        raise ValueError("Only uniform fitted-to-source scaling is supported")
+    rotation = linear / scale
+    for node in graph.nodes.values():
+        node.position = _transform_points(node.position[None, :], matrix)[0]
+
+    attachments = [item[2] for item in _all_attachments(graph)]
+    for attachment in attachments:
+        parameters = attachment.parameters
+        for key in ("center", "neck_center"):
+            if key in parameters and parameters[key] is not None:
+                parameters[key] = _transform_points(
+                    np.asarray(parameters[key], dtype=float)[None, :], matrix
+                )[0]
+        for key in ("centerline_points", "centerline_control_points"):
+            if key in parameters and parameters[key] is not None:
+                parameters[key] = _transform_points(parameters[key], matrix)
+        if "orientation" in parameters:
+            parameters["orientation"] = rotation @ np.asarray(
+                parameters["orientation"], dtype=float
+            )
+        for key in (
+            "axis_lengths",
+            "axis_lengths_negative",
+            "axis_lengths_positive",
+            "r_neck",
+            "r_attachment",
+            "r_body",
+            "r_tip",
+            "r_taper",
+            "r_constriction",
+            "radius",
+        ):
+            if key in parameters and parameters[key] is not None:
+                parameters[key] = np.asarray(parameters[key], dtype=float) * scale
+                if np.ndim(parameters[key]) == 0:
+                    parameters[key] = float(parameters[key])
+    graph.coordinate_frame = {"kind": "original_mesh"}
 
 
 def save_shape_export(
@@ -466,118 +687,55 @@ def save_shape_export(
     primitive_result: PrimitiveFitResult | None = None,
     metadata: dict[str, Any] | None = None,
     prefix: str = "shape",
-    include_detections: bool = True,
-    include_intermediates: bool = False,
-    include_components: bool = False,
-    write_json: bool = True,
-    write_tables: bool = True,
-    write_npz: bool = True,
 ) -> dict[str, str]:
-    """Write one portable skeleton/primitives export directory.
-
-    Returns a dictionary of output paths keyed by artifact name.
-    """
+    """Write one strict, compact v2 JSON export and return its path."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    coerced = _coerce_shape_result(result, primitive_result=primitive_result)
-
     payload = shape_export_payload(
         result,
         primitive_result=primitive_result,
         metadata=metadata,
-        include_detections=include_detections,
-        include_intermediates=include_intermediates,
-        include_components=include_components,
     )
-    paths: dict[str, str] = {}
-    if write_json:
-        path = output_dir / f"{prefix}.json"
-        path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-        paths["json"] = str(path)
-    if write_tables:
-        nodes_path = output_dir / f"{prefix}_nodes.csv"
-        edges_path = output_dir / f"{prefix}_edges.csv"
-        primitives_path = output_dir / f"{prefix}_primitives.csv"
-        _write_csv(nodes_path, payload["tables"]["nodes"])
-        _write_csv(edges_path, payload["tables"]["edges"])
-        _write_csv(primitives_path, payload["tables"]["primitives"])
-        paths.update(
-            {
-                "nodes_csv": str(nodes_path),
-                "edges_csv": str(edges_path),
-                "primitives_csv": str(primitives_path),
-            }
-        )
-    if write_npz:
-        path = output_dir / f"{prefix}_arrays.npz"
-        np.savez_compressed(path, **graph_arrays(coerced.graph))
-        paths["arrays_npz"] = str(path)
-    return paths
+    path = output_dir / f"{prefix}.json"
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True, allow_nan=False),
+        encoding="utf-8",
+    )
+    return {"json": str(path)}
 
 
 def load_shape_export_json(path) -> dict[str, Any]:
-    """Load a JSON payload written by :func:`save_shape_export`."""
-    path = Path(path)
-    with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+    """Load and validate a compact v2 shape payload."""
+    with Path(path).open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    validate_shape_export_payload(payload)
+    return payload
+
+
+def load_shape_export_graph(path, *, coordinate_system: str = "fitted") -> SkeletonGraph:
+    """Load a v2 export directly as a fitted- or original-coordinate graph."""
+    return graph_from_shape_export_payload(
+        load_shape_export_json(path),
+        coordinate_system=coordinate_system,
+    )
 
 
 def write_export_readme(path, *, dataset: str | None = None) -> None:
-    """Write a compact data dictionary for a skeleton/primitives export root."""
+    """Write the compact batch-export data dictionary."""
     dataset_line = f"Dataset: `{dataset}`.\n\n" if dataset else ""
-    text = f"""# Skeleton and Primitive Export
+    text = f"""# OrganoGraph Shape Export v2
 
-{dataset_line}This directory contains portable exports of organoid skeleton graphs and fitted
-primitive attachments for downstream shape modeling, including VAE work in a
-separate project.
+{dataset_line}Each organoid directory contains one `shape.json` with the final
+skeleton and fitted primitives shown by `notebooks/tutorial_skeleton.ipynb`.
+Detection arrays, component masks, fit errors, and residuals are not included.
 
-## Per-organoid layout
+The file contains sample identity and VAE eligibility, reversible original-mesh
+coordinate transforms, graph nodes and edges, and reconstructive primitive
+parameters. Crypt array order is explicitly non-semantic; use `crypt_id` and
+graph connectivity or permutation-invariant matching.
 
-Each organoid directory contains:
-
-- `shape.json`: complete JSON payload with metadata, graph nodes/edges,
-  primitive attachments, configs, detections, and compact component summaries.
-- `shape_nodes.csv`: node table with `node_id`, `node_type`, `crypt_id`, `x`,
-  `y`, `z`, and JSON metadata columns.
-- `shape_edges.csv`: edge table with `edge_id`, `source`, `target`,
-  `edge_type`, `crypt_id`, and JSON metadata columns.
-- `shape_primitives.csv`: one row per graph-level primitive attachment.  The
-  `attachment_scope` column identifies whether the primitive is attached to a
-  node, edge, or graph-level path.  Body and branch blobs are usually node
-  attachments, while crypt tubes are usually graph-level path attachments.  The
-  `parameters_json`, `derived_parameters_json`, `residuals_json`, and
-  `metadata_json` columns intentionally keep primitive-specific content generic.
-- `shape_arrays.npz`: NumPy arrays for quick loading of node positions, edge
-  indices, node/edge types, and primitive JSON strings.
-
-## Schema principle
-
-The export is designed to survive changes in skeleton nodes, primitive
-families, and metadata.  Stable columns identify biological graph structure;
-rapidly evolving details are stored as JSON dictionaries.  Downstream projects
-should version their own packed VAE tensors separately from this raw portable
-export.
-
-## Minimal loading example
-
-```python
-import json
-import numpy as np
-
-with open("LABEL_UID/shape.json") as f:
-    payload = json.load(f)
-
-arrays = np.load("LABEL_UID/shape_arrays.npz", allow_pickle=False)
-node_positions = arrays["node_positions"]
-edge_index = arrays["edge_index"]
-primitive_parameters = arrays["primitive_parameters_json"]
-```
-
-## Recommended downstream use
-
-Use this export as the raw interchange format.  Build a separate, versioned VAE
-packing step that selects and normalizes `T` (topology), `S` (core skeleton
-morphology), `P` (primitive details), and `C` (context/metadata) for a specific
-model experiment.
+Use `organograph.skeleton.load_shape_export_graph(path)` to reconstruct the
+prepared-mesh graph, or pass `coordinate_system="source"` to restore positions,
+scales, and orientations to the original mesh coordinate system.
 """
     Path(path).write_text(text, encoding="utf-8")

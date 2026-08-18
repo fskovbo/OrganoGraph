@@ -401,9 +401,12 @@ def build_skeleton_graph(
     graph = SkeletonGraph(
         metadata=_json_safe_metadata(metadata),
         coordinate_frame={
-            "kind": "raw",
+            "kind": "input_mesh",
             "body_center_node": "body",
-            "description": "Raw mesh/world coordinates; edges are straight segments.",
+            "description": (
+                "Coordinates of the mesh supplied to graph construction; the "
+                "mesh may already be normalized or rotated. Edges are straight."
+            ),
         },
     )
     body_position = np.asarray(body_center, dtype=float)

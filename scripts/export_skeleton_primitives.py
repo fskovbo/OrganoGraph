@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
 """
-Build and export biology-aware skeletons plus fitted primitives for a dataset.
+Build and export biology-aware skeletons plus fitted primitives for one or more
+mesh datasets.
 
-The output is intended as a portable raw interchange format for a separate VAE
-project.  Each organoid gets a directory containing:
+The output is a compact reconstructive format for a separate VAE project. Each
+organoid gets a directory containing:
 
     shape.json
-    shape_nodes.csv
-    shape_edges.csv
-    shape_primitives.csv
-    shape_arrays.npz
 
-The JSON payload preserves the full skeleton graph, primitive attachments,
-configs, detections, metadata, and compact component summaries.  The CSV/NPZ
-files are easier to load from lightweight downstream analysis code.
+The JSON payload preserves the final skeleton, fitted primitive geometry, and
+the reversible transform to original mesh coordinates. Fitting diagnostics and
+segmentation arrays are intentionally omitted.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
-import json
 import os
 import time
 import traceback
@@ -28,7 +24,6 @@ from pathlib import Path
 
 import numpy as np
 
-from organograph.crypts.filters import filter_crypts_by_hks_percent, filter_crypts_by_size
 from organograph.io_utils.blacklist import (
     default_discard_labels_path,
     load_blacklist,
@@ -38,18 +33,13 @@ from organograph.io_utils.dataset_config import load_mesh_dataset_config
 from organograph.io_utils.path_parsing import discover_mesh_paths, parse_mesh_path
 from organograph.io_utils.run_metadata import write_run_settings
 from organograph.skeleton import (
-    BarrierConfig,
-    BodyTransitionConfig,
-    BranchValidationConfig,
-    CandidateDetectionConfig,
-    CryptOverlapConfig,
-    DetectionConfig,
-    GraphConfig,
-    MeshPreparationConfig,
-    NeckProfileConfig,
-    PrimitiveFitConfig,
-    SkeletonizationConfig,
+    SHAPE_EXPORT_SCHEMA_VERSION,
+    definitive_filter_options,
+    definitive_mesh_preparation,
+    definitive_primitive_fit_config,
+    definitive_skeletonization_config,
     fit_primitives_for_skeletonization_result,
+    graph_summary,
     save_shape_export,
     skeletonize_organoid,
     write_export_readme,
@@ -63,181 +53,91 @@ from organograph.skeleton import (
 SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 
-DATASET = "20250929" # "20251201"
 DATA_ROOT = (PROJECT_ROOT.parent / "NicoleData").resolve()
-DATASET_ROOT = DATA_ROOT / DATASET
-MESH_DATA_DIR = DATASET_ROOT / "fractal_output"
-MESH_CONFIG_PATH = DATASET_ROOT / "mesh_config.json"
-VOCAB_PATH = PROJECT_ROOT / "sim" / "vocab_with_meta.npz"
-OUTPUT_ROOT = DATASET_ROOT / "skeleton_primitive_exports"
-BLACKLIST_PATH = default_discard_labels_path(str(DATASET_ROOT))
-WHITELIST_PATH = None
+DATASET_TIMEPOINTS = {
+    "20250929": ["day3p5", "day4", "day4p5", "day4p5-more"],
+    "20251201": ["day4p5"],
+}
 
-# Set to None to process all configured timepoints.
-TIMEPOINTS = ["day3p5", "day4", "day4p5", "day4p5-more"]
+# All configured datasets are written into this one VAE-ready export dataset.
+# Dataset names remain part of each sample path to avoid label collisions.
+EXPORT_ROOT = (DATA_ROOT / "combined_skeleton_primitive_exports_v2").resolve()
+
+VOCAB_PATH = PROJECT_ROOT / "sim" / "vocab_with_meta.npz"
+WHITELIST_PATH = None
 
 OVERWRITE = False
 VERBOSE = True
-DRY_RUN = False
+DRY_RUN = True
 STRICT = False
 MAX_MESHES = None
 
-NORMALIZE_MESH = True
-NORMALIZE_SCALE = 10.0
-EIGEN_K = 225
-SMOOTH_MESH = True
-SMOOTH_LMAX = 12
-SMOOTH_EIGEN_K = None
+MESH_PREPARATION = definitive_mesh_preparation()
+NORMALIZE_MESH = MESH_PREPARATION["normalize_mesh"]
+NORMALIZE_SCALE = MESH_PREPARATION["normalize_scale"]
+EIGEN_K = MESH_PREPARATION["eigen_k"]
+SMOOTH_MESH = MESH_PREPARATION["smooth_mesh"]
+SMOOTH_LMAX = MESH_PREPARATION["smooth_lmax"]
+SMOOTH_EIGEN_K = MESH_PREPARATION["smooth_eigen_k"]
 
-FILTER_KWARGS = {
-    "use_hks_filter": True,
-    "min_percent_greater": 2.0,
-    "hks_t_min": None,
-    "hks_t_max": 10.0,
-    "use_size_filter": True,
-    "min_patch_verts": 25,
-    "min_patch_area": 5.0,
-}
-
-FILTER_NAMES = [
-    "filter_crypts_by_hks_percent",
-    "filter_crypts_by_size",
-]
-
-def make_filter_list(**kw):
-    filters = []
-    if kw.get("use_hks_filter", True):
-        filters.append(
-            lambda patches, **inner: filter_crypts_by_hks_percent(
-                patches,
-                min_percent_greater=kw["min_percent_greater"],
-                t_min=kw.get("hks_t_min"),
-                t_max=kw.get("hks_t_max"),
-                **inner,
-            )
-        )
-    if kw.get("use_size_filter", True):
-        filters.append(
-            lambda patches, **inner: filter_crypts_by_size(
-                patches,
-                min_patch_verts=kw["min_patch_verts"],
-                min_patch_area=kw.get("min_patch_area"),
-                **inner,
-            )
-        )
-    return filters or None
-
-
-FILTERS = make_filter_list(**FILTER_KWARGS)
-
-SKELETONIZATION_CONFIG = SkeletonizationConfig(
-    detection=DetectionConfig(
-        candidates=CandidateDetectionConfig(
-            threshold=0.5,
-            filters=FILTERS,
-            refine_threshold=0.0,
-            refine_min_area=5.0,
-            min_child_fraction=0.05,
-            final_tip_hks_time=1.0,
-            final_tip_bottom_fraction=0.6,
-            final_tip_min_hks_percent_increase=5.0,
-        ),
-        necks=NeckProfileConfig(
-            max_axis_level=2.0,
-            resolution=200,
-            search_interval=(0.8, 2.0),
-            min_prominence=0.05,
-            min_length=0.05,
-        ),
-        branches=BranchValidationConfig(
-            min_confidence=0.85,
-            max_neck_to_body_radius_ratio=0.70,
-            max_growth_size_factor=3.0,
-            max_mesh_fraction=0.40,
-        ),
-        body_transition=BodyTransitionConfig(enabled=True),
-        barriers=BarrierConfig(),
-        mesh=MeshPreparationConfig(smooth=False),
-    ),
-    graph=GraphConfig(
-        max_dimensionless_curvature=0.50,
-        curvature_penalty=8.0,
-    ),
-)
-
-PRIMITIVE_FIT_CONFIG = PrimitiveFitConfig(
-    refine_host_primitives=False,
-    component_kwargs={},
-    body_branch_neck_kwargs={
-        "radius_quantile": 0.5,
-        "expansion_factor": 1.35,
-        "max_extent_fraction": 0.25,
-        "min_extent_radius_fraction": 0.35,
-    },
-    body_kwargs={
-        "primitive_type": "asymmetric_superellipsoid",
-        "add_attachment_cap_support": True,
-        "cap_support_points_per_attachment": 2 * 64,
-        "cap_support_radius_fraction": 0.5,
-    },
-    branch_kwargs={"primitive_type": "asymmetric_superellipsoid"},
-    crypt_tube_kwargs={
-        "smooth_centerline": True,
-        "smooth_bulged_centerlines": False,
-        "centerline_n_bands": 7,
-        "centerline_n_samples": 64,
-        "centerline_constriction_weight": 4.0,
-        "update_crypt_nodes": True,
-        "radius_quantile": 0.5,
-        "optimize_radius_profile": True,
-        "initial_body_position": 0.5,
-        "initial_taper_position": 0.85,
-        "body_position_bounds": (0.2, 0.7),
-        "min_taper_gap": 0.1,
-        "max_taper_position": 0.9,
-    },
-    crypt_overlap=CryptOverlapConfig(
-        enabled=True,
-        threshold=0.30,
-        samples=32768,
-        random_seed=0,
-        max_passes=3,
-        max_host_attachment_angle=np.pi / 3,
-    ),
-)
+FILTER_KWARGS = definitive_filter_options()
+FILTER_NAMES = ["filter_crypts_by_hks_percent", "filter_crypts_by_size"]
+SKELETONIZATION_CONFIG = definitive_skeletonization_config()
+PRIMITIVE_FIT_CONFIG = definitive_primitive_fit_config()
 
 
 # =============================================================================
 # HELPERS
 # =============================================================================
 
-def parse_timepoints(value: str | None):
+def parse_csv_values(value: str | None):
     if value is None:
-        return TIMEPOINTS
+        return None
     value = value.strip()
     if value.lower() in {"", "none", "all"}:
         return None
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
-def resolve_paths(args) -> dict[str, Path | str | None]:
+def selected_datasets(args) -> list[str]:
+    requested = parse_csv_values(args.datasets)
+    return requested if requested is not None else list(DATASET_TIMEPOINTS)
+
+
+def resolve_shared_paths(args) -> dict[str, Path]:
     data_root = Path(args.data_root).resolve()
-    dataset_root = data_root / args.dataset
     return {
         "data_root": data_root,
-        "dataset_root": dataset_root,
-        "mesh_data_dir": Path(args.mesh_data_dir).resolve()
-        if args.mesh_data_dir
-        else dataset_root / "fractal_output",
-        "mesh_config_path": Path(args.mesh_config).resolve()
-        if args.mesh_config
-        else dataset_root / "mesh_config.json",
         "vocab_path": Path(args.vocab_path).resolve(),
-        "output_root": Path(args.output_root).resolve()
-        if args.output_root
-        else dataset_root / "skeleton_primitive_exports",
-        "blacklist_path": args.blacklist_path,
-        "whitelist_path": args.whitelist_path,
+        "output_root": Path(args.output_root).resolve(),
+    }
+
+
+def resolve_dataset_paths(
+    dataset: str,
+    *,
+    data_root: Path,
+    args,
+    allow_single_dataset_overrides: bool,
+) -> dict[str, Path | str | None]:
+    dataset_root = data_root / dataset
+    return {
+        "dataset_root": dataset_root,
+        "mesh_data_dir": (
+            Path(args.mesh_data_dir).resolve()
+            if allow_single_dataset_overrides and args.mesh_data_dir
+            else dataset_root / "fractal_output"
+        ),
+        "mesh_config_path": (
+            Path(args.mesh_config).resolve()
+            if allow_single_dataset_overrides and args.mesh_config
+            else dataset_root / "mesh_config.json"
+        ),
+        "blacklist_path": (
+            args.blacklist_path
+            if allow_single_dataset_overrides and args.blacklist_path
+            else default_discard_labels_path(str(dataset_root))
+        ),
     }
 
 
@@ -324,20 +224,42 @@ def append_failure(path: Path, *, label_uid: str, mesh_path: str, error: BaseExc
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Build and export skeletons plus fitted primitives."
+        description="Build and export a combined skeleton-plus-primitive dataset."
     )
-    parser.add_argument("--dataset", default=DATASET)
+    parser.add_argument(
+        "--datasets",
+        default=None,
+        help=(
+            "Comma-separated datasets. By default, process every dataset in "
+            "DATASET_TIMEPOINTS using its configured timepoints."
+        ),
+    )
     parser.add_argument("--data-root", default=str(DATA_ROOT))
-    parser.add_argument("--mesh-data-dir", default=None)
-    parser.add_argument("--mesh-config", default=None)
+    parser.add_argument(
+        "--mesh-data-dir",
+        default=None,
+        help="Override the mesh root when processing exactly one dataset.",
+    )
+    parser.add_argument(
+        "--mesh-config",
+        default=None,
+        help="Override mesh_config.json when processing exactly one dataset.",
+    )
     parser.add_argument("--vocab-path", default=str(VOCAB_PATH))
-    parser.add_argument("--output-root", default=None)
+    parser.add_argument("--output-root", default=str(EXPORT_ROOT))
     parser.add_argument(
         "--timepoints",
         default=None,
-        help="Comma-separated timepoints. Use 'all' to process all configured timepoints.",
+        help=(
+            "Override timepoints for every selected dataset. By default, use "
+            "DATASET_TIMEPOINTS; use 'all' for all timepoints in each mesh config."
+        ),
     )
-    parser.add_argument("--blacklist-path", default=BLACKLIST_PATH)
+    parser.add_argument(
+        "--blacklist-path",
+        default=None,
+        help="Override the blacklist when processing exactly one dataset.",
+    )
     parser.add_argument("--whitelist-path", default=WHITELIST_PATH)
     parser.add_argument("--max-meshes", type=int, default=MAX_MESHES)
     parser.add_argument("--overwrite", action="store_true", default=OVERWRITE)
@@ -345,14 +267,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--strict", action="store_true", default=STRICT)
     parser.add_argument(
-        "--include-intermediates",
+        "--unbranched-only",
         action="store_true",
-        help="Include full skeleton detection intermediates in shape.json.",
-    )
-    parser.add_argument(
-        "--include-components",
-        action="store_true",
-        help="Include full primitive component dictionaries in shape.json.",
+        help=(
+            "Skip organoids containing branch nodes; all exports are still "
+            "marked for eligibility."
+        ),
     )
     return parser
 
@@ -365,48 +285,80 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     verbose = bool(VERBOSE and not args.quiet)
-    timepoints = parse_timepoints(args.timepoints)
-    paths = resolve_paths(args)
+    datasets = selected_datasets(args)
+    if not datasets:
+        parser.error("At least one dataset must be selected")
+    if len(datasets) > 1 and any(
+        (args.mesh_data_dir, args.mesh_config, args.blacklist_path)
+    ):
+        parser.error(
+            "--mesh-data-dir, --mesh-config, and --blacklist-path can only be "
+            "used when processing one dataset"
+        )
 
-    output_root = Path(paths["output_root"])
+    timepoint_override = parse_csv_values(args.timepoints)
+    shared_paths = resolve_shared_paths(args)
+    output_root = shared_paths["output_root"]
     output_root.mkdir(parents=True, exist_ok=True)
     failure_log = output_root / "failures.log"
     if failure_log.exists() and args.overwrite:
         failure_log.unlink()
 
-    if not Path(paths["vocab_path"]).exists():
-        raise FileNotFoundError(f"VOCAB_PATH not found: {paths['vocab_path']}")
-    if not Path(paths["mesh_config_path"]).exists():
-        raise FileNotFoundError(f"Mesh config not found: {paths['mesh_config_path']}")
-
-    mesh_cfg = load_mesh_dataset_config(str(paths["mesh_config_path"]))
-    zarr_names = mesh_cfg["zarr_name_by_tp"]
-    rounds = mesh_cfg["round_by_tp"]
-    meshes = mesh_cfg["meshname_by_tp"]
-    wells = mesh_cfg.get("wells_by_tp", {})
-
-    blacklist = load_optional_blacklist(
-        paths["blacklist_path"],
-        label="blacklist",
-        verbose=verbose,
-    )
+    if not shared_paths["vocab_path"].exists():
+        raise FileNotFoundError(f"VOCAB_PATH not found: {shared_paths['vocab_path']}")
     whitelist = (
-        load_blacklist(paths["whitelist_path"])
-        if paths["whitelist_path"]
+        load_blacklist(args.whitelist_path)
+        if args.whitelist_path
         else None
     )
-    vocab = np.load(paths["vocab_path"], allow_pickle=True)
+    vocab = np.load(shared_paths["vocab_path"], allow_pickle=True)
 
-    mesh_paths = discover_mesh_paths(
-        data_dir=str(paths["mesh_data_dir"]),
-        timepoints=timepoints,
-        zarr_names=zarr_names,
-        rounds=rounds,
-        meshes=meshes,
-        wells=wells,
-    )
+    dataset_runs: dict[str, dict] = {}
+    mesh_records: list[dict] = []
+    for dataset in datasets:
+        paths = resolve_dataset_paths(
+            dataset,
+            data_root=shared_paths["data_root"],
+            args=args,
+            allow_single_dataset_overrides=len(datasets) == 1,
+        )
+        mesh_config_path = Path(paths["mesh_config_path"])
+        if not mesh_config_path.exists():
+            raise FileNotFoundError(
+                f"Mesh config for dataset {dataset!r} not found: {mesh_config_path}"
+            )
+        mesh_cfg = load_mesh_dataset_config(str(mesh_config_path))
+        timepoints = (
+            timepoint_override
+            if args.timepoints is not None
+            else DATASET_TIMEPOINTS.get(dataset)
+        )
+        dataset_mesh_paths = discover_mesh_paths(
+            data_dir=str(paths["mesh_data_dir"]),
+            timepoints=timepoints,
+            zarr_names=mesh_cfg["zarr_name_by_tp"],
+            rounds=mesh_cfg["round_by_tp"],
+            meshes=mesh_cfg["meshname_by_tp"],
+            wells=mesh_cfg.get("wells_by_tp", {}),
+        )
+        blacklist = load_optional_blacklist(
+            paths["blacklist_path"],
+            label=f"{dataset} blacklist",
+            verbose=verbose,
+        )
+        dataset_runs[dataset] = {
+            "timepoints": timepoints,
+            "paths": paths,
+            "blacklist": blacklist,
+            "mesh_files_found": len(dataset_mesh_paths),
+        }
+        mesh_records.extend(
+            {"dataset": dataset, "mesh_path": mesh_path}
+            for mesh_path in dataset_mesh_paths
+        )
+
     if args.max_meshes is not None:
-        mesh_paths = mesh_paths[: int(args.max_meshes)]
+        mesh_records = mesh_records[: int(args.max_meshes)]
 
     OrganoidMesh = None
     compute_geodesics_dijkstra = None
@@ -415,22 +367,36 @@ def main(argv: list[str] | None = None) -> int:
         from organograph.mesh.geodesics import compute_geodesics_dijkstra
 
     if verbose:
-        print(f"[skeleton-export] found {len(mesh_paths)} mesh files")
+        for dataset, run in dataset_runs.items():
+            print(
+                f"[skeleton-export] {dataset}: found "
+                f"{run['mesh_files_found']} mesh files"
+            )
+        print(f"[skeleton-export] combined total: {len(mesh_records)} mesh files")
         print(f"[skeleton-export] output root: {output_root}")
 
     stats = {
-        "mesh_files_found": int(len(mesh_paths)),
+        "mesh_files_found": int(len(mesh_records)),
+        "mesh_files_found_by_dataset": {
+            dataset: int(run["mesh_files_found"])
+            for dataset, run in dataset_runs.items()
+        },
         "exported": 0,
         "skipped_blacklist": 0,
         "skipped_whitelist": 0,
         "skipped_existing": 0,
+        "skipped_branched": 0,
         "failed": 0,
         "dry_run": bool(args.dry_run),
     }
     manifest_rows: list[dict] = []
     t_start = time.perf_counter()
 
-    for mesh_path in mesh_paths:
+    for mesh_record in mesh_records:
+        dataset = mesh_record["dataset"]
+        mesh_path = mesh_record["mesh_path"]
+        dataset_run = dataset_runs[dataset]
+        blacklist = dataset_run["blacklist"]
         label_uid = str(mesh_path)
         try:
             rec = parse_mesh_path(mesh_path)
@@ -448,7 +414,7 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"[skip] {label_uid} not in whitelist")
                 continue
 
-            organoid_dir = output_root / timepoint / label_uid
+            organoid_dir = output_root / dataset / timepoint / label_uid
             if output_exists(organoid_dir) and not args.overwrite:
                 stats["skipped_existing"] += 1
                 if verbose:
@@ -466,13 +432,13 @@ def main(argv: list[str] | None = None) -> int:
             prepare_mesh_for_skeleton_export(mesh)
 
             metadata = {
-                "dataset": args.dataset,
+                "dataset": dataset,
                 "timepoint": timepoint,
                 "well": rec.get("well"),
                 "organoid_id": rec.get("organoid_id"),
                 "label_uid": label_uid,
                 "mesh_path": str(mesh_path),
-                "vocab_path": str(paths["vocab_path"]),
+                "vocab_path": str(shared_paths["vocab_path"]),
             }
             t0 = time.perf_counter()
             skeleton_result = skeletonize_organoid(
@@ -486,23 +452,24 @@ def main(argv: list[str] | None = None) -> int:
                 skeleton_result,
                 config=PRIMITIVE_FIT_CONFIG,
             )
+            summary = graph_summary(primitive_result.graph)
+            has_branches = summary["n_branches"] > 0
+            if args.unbranched_only and has_branches:
+                stats["skipped_branched"] += 1
+                if verbose:
+                    print(f"[skip branched] {label_uid}")
+                continue
             export_paths = save_shape_export(
                 primitive_result,
                 organoid_dir,
                 metadata=metadata,
-                include_detections=True,
-                include_intermediates=args.include_intermediates,
-                include_components=args.include_components,
             )
             dt = time.perf_counter() - t0
-            summary = primitive_result.graph.to_dict()
-            n_nodes = len(summary.get("nodes", []))
-            n_edges = len(summary.get("edges", []))
-            n_primitives = len(summary.get("primitive_attachments", []))
 
             manifest_rows.append(
                 {
-                    "dataset": args.dataset,
+                    "schema_version": SHAPE_EXPORT_SCHEMA_VERSION,
+                    "dataset": dataset,
                     "timepoint": timepoint,
                     "well": rec.get("well"),
                     "organoid_id": rec.get("organoid_id"),
@@ -510,18 +477,18 @@ def main(argv: list[str] | None = None) -> int:
                     "mesh_path": str(mesh_path),
                     "output_dir": str(organoid_dir),
                     "json_path": export_paths.get("json", ""),
-                    "arrays_npz_path": export_paths.get("arrays_npz", ""),
-                    "n_nodes": n_nodes,
-                    "n_edges": n_edges,
-                    "n_primitives": n_primitives,
+                    "has_branches": has_branches,
+                    "vae_eligible": not has_branches,
+                    **summary,
                     "elapsed_s": f"{dt:.3f}",
                 }
             )
             stats["exported"] += 1
             if verbose:
                 print(
-                    f"[skeleton-export] {label_uid}: nodes={n_nodes} "
-                    f"edges={n_edges} primitives={n_primitives} in {dt:.2f}s"
+                    f"[skeleton-export] {label_uid}: nodes={summary['n_nodes']} "
+                    f"edges={summary['n_edges']} primitives={summary['n_primitives']} "
+                    f"in {dt:.2f}s"
                 )
 
         except Exception as exc:
@@ -533,31 +500,36 @@ def main(argv: list[str] | None = None) -> int:
                 raise
 
     write_manifest(output_root / "manifest.csv", manifest_rows)
-    write_export_readme(output_root / "README.md", dataset=args.dataset)
+    write_export_readme(output_root / "README.md", dataset=", ".join(datasets))
     elapsed_s = time.perf_counter() - t_start
     write_run_settings(
         output_root,
         script_name=os.path.basename(__file__),
         payload={
-            "dataset": args.dataset,
-            "timepoints": timepoints,
+            "shape_export_schema": SHAPE_EXPORT_SCHEMA_VERSION,
+            "datasets": {
+                dataset: {
+                    "timepoints": run["timepoints"],
+                    "mesh_files_found": int(run["mesh_files_found"]),
+                    "paths": {
+                        key: str(value) if value is not None else None
+                        for key, value in run["paths"].items()
+                    },
+                }
+                for dataset, run in dataset_runs.items()
+            },
             "paths": {
-                "data_root": str(paths["data_root"]),
-                "dataset_root": str(paths["dataset_root"]),
-                "mesh_data_dir": str(paths["mesh_data_dir"]),
-                "mesh_config_path": str(paths["mesh_config_path"]),
-                "vocab_path": str(paths["vocab_path"]),
+                "data_root": str(shared_paths["data_root"]),
+                "vocab_path": str(shared_paths["vocab_path"]),
                 "output_root": str(output_root),
-                "blacklist_path": paths["blacklist_path"],
-                "whitelist_path": paths["whitelist_path"],
+                "whitelist_path": args.whitelist_path,
             },
             "parameters": {
                 "overwrite": bool(args.overwrite),
                 "dry_run": bool(args.dry_run),
                 "strict": bool(args.strict),
                 "max_meshes": args.max_meshes,
-                "include_intermediates": bool(args.include_intermediates),
-                "include_components": bool(args.include_components),
+                "unbranched_only": bool(args.unbranched_only),
                 "mesh_preparation": {
                     "normalize_mesh": NORMALIZE_MESH,
                     "normalize_scale": NORMALIZE_SCALE,

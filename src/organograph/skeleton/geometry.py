@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
-from typing import Iterable
 
 import numpy as np
 
@@ -53,78 +52,6 @@ def surface_area_centroid(vertices, faces) -> np.ndarray:
         return centroid(vertices)
     return (vertices[faces].mean(axis=1) * areas[:, None]).sum(axis=0) / total
 
-
-def chord_midpoint(neck: Iterable[float], tip: Iterable[float]) -> np.ndarray:
-    return 0.5 * (np.asarray(neck, dtype=float) + np.asarray(tip, dtype=float))
-
-
-def crypt_centroid_midsection(
-    vertices,
-    crypt_vertices,
-    neck_position,
-    tip_position,
-    *,
-    lo: float = 0.4,
-    hi: float = 0.6,
-) -> np.ndarray | None:
-    """Estimate a bend point from crypt-region vertices near the chord middle.
-
-    Points are projected onto the straight neck-tip chord.  The centroid of
-    points whose projection lies in the middle interval is used as a simple,
-    robust placeholder bend estimate.
-    """
-    vertices = as_points(vertices)
-    idx = as_vertex_indices(crypt_vertices)
-    if idx.size == 0:
-        return None
-
-    neck = np.asarray(neck_position, dtype=float)
-    tip = np.asarray(tip_position, dtype=float)
-    chord = tip - neck
-    denom = float(np.dot(chord, chord))
-    if denom <= 1e-12:
-        return None
-
-    pts = vertices[idx]
-    t = ((pts - neck) @ chord) / denom
-    mask = (t >= float(lo)) & (t <= float(hi))
-    if not np.any(mask):
-        return None
-    return centroid(pts[mask])
-
-
-def estimate_bend_position(
-    vertices,
-    crypt_vertices,
-    neck_position,
-    tip_position,
-    *,
-    strategy: str = "none",
-) -> np.ndarray | None:
-    strategy = str(strategy)
-    if strategy == "none":
-        return None
-    if strategy == "midpoint":
-        return chord_midpoint(neck_position, tip_position)
-    if strategy == "crypt_centroid":
-        idx = as_vertex_indices(crypt_vertices)
-        if idx.size:
-            return centroid(as_points(vertices)[idx])
-        return chord_midpoint(neck_position, tip_position)
-    if strategy == "crypt_centroid_midsection":
-        bend = crypt_centroid_midsection(
-            vertices,
-            crypt_vertices,
-            neck_position,
-            tip_position,
-        )
-        if bend is not None:
-            return bend
-        return chord_midpoint(neck_position, tip_position)
-    raise ValueError(
-        "bend_strategy must be one of 'none', 'midpoint', "
-        "'crypt_centroid', or 'crypt_centroid_midsection'"
-    )
 
 
 def transform_points_body_relative(

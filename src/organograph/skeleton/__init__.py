@@ -1,99 +1,32 @@
-"""Biology-aware skeleton graphs for organoid meshes.
+"""Barrier-aware, biology-aware organoid skeletons and shape primitives.
 
-The public API builds compact straight-edge skeletons from crypt detections.
-It is intentionally separate from primitive fitting and from generic medial
-axis extraction.
+The public workflow has three explicit stages: skeletonization, interpretable
+primitive fitting, and visualization-only blending. Skeletonization always
+fits body/branch barriers and places appendix attachments at their boundaries.
 """
 
-from organograph.skeleton.build import (
-    analyze_neck_circumference_profile,
-    build_skeleton_from_crypt_detections,
-    build_skeleton_from_segmentation_parameters,
-    detect_crypts_for_skeleton,
-    normalize_crypt_detections,
+from organograph.skeleton.config import (
+    BarrierConfig,
+    BlendConfig,
+    BodyTransitionConfig,
+    BranchValidationConfig,
+    CandidateDetectionConfig,
+    CryptOverlapConfig,
+    DetectionConfig,
+    GraphConfig,
+    MeshPreparationConfig,
+    NeckProfileConfig,
+    PrimitiveFitConfig,
+    SkeletonizationConfig,
 )
-from organograph.skeleton.blending import BlendAttachment, create_attachment_blends
-from organograph.skeleton.barrier_ellipsoid import (
-    SoftBarrierEllipsoidConfig,
-    SoftBarrierEllipsoidFit,
-    barrier_primitive_vertices_like_mesh,
-    ellipsoid_vertices_like_mesh,
-    fit_branch_barrier_primitives,
-    fit_soft_barrier_primitive,
-    fit_soft_barrier_primitive_sampled,
-    fit_soft_barrier_ellipsoid,
-    fit_soft_barrier_ellipsoid_sampled,
-    project_crypt_attachments_to_barrier_surfaces,
-    protect_detection_regions_from_mask,
-    protect_patches_from_mask,
-    relative_height_field,
-    sampled_vertex_indices,
-    solid_center_of_mass,
-    superellipsoid_level,
-    villus_mask_from_barrier_primitive,
-    villus_mask_from_ellipsoid,
-)
-from organograph.skeleton.detection.barrier_crossings import (
-    assign_crypt_attachments_from_barrier_crossings,
-    find_barrier_boundary_crossing,
-)
-from organograph.skeleton.config import BlendConfig, PrimitiveFitConfig, SkeletonizationConfig
-from organograph.skeleton.datatypes import (
-    NODE_TYPES,
-    SkeletonEdge,
-    SkeletonGraph,
-    SkeletonNode,
-)
-from organograph.skeleton.geometry import (
-    crypt_attachment_direction,
-    crypt_bend_angle,
-    crypt_path_length,
-    crypt_straight_distance,
-    crypt_tortuosity,
-    edge_length,
-    number_of_crypts,
-    number_of_split_crypts,
-    skeleton_to_body_relative,
-    transform_points_body_relative,
-)
+from organograph.skeleton.datatypes import NODE_TYPES, SkeletonEdge, SkeletonGraph, SkeletonNode
+from organograph.skeleton.export import load_shape_export_json, save_shape_export, write_export_readme
 from organograph.skeleton.io import load_skeleton_json, save_skeleton_json
-from organograph.skeleton.export import (
-    SHAPE_EXPORT_SCHEMA_VERSION,
-    edge_records,
-    graph_arrays,
-    graph_summary,
-    load_shape_export_json,
-    node_records,
-    primitive_records,
-    save_shape_export,
-    shape_export_payload,
-    write_export_readme,
-)
-from organograph.skeleton.primitive_geometry import (
-    estimate_smooth_crypt_centerline,
-    sample_quadratic_bezier,
-)
-from organograph.skeleton.primitive_fitting import (
-    attach_body_primitive,
-    attach_body_branch_neck_primitives,
-    attach_branch_primitives,
-    attach_crypt_tube_primitives,
-    crypt_terminal_paths,
-    fit_blob_primitive_to_points,
-    fit_asymmetric_superellipsoid_to_points,
-    fit_crypt_tube_to_points,
-    fit_ellipsoid_to_points,
-    fit_straight_neck_cylinder,
-    primitive_components_from_crypt_detections,
-    primitive_attachments_to_dataframe,
-)
-from organograph.skeleton.primitives import (
-    Primitive,
-    PrimitiveAttachment,
-    PrimitiveFit,
-)
+from organograph.skeleton.primitives import Primitive, PrimitiveAttachment, PrimitiveFit
 from organograph.skeleton.results import (
+    BarrierStageResult,
     BlendResult,
+    DetectionResult,
     OrganoidShapeResult,
     PrimitiveFitResult,
     SkeletonizationResult,
@@ -105,83 +38,37 @@ from organograph.skeleton.workflow import (
 )
 
 __all__ = [
-    "BlendAttachment",
+    "BarrierConfig",
+    "BarrierStageResult",
     "BlendConfig",
     "BlendResult",
+    "BodyTransitionConfig",
+    "BranchValidationConfig",
+    "CandidateDetectionConfig",
+    "CryptOverlapConfig",
+    "DetectionConfig",
+    "DetectionResult",
+    "GraphConfig",
+    "MeshPreparationConfig",
     "NODE_TYPES",
+    "NeckProfileConfig",
     "OrganoidShapeResult",
     "Primitive",
     "PrimitiveAttachment",
     "PrimitiveFit",
     "PrimitiveFitConfig",
     "PrimitiveFitResult",
-    "SoftBarrierEllipsoidConfig",
-    "SoftBarrierEllipsoidFit",
     "SkeletonEdge",
     "SkeletonGraph",
     "SkeletonNode",
     "SkeletonizationConfig",
     "SkeletonizationResult",
-    "SHAPE_EXPORT_SCHEMA_VERSION",
-    "attach_body_primitive",
-    "attach_body_branch_neck_primitives",
-    "attach_branch_primitives",
-    "attach_crypt_tube_primitives",
-    "analyze_neck_circumference_profile",
-    "assign_crypt_attachments_from_barrier_crossings",
-    "barrier_primitive_vertices_like_mesh",
-    "build_skeleton_from_crypt_detections",
-    "build_skeleton_from_segmentation_parameters",
     "blend_primitives_for_visualization",
-    "create_attachment_blends",
-    "crypt_attachment_direction",
-    "crypt_bend_angle",
-    "crypt_path_length",
-    "crypt_straight_distance",
-    "crypt_tortuosity",
-    "crypt_terminal_paths",
-    "detect_crypts_for_skeleton",
-    "edge_length",
-    "estimate_smooth_crypt_centerline",
-    "fit_blob_primitive_to_points",
-    "fit_branch_barrier_primitives",
-    "fit_asymmetric_superellipsoid_to_points",
-    "fit_crypt_tube_to_points",
-    "fit_ellipsoid_to_points",
     "fit_primitives_for_skeletonization_result",
-    "fit_soft_barrier_primitive",
-    "fit_soft_barrier_primitive_sampled",
-    "fit_soft_barrier_ellipsoid",
-    "fit_soft_barrier_ellipsoid_sampled",
-    "fit_straight_neck_cylinder",
-    "find_barrier_boundary_crossing",
-    "ellipsoid_vertices_like_mesh",
-    "graph_arrays",
-    "graph_summary",
-    "load_skeleton_json",
     "load_shape_export_json",
-    "node_records",
-    "normalize_crypt_detections",
-    "number_of_crypts",
-    "number_of_split_crypts",
-    "primitive_components_from_crypt_detections",
-    "primitive_records",
-    "primitive_attachments_to_dataframe",
-    "project_crypt_attachments_to_barrier_surfaces",
-    "protect_detection_regions_from_mask",
-    "protect_patches_from_mask",
-    "relative_height_field",
+    "load_skeleton_json",
     "save_shape_export",
     "save_skeleton_json",
-    "shape_export_payload",
     "skeletonize_organoid",
-    "sample_quadratic_bezier",
-    "sampled_vertex_indices",
-    "skeleton_to_body_relative",
-    "solid_center_of_mass",
-    "superellipsoid_level",
-    "transform_points_body_relative",
-    "villus_mask_from_barrier_primitive",
-    "villus_mask_from_ellipsoid",
     "write_export_readme",
 ]

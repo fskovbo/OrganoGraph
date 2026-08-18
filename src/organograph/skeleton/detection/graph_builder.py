@@ -15,13 +15,10 @@ from organograph.skeleton.detection.common import (
     _point_from_vertex,
 )
 from organograph.skeleton.detection.mesh_regions import (
-    _body_center_from_root_regions,
-    _branch_position_from_regions,
-    _crypt_side_region,
     _radial_distances_to_axis,
 )
-from organograph.skeleton.detection.neck_profiles import _neck_position, _add_neck_profile_geometry
-from organograph.skeleton.geometry import as_points, centroid, estimate_bend_position, surface_area_centroid
+from organograph.skeleton.detection.neck_profiles import _neck_position
+from organograph.skeleton.geometry import as_points, centroid
 
 def _tip_position(vertices, detection: dict[str, Any]) -> np.ndarray:
     explicit = _point_from_keys(
@@ -199,50 +196,13 @@ def _add_crypt_tip_path(
     source_position: np.ndarray,
     tip_position: np.ndarray,
     metadata: dict[str, Any],
-    bend_strategy: str,
     bend_max_dimensionless_curvature: float | None,
     bend_curvature_penalty: float,
     crypt_role: str = "crypt_centroid",
 ) -> None:
-    """Connect a crypt neck-like source to a tip, optionally through a waypoint."""
-    strategy = str(bend_strategy).lower()
-    intermediate_position = None
-    intermediate_type = None
-    intermediate_role = None
-
-    if strategy != "none":
-        if strategy == "crypt_centroid":
-            intermediate_position = _crypt_position(vertices, detection)
-            intermediate_type = "crypt"
-            intermediate_role = crypt_role
-        else:
-            intermediate_position = _point_from_keys(
-                vertices,
-                detection,
-                ("bend_position", "bend_center", "bend", "p_bend"),
-            )
-            if intermediate_position is None:
-                intermediate_position = estimate_bend_position(
-                    vertices,
-                    crypt_vertices,
-                    source_position,
-                    tip_position,
-                    strategy=strategy,
-                )
-            if intermediate_position is not None:
-                intermediate_type = "bend"
-                intermediate_role = "bend"
-
-    if intermediate_position is None:
-        source_type = graph.node(source_id).node_type
-        graph.add_edge(
-            f"{path_prefix}_{source_type}_to_tip",
-            source_id,
-            tip_id,
-            edge_type=f"{source_type}_to_tip",
-            crypt_id=crypt_id,
-        )
-        return
+    """Connect an attachment or constriction to a tip through its crypt center."""
+    intermediate_position = _crypt_position(vertices, detection)
+    intermediate_type = "crypt"
 
     intermediate_position, bend_diagnostics = _penalize_short_crypt_bending(
         vertices,
@@ -261,8 +221,7 @@ def _add_crypt_tip_path(
         crypt_id=crypt_id,
         metadata={
             **metadata,
-            "role": intermediate_role,
-            "bend_strategy": strategy,
+            "role": crypt_role,
             "bend_validation": _json_safe_metadata(bend_diagnostics),
         },
     )
@@ -294,7 +253,7 @@ def _add_attachment_path(
     metadata: dict[str, Any],
     host_edge_prefix: str,
 ) -> tuple[str, np.ndarray]:
-    """Add legacy neck or explicit attachment/constriction nodes."""
+    """Add a branch neck or a terminal attachment/constriction sequence."""
     profile = detection.get("neck_profile")
     if not isinstance(profile, dict):
         neck = _neck_position(vertices, faces, detection)
@@ -376,28 +335,6 @@ def _add_attachment_path(
     )
     return constriction_id, constriction
 
-def _branch_position(vertices, detection: dict[str, Any], neck, daughter_tips) -> np.ndarray:
-    explicit = _point_from_keys(
-        vertices,
-        detection,
-        ("branch_position", "branch_center", "branch", "split_position", "split_center"),
-    )
-    if explicit is not None:
-        return explicit
-
-    vertex_id = _first_present(detection, ("branch_vertex_id", "split_vertex_id"))
-    by_vertex = _point_from_vertex(vertices, vertex_id)
-    if by_vertex is not None:
-        return by_vertex
-
-    stem_vertices = _coerce_patch(_first_present(detection, ("stem_vertices", "trunk_vertices")))
-    if stem_vertices.size:
-        return centroid(as_points(vertices)[stem_vertices])
-
-    daughter_mean = centroid(np.vstack(daughter_tips))
-    return 0.5 * (np.asarray(neck, dtype=float) + daughter_mean)
-
-
 def _branch_center_override(
     branch_center_overrides: dict[Any, Any] | None,
     *,
@@ -435,112 +372,31 @@ def _daughter_detections(detection: dict[str, Any]) -> list[dict[str, Any]]:
                 out.append({"tip_vertex_id": int(arr)})
     return out
 
-def normalize_crypt_detections(crypt_detections) -> list[dict[str, Any]]:
-    """Normalize common segmentation outputs to a list of detection dicts.
-
-    Accepted inputs include:
-    - list of dicts with explicit neck/tip fields;
-    - list of vertex-index patches;
-    - segmentation dictionaries containing `crypts_mesh`, `crypts_ll`, or
-      `crypts`, optionally with per-crypt arrays such as `bottom_vertex_ids`
-      and `d_crypts`.
-    """
-    if crypt_detections is None:
-        return []
-
-    if isinstance(crypt_detections, dict):
-        patches = _first_present(
-            crypt_detections,
-            ("crypt_detections", "crypts_mesh", "crypts_ll", "crypts", "patches"),
-        )
-        if patches is not None and not isinstance(patches, dict):
-            if all(isinstance(patch, dict) for patch in patches):
-                return [dict(patch, crypt_id=patch.get("crypt_id", i)) for i, patch in enumerate(patches)]
-            detections = []
-            for i, patch in enumerate(patches):
-                det = {"crypt_id": i, "crypt_vertices": patch}
-                for src_key, dst_key in (
-                    ("bottom_vertex_ids", "bottom_vertex_id"),
-                    ("tip_vertex_ids", "tip_vertex_id"),
-                    ("d_crypts", "d_crypt"),
-                    ("L_crypts", "L_crypt"),
-                    ("circumference_crypts", "circumference"),
-                    ("crypt_constrictions", "constriction"),
-                    ("crypt_elongations", "elongation"),
-                ):
-                    if src_key in crypt_detections:
-                        values = crypt_detections[src_key]
-                        if len(values) > i:
-                            det[dst_key] = values[i]
-                detections.append(det)
-            return detections
-        return [dict(crypt_detections)]
-
-    detections = []
-    for i, item in enumerate(crypt_detections):
-        if isinstance(item, dict):
-            det = dict(item)
-            det.setdefault("crypt_id", i)
-        else:
-            det = {"crypt_id": i, "crypt_vertices": item}
-        detections.append(det)
-    return detections
-
-def _body_center(vertices, faces, body_vertices, body_faces, body_center) -> np.ndarray:
-    if body_center is not None:
-        center = np.asarray(body_center, dtype=float)
-        if center.shape != (3,):
-            raise ValueError("body_center must be a 3-vector")
-        return center
-    vertices = as_points(vertices)
-    if body_vertices is not None:
-        idx = _coerce_patch(body_vertices)
-        if idx.size:
-            return centroid(vertices[idx])
-    if body_faces is not None:
-        return surface_area_centroid(vertices, np.asarray(body_faces, dtype=np.int64))
-    if faces is not None:
-        return surface_area_centroid(vertices, faces)
-    return centroid(vertices)
-
-def build_skeleton_from_crypt_detections(
+def build_skeleton_graph(
     vertices,
     faces,
     crypt_detections,
-    body_vertices=None,
-    body_faces=None,
-    body_center=None,
-    branch_center_overrides: dict[Any, Any] | None = None,
-    bend_strategy: str = "none",
+    *,
+    body_center,
+    branch_centers: dict[Any, Any] | None = None,
     bend_max_dimensionless_curvature: float | None = 0.5,
-    bend_curvature_penalty: float = 5.0,
-    refine_body_center_from_necks: bool = True,
-    refine_branch_centers_from_necks: bool = True,
+    bend_curvature_penalty: float = 8.0,
     metadata: dict[str, Any] | None = None,
 ) -> SkeletonGraph:
-    """Build a straight-edge organoid skeleton from crypt detections.
+    """Build the fixed biology-aware topology from barrier-bounded detections.
 
-    Each non-split crypt is represented as `body -> neck -> tip` by default.
-    When an intermediate waypoint is requested through ``bend_strategy``, the
-    crypt path becomes either `neck -> bend -> tip` or, for
-    ``bend_strategy="crypt_centroid"``, `neck -> crypt -> tip`.  Split
-    detections with daughters use the same daughter-neck to daughter-tip rule.
-    Optional crypt waypoints are softly straightened when their bend is too
-    sharp for the path length and estimated crypt radius.
-
-    An explicit ``body_center`` and entries in ``branch_center_overrides`` take
-    precedence over region-derived centers. This allows an upstream component
-    primitive, such as a soft-barrier ellipsoid, to define the corresponding
-    skeleton node center.
-
-    When enabled, body and branch node positions are otherwise refined from mesh regions:
-    root necks bound crypt-side regions that are excluded from the villus body,
-    and split branches are placed at the centroid of the parent region after
-    subtracting daughter crypt-side regions.
+    Body and branch centers are supplied by their barrier primitives. Every
+    crypt path contains one centroid waypoint, so bending remains represented
+    by straight graph edges while the later tube fit may use a smooth midline.
     """
     vertices = as_points(vertices)
     faces = np.asarray(faces, dtype=np.int64)
-    detections = normalize_crypt_detections(crypt_detections)
+    if crypt_detections is None:
+        detections = []
+    elif not all(isinstance(item, dict) for item in crypt_detections):
+        raise TypeError("crypt_detections must be a sequence of detection dictionaries")
+    else:
+        detections = [dict(item) for item in crypt_detections]
 
     graph = SkeletonGraph(
         metadata=_json_safe_metadata(metadata),
@@ -550,13 +406,9 @@ def build_skeleton_from_crypt_detections(
             "description": "Raw mesh/world coordinates; edges are straight segments.",
         },
     )
-    body_position = _body_center(vertices, faces, body_vertices, body_faces, body_center)
-    body_refined = False
-    if body_center is None and body_vertices is None and body_faces is None and refine_body_center_from_necks:
-        refined_body = _body_center_from_root_regions(vertices, detections)
-        if refined_body is not None:
-            body_position = refined_body
-            body_refined = True
+    body_position = np.asarray(body_center, dtype=float)
+    if body_position.shape != (3,) or not np.all(np.isfinite(body_position)):
+        raise ValueError("body_center must be a finite 3-vector from the body barrier")
 
     graph.add_node(
         "body",
@@ -564,14 +416,7 @@ def build_skeleton_from_crypt_detections(
         body_position,
         metadata={
             "role": "villus_body_center",
-            "center_refined_from_neck_regions": body_refined,
-            "center_source": (
-                "explicit_override"
-                if body_center is not None
-                else "neck_bounded_region"
-                if body_refined
-                else "mesh_centroid"
-            ),
+            "center_source": "body_barrier_primitive",
         },
     )
 
@@ -608,22 +453,21 @@ def build_skeleton_from_crypt_detections(
         if daughters:
             daughter_tips = [_tip_position(vertices, daughter) for daughter in daughters]
             branch_id = f"{crypt_prefix}_branch"
-            branch_region = np.empty(0, dtype=np.int64)
             branch = _branch_center_override(
-                branch_center_overrides,
+                branch_centers,
                 branch_node_id=branch_id,
                 crypt_id=crypt_id,
             )
-            branch_center_overridden = branch is not None
-            if branch is None and refine_branch_centers_from_necks:
-                branch, branch_region = _branch_position_from_regions(vertices, detection, daughters)
+            center_source = "branch_barrier_primitive"
             if branch is None:
-                branch = _branch_position(
+                branch = _point_from_keys(
                     vertices,
                     detection,
-                    root_source_position,
-                    daughter_tips,
+                    ("branch_position", "branch_center", "split_position"),
                 )
+                center_source = "explicit_detection_position"
+            if branch is None:
+                raise ValueError(f"Accepted branch {branch_id!r} has no center")
             graph.add_node(
                 branch_id,
                 "branch",
@@ -632,16 +476,7 @@ def build_skeleton_from_crypt_detections(
                 metadata={
                     **common_meta,
                     "n_daughters": len(daughters),
-                    "center_refined_from_neck_regions": bool(branch_region.size),
-                    "center_source": (
-                        "explicit_override"
-                        if branch_center_overridden
-                        else "neck_bounded_region"
-                        if branch_region.size
-                        else "detection_or_geometric_fallback"
-                    ),
-                    "n_branch_region_vertices": int(branch_region.size),
-                    "branch_region_vertices": branch_region.tolist(),
+                    "center_source": center_source,
                 },
             )
             graph.add_edge(
@@ -700,7 +535,6 @@ def build_skeleton_from_crypt_detections(
                     source_position=daughter_source_position,
                     tip_position=daughter_tips[j],
                     metadata=daughter_meta,
-                    bend_strategy=bend_strategy,
                     bend_max_dimensionless_curvature=bend_max_dimensionless_curvature,
                     bend_curvature_penalty=bend_curvature_penalty,
                     crypt_role="daughter_crypt_centroid",
@@ -728,7 +562,6 @@ def build_skeleton_from_crypt_detections(
             source_position=root_source_position,
             tip_position=tip,
             metadata=common_meta,
-            bend_strategy=bend_strategy,
             bend_max_dimensionless_curvature=bend_max_dimensionless_curvature,
             bend_curvature_penalty=bend_curvature_penalty,
         )

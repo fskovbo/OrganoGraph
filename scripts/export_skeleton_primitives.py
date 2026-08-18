@@ -38,6 +38,15 @@ from organograph.io_utils.dataset_config import load_mesh_dataset_config
 from organograph.io_utils.path_parsing import discover_mesh_paths, parse_mesh_path
 from organograph.io_utils.run_metadata import write_run_settings
 from organograph.skeleton import (
+    BarrierConfig,
+    BodyTransitionConfig,
+    BranchValidationConfig,
+    CandidateDetectionConfig,
+    CryptOverlapConfig,
+    DetectionConfig,
+    GraphConfig,
+    MeshPreparationConfig,
+    NeckProfileConfig,
     PrimitiveFitConfig,
     SkeletonizationConfig,
     fit_primitives_for_skeletonization_result,
@@ -122,60 +131,42 @@ def make_filter_list(**kw):
 FILTERS = make_filter_list(**FILTER_KWARGS)
 
 SKELETONIZATION_CONFIG = SkeletonizationConfig(
-    detection_kwargs={
-        "L_ref": None,
-        "crypt_vocab_idx": None,
-        "threshold": 0.5,
-        "filter_fn_list": FILTERS,
-        "refine_crypts": True,
-        "refine_threshold": 0.0,
-        "refine_only_if_area_at_least": 5.0,
-        "min_refined_frac_of_parent": 0.05,
-        "geodesic_kwargs": None,
-        "final_tip_hks_time": 1.0,
-        "final_tip_bottom_fraction": 0.6,
-        "final_tip_min_hks_percent_increase": 5.0,
-        "extend_max": 2.0,
-        "disc_resolution": 200,
-        "neck_search_interval": (0.8, 2.0),
-        "neck_window_length": 9,
-        "neck_polyorder": 3,
-        "neck_min_prominence": 0.05,
-        "neck_min_length": 0.05,
-        "validate_split_stems": True,
-        "validate_branch_geometry": True,
-        "branch_min_confidence": 0.85,
-        "branch_max_neck_to_body_radius_ratio": 0.70,
-        "split_growth_max_size_factor": 3.0,
-        "split_growth_max_mesh_fraction": 0.40,
-        "split_growth_smooth_perimeter": True,
-        "split_growth_smoothing_tolerance": 0.0,
-        "split_growth_min_decrease_fraction": 0.0,
-        "split_growth_min_prominence_fraction": 0.01,
-        "split_growth_robust_window": 1,
-        "refine_broad_crypt_openings": False,
-        "max_opening_to_crypt_body_ratio": 0.65,
-        "branch_max_opening_to_crypt_body_ratio": 0.95,
-        "broad_opening_min_linear_profile_r2": 0.985,
-        "broad_opening_max_linear_profile_deviation": 0.08,
-        "broad_opening_min_attachment_level": 0.35,
-        "refine_body_transition_width_outliers": True,
-        "body_transition_max_crypt_to_host_width_ratio": 0.80,
-        "body_transition_host_width_quantile": 0.75,
-        "body_transition_min_second_derivative_score": 0.60,
-        "body_transition_min_attachment_level": 0.25,
-    },
-    build_kwargs={
-        "body_center": None,
-        "bend_strategy": "crypt_centroid",
-        "bend_max_dimensionless_curvature": 0.50,
-        "bend_curvature_penalty": 5.0,
-        "refine_body_center_from_necks": True,
-        "refine_branch_centers_from_necks": True,
-    },
+    detection=DetectionConfig(
+        candidates=CandidateDetectionConfig(
+            threshold=0.5,
+            filters=FILTERS,
+            refine_threshold=0.0,
+            refine_min_area=5.0,
+            min_child_fraction=0.05,
+            final_tip_hks_time=1.0,
+            final_tip_bottom_fraction=0.6,
+            final_tip_min_hks_percent_increase=5.0,
+        ),
+        necks=NeckProfileConfig(
+            max_axis_level=2.0,
+            resolution=200,
+            search_interval=(0.8, 2.0),
+            min_prominence=0.05,
+            min_length=0.05,
+        ),
+        branches=BranchValidationConfig(
+            min_confidence=0.85,
+            max_neck_to_body_radius_ratio=0.70,
+            max_growth_size_factor=3.0,
+            max_mesh_fraction=0.40,
+        ),
+        body_transition=BodyTransitionConfig(enabled=True),
+        barriers=BarrierConfig(),
+        mesh=MeshPreparationConfig(smooth=False),
+    ),
+    graph=GraphConfig(
+        max_dimensionless_curvature=0.50,
+        curvature_penalty=8.0,
+    ),
 )
 
 PRIMITIVE_FIT_CONFIG = PrimitiveFitConfig(
+    refine_host_primitives=False,
     component_kwargs={},
     body_branch_neck_kwargs={
         "radius_quantile": 0.5,
@@ -205,6 +196,14 @@ PRIMITIVE_FIT_CONFIG = PrimitiveFitConfig(
         "min_taper_gap": 0.1,
         "max_taper_position": 0.9,
     },
+    crypt_overlap=CryptOverlapConfig(
+        enabled=True,
+        threshold=0.30,
+        samples=32768,
+        random_seed=0,
+        max_passes=3,
+        max_host_attachment_angle=np.pi / 3,
+    ),
 )
 
 
@@ -475,24 +474,12 @@ def main(argv: list[str] | None = None) -> int:
                 "mesh_path": str(mesh_path),
                 "vocab_path": str(paths["vocab_path"]),
             }
-            build_kwargs = dict(SKELETONIZATION_CONFIG.build_kwargs)
-            build_kwargs["metadata"] = {
-                "label_uid": label_uid,
-                "mesh_path": str(mesh_path),
-                "timepoint": timepoint,
-                "well": rec.get("well"),
-                "organoid_id": rec.get("organoid_id"),
-            }
-            skeleton_config = SkeletonizationConfig(
-                detection_kwargs=dict(SKELETONIZATION_CONFIG.detection_kwargs),
-                build_kwargs=build_kwargs,
-            )
             t0 = time.perf_counter()
             skeleton_result = skeletonize_organoid(
                 mesh,
                 vocab,
                 geodesic_fn=compute_geodesics_dijkstra,
-                config=skeleton_config,
+                config=SKELETONIZATION_CONFIG,
                 metadata={"record": dict(metadata)},
             )
             primitive_result = fit_primitives_for_skeletonization_result(

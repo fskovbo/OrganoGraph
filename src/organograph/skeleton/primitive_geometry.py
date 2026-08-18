@@ -115,6 +115,120 @@ def sample_quadratic_bezier(
     )
 
 
+def sample_cubic_bezier(
+    start,
+    control_1,
+    control_2,
+    end,
+    *,
+    n_samples: int = 64,
+) -> np.ndarray:
+    """Sample one cubic Bézier centerline segment."""
+    points = [
+        np.asarray(point, dtype=float)
+        for point in (start, control_1, control_2, end)
+    ]
+    if any(point.shape != (3,) for point in points):
+        raise ValueError("Bézier points must be 3-vectors")
+    start, control_1, control_2, end = points
+    u = np.linspace(0.0, 1.0, max(2, int(n_samples)))
+    return (
+        (1.0 - u)[:, None] ** 3 * start
+        + 3.0 * (1.0 - u)[:, None] ** 2 * u[:, None] * control_1
+        + 3.0 * (1.0 - u)[:, None] * u[:, None] ** 2 * control_2
+        + u[:, None] ** 3 * end
+    )
+
+
+def estimate_bulged_crypt_centerline(
+    attachment_position,
+    crypt_position,
+    tip_position,
+    *,
+    n_samples: int = 64,
+) -> dict[str, Any]:
+    """Fit one cubic curve through a bulged crypt's three skeleton nodes.
+
+    The initial Bézier handle is constrained to the attachment-to-crypt-node
+    direction. The second handle is then chosen so the curve passes through
+    the crypt node, with the remaining scalar handle length selected to
+    minimize integrated squared acceleration. This gives a smooth single
+    segment whose attachment tangent agrees exactly with the skeleton edge.
+    """
+    attachment = np.asarray(attachment_position, dtype=float)
+    crypt = np.asarray(crypt_position, dtype=float)
+    tip = np.asarray(tip_position, dtype=float)
+    if any(point.shape != (3,) for point in (attachment, crypt, tip)):
+        raise ValueError("Bulged crypt centerline nodes must be 3-vectors")
+    if not all(np.all(np.isfinite(point)) for point in (attachment, crypt, tip)):
+        raise ValueError("Bulged crypt centerline nodes must be finite")
+
+    proximal = crypt - attachment
+    distal = tip - crypt
+    proximal_length = float(np.linalg.norm(proximal))
+    distal_length = float(np.linalg.norm(distal))
+    if proximal_length <= 1e-12 or distal_length <= 1e-12:
+        raise ValueError("Bulged crypt centerline nodes must be distinct")
+
+    node_parameter = float(
+        np.clip(
+            proximal_length / (proximal_length + distal_length),
+            0.2,
+            0.8,
+        )
+    )
+    t = node_parameter
+    a0 = (1.0 - t) ** 3
+    a1 = 3.0 * (1.0 - t) ** 2 * t
+    a2 = 3.0 * (1.0 - t) * t**2
+    a3 = t**3
+
+    control_2_zero = (
+        crypt - a0 * attachment - a1 * attachment - a3 * tip
+    ) / a2
+    control_2_slope = -(a1 / a2) * proximal
+
+    acceleration_start_zero = control_2_zero - attachment
+    acceleration_start_slope = control_2_slope - 2.0 * proximal
+    acceleration_end_zero = tip - 2.0 * control_2_zero + attachment
+    acceleration_end_slope = -2.0 * control_2_slope + proximal
+    linear_term = (
+        2.0 * np.dot(acceleration_start_zero, acceleration_start_slope)
+        + np.dot(acceleration_start_slope, acceleration_end_zero)
+        + np.dot(acceleration_start_zero, acceleration_end_slope)
+        + 2.0 * np.dot(acceleration_end_zero, acceleration_end_slope)
+    )
+    quadratic_term = (
+        np.dot(acceleration_start_slope, acceleration_start_slope)
+        + np.dot(acceleration_start_slope, acceleration_end_slope)
+        + np.dot(acceleration_end_slope, acceleration_end_slope)
+    )
+    handle_scale = (
+        float(np.clip(-linear_term / (2.0 * quadratic_term), 0.05, 3.0))
+        if quadratic_term > 1e-12
+        else 1.0 / 3.0
+    )
+    control_1 = attachment + handle_scale * proximal
+    control_2 = control_2_zero + handle_scale * control_2_slope
+    centerline = sample_cubic_bezier(
+        attachment,
+        control_1,
+        control_2,
+        tip,
+        n_samples=n_samples,
+    )
+    return {
+        "centerline_points": centerline,
+        "control_points": np.vstack([attachment, control_1, control_2, tip]),
+        "control_parameters": np.array([0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0]),
+        "crypt_node_parameter": node_parameter,
+        "crypt_node_on_centerline": True,
+        "initial_tangent": control_1 - attachment,
+        "initial_tangent_source": "attachment_to_crypt_edge",
+        "method": "skeleton_anchored_bulged_cubic_bezier",
+    }
+
+
 def fit_quadratic_bezier_control(
     start,
     end,
@@ -301,32 +415,6 @@ def point_at_polyline_arclength(points, fraction: float) -> np.ndarray:
     segment = max(0, min(segment, lengths.size - 1))
     local = (target - cumulative[segment]) / max(lengths[segment], 1e-12)
     return line[segment] + local * (line[segment + 1] - line[segment])
-
-
-def quadratic_radius(
-    s,
-    r_neck: float,
-    r_body: float,
-    r_tip: float,
-    *,
-    body_s: float = 0.5,
-    tip_s: float = 1.0,
-) -> np.ndarray:
-    """Quadratic radius profile through s=0, ``body_s``, and ``tip_s``."""
-    s = np.asarray(s, dtype=float)
-    rn = float(r_neck)
-    rb = float(r_body)
-    rt = float(r_tip)
-    sb = float(body_s)
-    st = float(tip_s)
-    if not (0.0 < sb < st):
-        raise ValueError("Radius control positions must satisfy 0 < body_s < tip_s")
-
-    # Lagrange interpolation through (0, rn), (sb, rb), and (st, rt).
-    l0 = ((s - sb) * (s - st)) / (sb * st)
-    l1 = (s * (s - st)) / (sb * (sb - st))
-    lt = (s * (s - sb)) / (st * (st - sb))
-    return rn * l0 + rb * l1 + rt * lt
 
 
 def capped_tube_radius(

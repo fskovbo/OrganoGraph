@@ -5,8 +5,60 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from organograph.skeleton.config import BlendConfig, PrimitiveFitConfig, SkeletonizationConfig
+from organograph.skeleton.config import (
+    BlendConfig,
+    DetectionConfig,
+    PrimitiveFitConfig,
+    SkeletonizationConfig,
+)
 from organograph.skeleton.datatypes import SkeletonGraph
+
+
+@dataclass
+class BarrierStageResult:
+    """Body and branch barriers shared by detection, graph, and primitive stages."""
+
+    body_fit: Any
+    body_mask: Any
+    branch_fits: dict[str, Any] = field(default_factory=dict)
+    branch_masks: dict[str, Any] = field(default_factory=dict)
+    protected_mask: Any | None = None
+    branch_diagnostics: list[dict[str, Any]] = field(default_factory=list)
+
+    def __post_init__(self):
+        if self.protected_mask is None:
+            self.protected_mask = self.body_mask
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "body_fit": self.body_fit.to_dict(),
+            "body_mask": self.body_mask,
+            "branch_fits": {
+                key: fit.to_dict() for key, fit in self.branch_fits.items()
+            },
+            "branch_masks": dict(self.branch_masks),
+            "protected_mask": self.protected_mask,
+            "branch_diagnostics": list(self.branch_diagnostics),
+        }
+
+
+@dataclass
+class DetectionResult:
+    """Typed boundary between crypt detection and graph construction."""
+
+    detections: list[dict[str, Any]]
+    barriers: BarrierStageResult
+    config: DetectionConfig
+    diagnostics: dict[str, Any] = field(default_factory=dict)
+    detection_mesh: Any | None = None
+
+    @property
+    def attachment_crossings(self) -> list[dict[str, Any]]:
+        return list(self.diagnostics.get("attachment_crossings", []))
+
+    @property
+    def failed_attachments(self) -> list[dict[str, Any]]:
+        return list(self.diagnostics.get("attachment_crossing_failures", []))
 
 
 @dataclass
@@ -15,10 +67,12 @@ class SkeletonizationResult:
 
     graph: SkeletonGraph
     detections: list[dict[str, Any]]
+    barriers: BarrierStageResult | None = None
     intermediates: dict[str, Any] = field(default_factory=dict)
     config: SkeletonizationConfig = field(default_factory=SkeletonizationConfig)
     metadata: dict[str, Any] = field(default_factory=dict)
     mesh: Any | None = None
+    geodesic_fn: Any | None = field(default=None, repr=False)
 
     def to_node_dataframe(self):
         return self.graph.to_node_dataframe()
@@ -29,10 +83,15 @@ class SkeletonizationResult:
     def to_primitive_dataframe(self):
         return self.graph.to_primitive_dataframe()
 
+    @property
+    def failed_attachments(self) -> list[dict[str, Any]]:
+        return list(self.intermediates.get("attachment_crossing_failures", []))
+
     def to_dict(self, *, include_intermediates: bool = False) -> dict[str, Any]:
         data = {
             "graph": self.graph.to_dict(),
             "detections": self.detections,
+            "barriers": None if self.barriers is None else self.barriers.to_dict(),
             "config": self.config.to_dict(),
             "metadata": dict(self.metadata),
         }

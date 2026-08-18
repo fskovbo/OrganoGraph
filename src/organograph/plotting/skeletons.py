@@ -80,6 +80,178 @@ def _smooth_centerlines(graph):
     return centerlines
 
 
+def _centerline_curvature_profile(centerline):
+    """Return normalized arc length and discrete three-point curvature."""
+    points = np.asarray(centerline, dtype=float)
+    if points.ndim != 2 or points.shape[1] != 3 or points.shape[0] < 2:
+        raise ValueError("centerline must be an (N, 3) array with N >= 2")
+    lengths, cumulative, total = polyline_lengths(points)
+    if total <= 1e-12:
+        return np.zeros(points.shape[0], dtype=float), np.full(
+            points.shape[0], np.nan, dtype=float
+        )
+
+    s = cumulative / total
+    curvature = np.full(points.shape[0], np.nan, dtype=float)
+    for i in range(1, points.shape[0] - 1):
+        previous = points[i] - points[i - 1]
+        following = points[i + 1] - points[i]
+        chord = points[i + 1] - points[i - 1]
+        denominator = (
+            float(np.linalg.norm(previous))
+            * float(np.linalg.norm(following))
+            * float(np.linalg.norm(chord))
+        )
+        if denominator > 1e-12:
+            curvature[i] = 2.0 * float(
+                np.linalg.norm(np.cross(previous, following))
+            ) / denominator
+    return s, curvature
+
+
+def plot_crypt_primitive_diagnostics(
+    graph,
+    *,
+    title=None,
+    curvature_radius_guides=(0.6, 0.8),
+    width=1200,
+    height=390,
+):
+    """Plot centerline curvature, tube radius, and their product for each crypt."""
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+
+    tubes = [
+        (str(attachment_id), attachment)
+        for attachment_id, attachment in graph.primitive_attachments.items()
+        if attachment.primitive_type == "tapered_capped_tube"
+    ]
+    fig = make_subplots(
+        rows=1,
+        cols=3,
+        subplot_titles=(
+            "Centerline curvature",
+            "Radius profile",
+            "Curvature x radius",
+        ),
+        horizontal_spacing=0.07,
+    )
+    colors = [
+        "#4c78a8",
+        "#f58518",
+        "#54a24b",
+        "#e45756",
+        "#b279a2",
+        "#72b7b2",
+        "#ff9da6",
+        "#9d755d",
+        "#bab0ac",
+    ]
+    for index, (attachment_id, attachment) in enumerate(tubes):
+        parameters = attachment.parameters
+        centerline = np.asarray(parameters.get("centerline_points"), dtype=float)
+        try:
+            s, curvature = _centerline_curvature_profile(centerline)
+            radius = capped_tube_radius(
+                s,
+                float(parameters["r_neck"]),
+                float(parameters["r_body"]),
+                float(parameters.get("r_taper", parameters["r_tip"])),
+                body_s=float(parameters.get("s_body", 0.5)),
+                taper_start=float(
+                    parameters.get(
+                        "s_taper",
+                        parameters.get("distal_taper_start", 0.85),
+                    )
+                ),
+                constriction_s=parameters.get("s_constriction"),
+                r_constriction=parameters.get("r_constriction"),
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+
+        color = colors[index % len(colors)]
+        common = dict(
+            x=s,
+            mode="lines",
+            line=dict(color=color, width=2.5),
+            name=attachment_id,
+            legendgroup=attachment_id,
+        )
+        fig.add_trace(
+            go.Scatter(
+                **common,
+                y=curvature,
+                showlegend=True,
+                hovertemplate=(
+                    f"{attachment_id}<br>s=%{{x:.3f}}"
+                    "<br>curvature=%{y:.4g}<extra></extra>"
+                ),
+            ),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                **common,
+                y=radius,
+                showlegend=False,
+                hovertemplate=(
+                    f"{attachment_id}<br>s=%{{x:.3f}}"
+                    "<br>radius=%{y:.4g}<extra></extra>"
+                ),
+            ),
+            row=1,
+            col=2,
+        )
+        fig.add_trace(
+            go.Scatter(
+                **common,
+                y=curvature * radius,
+                showlegend=False,
+                hovertemplate=(
+                    f"{attachment_id}<br>s=%{{x:.3f}}"
+                    "<br>curvature x radius=%{y:.4g}<extra></extra>"
+                ),
+            ),
+            row=1,
+            col=3,
+        )
+
+    for guide in curvature_radius_guides or ():
+        fig.add_hline(
+            y=float(guide),
+            line_dash="dash",
+            line_width=1,
+            line_color="#777777",
+            row=1,
+            col=3,
+        )
+    for col in range(1, 4):
+        fig.update_xaxes(title_text="Normalized arc length s", range=[0, 1], row=1, col=col)
+    fig.update_yaxes(title_text="1 / mesh unit", row=1, col=1)
+    fig.update_yaxes(title_text="Mesh units", row=1, col=2)
+    fig.update_yaxes(title_text="Dimensionless", rangemode="tozero", row=1, col=3)
+    fig.update_layout(
+        title=title,
+        width=int(width),
+        height=int(height),
+        template="plotly_white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.16, xanchor="left", x=0.0),
+        margin=dict(l=55, r=25, t=105 if title else 80, b=55),
+    )
+    if not tubes:
+        fig.add_annotation(
+            text="No fitted crypt tube primitives",
+            x=0.5,
+            y=0.5,
+            xref="paper",
+            yref="paper",
+            showarrow=False,
+        )
+    return fig
+
+
 def _node_arrays(graph):
     nodes = list(graph.nodes.values())
     xyz = np.vstack([node.position for node in nodes]) if nodes else np.empty((0, 3))

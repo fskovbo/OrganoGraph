@@ -19,6 +19,7 @@ from organograph.skeleton.primitive.common import _residual_summary
 from organograph.skeleton.primitive_geometry import (
     bend_angles_for_polyline,
     capped_tube_radius,
+    estimate_bulged_crypt_centerline,
     component_points,
     estimate_smooth_crypt_centerline,
     point_at_polyline_arclength,
@@ -756,6 +757,30 @@ def attach_crypt_tube_primitives(
                     "control_parameters": np.array([0.0, 1.0]),
                     "bulged_centerline_smoothing_disabled": True,
                 }
+            elif neck_kind == "transition" and bool(smooth_bulged_centerlines):
+                crypt_nodes = [
+                    graph.node(node_id).position
+                    for node_id in path[1:-1]
+                    if graph.node(node_id).node_type == "crypt"
+                ]
+                if crypt_nodes:
+                    try:
+                        centerline_metadata = estimate_bulged_crypt_centerline(
+                            graph_centerline[0],
+                            crypt_nodes[0],
+                            graph_centerline[-1],
+                            n_samples=centerline_n_samples,
+                        )
+                        centerline = centerline_metadata["centerline_points"]
+                    except ValueError as exc:
+                        path_smooth_centerline = False
+                        centerline = graph_centerline[[0, -1]]
+                        centerline_metadata = {
+                            "method": "straight_attachment_to_tip_fallback",
+                            "control_points": centerline,
+                            "control_parameters": np.array([0.0, 1.0]),
+                            "fallback_reason": str(exc),
+                        }
             path_constrictions = [
                 graph.node(node_id).position
                 for node_id in path
@@ -764,6 +789,7 @@ def attach_crypt_tube_primitives(
 
             if (
                 path_smooth_centerline
+                and neck_kind != "transition"
                 and data is not None
                 and data.get("distance_field") is not None
             ):
@@ -795,7 +821,11 @@ def attach_crypt_tube_primitives(
                         **centerline_metadata,
                         "fallback_reason": str(exc),
                     }
-            elif path_smooth_centerline and graph_centerline.shape[0] >= 3:
+            elif (
+                path_smooth_centerline
+                and neck_kind != "transition"
+                and graph_centerline.shape[0] >= 3
+            ):
                 control = np.mean(graph_centerline[1:-1], axis=0)
                 centerline = sample_quadratic_bezier(
                     graph_centerline[0],
@@ -811,7 +841,11 @@ def attach_crypt_tube_primitives(
                     "control_parameters": np.array([0.0, 0.5, 1.0]),
                 }
 
-            if update_crypt_nodes and path_smooth_centerline:
+            if (
+                update_crypt_nodes
+                and path_smooth_centerline
+                and not centerline_metadata.get("crypt_node_on_centerline", False)
+            ):
                 midpoint = point_at_polyline_arclength(centerline, 0.5)
                 for node_id in path[1:-1]:
                     node = graph.node(node_id)
@@ -862,6 +896,12 @@ def attach_crypt_tube_primitives(
                     ),
                     "centerline_fallback_reason": centerline_metadata.get(
                         "fallback_reason"
+                    ),
+                    "centerline_crypt_node_parameter": centerline_metadata.get(
+                        "crypt_node_parameter"
+                    ),
+                    "centerline_initial_tangent_source": centerline_metadata.get(
+                        "initial_tangent_source"
                     ),
                     "smooth_bulged_centerlines": bool(smooth_bulged_centerlines),
                     "bulged_centerline_smoothing_disabled": centerline_metadata.get(

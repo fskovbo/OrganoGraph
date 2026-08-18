@@ -1,67 +1,244 @@
-"""Configuration containers for skeleton and primitive pipelines.
+"""Typed configuration for the definitive organoid shape pipeline.
 
-The objects here are intentionally light wrappers around keyword dictionaries.
-They make batch runs easier to store and replay without freezing the rapidly
-evolving algorithm into a large rigid parameter schema.
+The public configuration mirrors biological stages rather than individual
+implementation functions. Numerical details which are not useful tuning knobs
+remain internal to those stages.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, is_dataclass
+from math import pi
 from typing import Any
+
+
+def _plain(value: Any) -> Any:
+    if is_dataclass(value):
+        return {item.name: _plain(getattr(value, item.name)) for item in fields(value)}
+    if isinstance(value, dict):
+        return {str(key): _plain(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
+    if callable(value):
+        return getattr(value, "__name__", value.__class__.__name__)
+    return value
+
+
+def _coerce(cls, value):
+    if isinstance(value, cls):
+        return value
+    return cls(**dict(value or {}))
+
+
+@dataclass
+class CandidateDetectionConfig:
+    """HKS candidate, split-refinement, and final-tip settings."""
+
+    threshold: float = 0.5
+    filters: list[Any] | None = None
+    vocab_reference: Any | None = None
+    crypt_vocab_indices: Any | None = None
+    refine_threshold: float = 0.0
+    refine_min_area: float = 5.0
+    min_child_fraction: float = 0.05
+    final_tip_hks_time: float = 1.0
+    final_tip_bottom_fraction: float = 0.6
+    final_tip_min_hks_percent_increase: float = 5.0
+    geodesic_kwargs: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class NeckProfileConfig:
+    """Circumference-profile settings used to classify crypt necks."""
+
+    max_axis_level: float = 2.0
+    resolution: int = 200
+    search_interval: tuple[float, float] = (0.8, 2.0)
+    min_prominence: float = 0.05
+    min_length: float = 0.05
+
+
+@dataclass
+class BranchValidationConfig:
+    """Settings for deciding whether a refined parent is a true branch."""
+
+    min_confidence: float = 0.85
+    max_neck_to_body_radius_ratio: float = 0.70
+    max_growth_size_factor: float = 3.0
+    max_mesh_fraction: float = 0.40
+    min_perimeter_prominence_fraction: float = 0.01
+
+
+@dataclass
+class BodyTransitionConfig:
+    """Conservative correction for implausibly broad body-attached crypts."""
+
+    enabled: bool = True
+    max_crypt_to_host_width_ratio: float = 0.80
+    host_width_quantile: float = 0.75
+    min_second_derivative_score: float = 0.60
+    min_attachment_level: float = 0.25
+
+
+def _default_body_barrier_options() -> dict[str, Any]:
+    return {
+        "primitive_type": "superellipsoid",
+        "barrier_weight": 2.5,
+        "underfill_weight": 0.02,
+        "center_regularization": 0.01,
+        "anisotropy_regularization": 0.1,
+        "center_shift_limit_frac": 0.55,
+        "initial_radius_quantile": 0.6,
+        "initial_epsilon_1": 0.9,
+        "epsilon_1_bounds": (0.35, 1.0),
+        "epsilon_1_regularization": 0.01,
+        "epsilon_2": 1.0,
+        "maxiter": 2000,
+    }
+
+
+def _default_branch_barrier_options() -> dict[str, Any]:
+    options = _default_body_barrier_options()
+    options.update(
+        primitive_type="ellipsoid",
+        anisotropy_regularization=1.0,
+        underfill_weight=0.5,
+        barrier_weight=100.0,
+    )
+    return options
+
+
+@dataclass
+class BarrierConfig:
+    """Body/branch barrier fitting, ownership, and boundary crossing settings."""
+
+    body_fit_options: dict[str, Any] = field(default_factory=_default_body_barrier_options)
+    branch_fit_options: dict[str, Any] = field(default_factory=_default_branch_barrier_options)
+    body_ownership_level: float = 1.2
+    branch_ownership_level: float = 1.1
+    min_candidate_vertices: int = 4
+    min_branch_vertices: int = 20
+    sample_fraction: float = 1.0
+    sample_seed: int | None = 0
+    crossing_surface_level: float = 1.0
+    crossing_min_axis_level: float = 0.03
+    crossing_samples: int = 40
+    crossing_persistence: int = 2
+
+    def crossing_kwargs(self) -> dict[str, Any]:
+        return {
+            "surface_level": self.crossing_surface_level,
+            "min_axis_level": self.crossing_min_axis_level,
+            "max_axis_level": None,
+            "n_samples": self.crossing_samples,
+            "persistence": self.crossing_persistence,
+        }
+
+
+@dataclass
+class MeshPreparationConfig:
+    """Optional low-pass mesh used consistently by all skeleton stages."""
+
+    smooth: bool = False
+    spectral_lmax: int = 5
+    recompute_eigen: bool = True
+    eigen_k: int | None = None
+
+
+@dataclass
+class GraphConfig:
+    """Fixed graph-topology settings for the crypt-center waypoint."""
+
+    max_dimensionless_curvature: float | None = 0.5
+    curvature_penalty: float = 8.0
+
+
+@dataclass
+class DetectionConfig:
+    """Configuration of the complete barrier-aware detection stage."""
+
+    candidates: CandidateDetectionConfig = field(default_factory=CandidateDetectionConfig)
+    necks: NeckProfileConfig = field(default_factory=NeckProfileConfig)
+    branches: BranchValidationConfig = field(default_factory=BranchValidationConfig)
+    body_transition: BodyTransitionConfig = field(default_factory=BodyTransitionConfig)
+    barriers: BarrierConfig = field(default_factory=BarrierConfig)
+    mesh: MeshPreparationConfig = field(default_factory=MeshPreparationConfig)
+
+    def __post_init__(self):
+        self.candidates = _coerce(CandidateDetectionConfig, self.candidates)
+        self.necks = _coerce(NeckProfileConfig, self.necks)
+        self.branches = _coerce(BranchValidationConfig, self.branches)
+        self.body_transition = _coerce(BodyTransitionConfig, self.body_transition)
+        self.barriers = _coerce(BarrierConfig, self.barriers)
+        self.mesh = _coerce(MeshPreparationConfig, self.mesh)
 
 
 @dataclass
 class SkeletonizationConfig:
-    """Settings for crypt detection followed by skeleton graph construction."""
+    """Settings for the single supported barrier-aware skeleton workflow."""
 
-    detection_kwargs: dict[str, Any] = field(default_factory=dict)
-    build_kwargs: dict[str, Any] = field(default_factory=dict)
+    detection: DetectionConfig = field(default_factory=DetectionConfig)
+    graph: GraphConfig = field(default_factory=GraphConfig)
+
+    def __post_init__(self):
+        self.detection = _coerce(DetectionConfig, self.detection)
+        self.graph = _coerce(GraphConfig, self.graph)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "detection_kwargs": dict(self.detection_kwargs),
-            "build_kwargs": dict(self.build_kwargs),
-        }
+        return _plain(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "SkeletonizationConfig":
-        data = dict(data or {})
-        return cls(
-            detection_kwargs=dict(data.get("detection_kwargs", {})),
-            build_kwargs=dict(data.get("build_kwargs", {})),
-        )
+        return cls(**dict(data or {}))
+
+
+@dataclass
+class CryptOverlapConfig:
+    """Post-fit merging of strongly overlapping crypt tube primitives."""
+
+    enabled: bool = True
+    threshold: float = 0.30
+    samples: int = 32768
+    random_seed: int | None = 0
+    max_passes: int = 3
+    max_host_attachment_angle: float | None = pi / 3.0
+
+    def __post_init__(self):
+        if not 0.0 <= float(self.threshold) <= 1.0:
+            raise ValueError("crypt overlap threshold must be between 0 and 1")
+        if int(self.samples) < 256:
+            raise ValueError("crypt overlap estimation requires at least 256 samples")
+        if int(self.max_passes) < 1:
+            raise ValueError("crypt overlap max_passes must be at least 1")
+        if self.max_host_attachment_angle is not None and not (
+            0.0 <= float(self.max_host_attachment_angle) <= pi
+        ):
+            raise ValueError(
+                "max_host_attachment_angle must be between 0 and pi, or None"
+            )
 
 
 @dataclass
 class PrimitiveFitConfig:
-    """Settings for fitting interpretable primitives to skeleton components."""
+    """Settings for crypt/neck fitting and optional host-primitive refinement."""
 
+    refine_host_primitives: bool = False
     component_kwargs: dict[str, Any] = field(default_factory=dict)
     body_kwargs: dict[str, Any] = field(default_factory=dict)
     branch_kwargs: dict[str, Any] = field(default_factory=dict)
     body_branch_neck_kwargs: dict[str, Any] = field(default_factory=dict)
     crypt_tube_kwargs: dict[str, Any] = field(default_factory=dict)
+    crypt_overlap: CryptOverlapConfig = field(default_factory=CryptOverlapConfig)
+
+    def __post_init__(self):
+        self.crypt_overlap = _coerce(CryptOverlapConfig, self.crypt_overlap)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "component_kwargs": dict(self.component_kwargs),
-            "body_kwargs": dict(self.body_kwargs),
-            "branch_kwargs": dict(self.branch_kwargs),
-            "body_branch_neck_kwargs": dict(self.body_branch_neck_kwargs),
-            "crypt_tube_kwargs": dict(self.crypt_tube_kwargs),
-        }
+        return _plain(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "PrimitiveFitConfig":
-        data = dict(data or {})
-        return cls(
-            component_kwargs=dict(data.get("component_kwargs", {})),
-            body_kwargs=dict(data.get("body_kwargs", {})),
-            branch_kwargs=dict(data.get("branch_kwargs", {})),
-            body_branch_neck_kwargs=dict(data.get("body_branch_neck_kwargs", {})),
-            crypt_tube_kwargs=dict(data.get("crypt_tube_kwargs", {})),
-        )
+        return cls(**dict(data or {}))
 
 
 @dataclass
@@ -83,49 +260,8 @@ class BlendConfig:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "enabled": bool(self.enabled),
-            "n_samples": int(self.n_samples),
-            "extension_length_fraction": float(self.extension_length_fraction),
-            "host_overlap_radius_fraction": float(self.host_overlap_radius_fraction),
-            "max_host_overlap_distance_fraction": float(
-                self.max_host_overlap_distance_fraction
-            ),
-            "crypt_overlap_radius_fraction": float(self.crypt_overlap_radius_fraction),
-            "host_radius_scale": float(self.host_radius_scale),
-            "min_host_to_crypt_radius_ratio": float(
-                self.min_host_to_crypt_radius_ratio
-            ),
-            "max_host_radius_fraction": float(self.max_host_radius_fraction),
-            "use_mesh_radius_fit": bool(self.use_mesh_radius_fit),
-            "mesh_radius_quantile": float(self.mesh_radius_quantile),
-            "mesh_search_radius_scale": float(self.mesh_search_radius_scale),
-            "metadata": dict(self.metadata),
-        }
+        return _plain(self)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "BlendConfig":
-        data = dict(data or {})
-        return cls(
-            enabled=bool(data.get("enabled", True)),
-            n_samples=int(data.get("n_samples", 32)),
-            extension_length_fraction=float(data.get("extension_length_fraction", 0.5)),
-            host_overlap_radius_fraction=float(
-                data.get("host_overlap_radius_fraction", 0.8)
-            ),
-            max_host_overlap_distance_fraction=float(
-                data.get("max_host_overlap_distance_fraction", 0.2)
-            ),
-            crypt_overlap_radius_fraction=float(
-                data.get("crypt_overlap_radius_fraction", 0.15)
-            ),
-            host_radius_scale=float(data.get("host_radius_scale", 2.5)),
-            min_host_to_crypt_radius_ratio=float(
-                data.get("min_host_to_crypt_radius_ratio", 1.4)
-            ),
-            max_host_radius_fraction=float(data.get("max_host_radius_fraction", 0.35)),
-            use_mesh_radius_fit=bool(data.get("use_mesh_radius_fit", True)),
-            mesh_radius_quantile=float(data.get("mesh_radius_quantile", 0.65)),
-            mesh_search_radius_scale=float(data.get("mesh_search_radius_scale", 2.5)),
-            metadata=dict(data.get("metadata", {})),
-        )
+        return cls(**dict(data or {}))

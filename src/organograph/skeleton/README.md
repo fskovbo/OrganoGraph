@@ -59,6 +59,9 @@ datasets and timepoints declared in its `DATASET_TIMEPOINTS` configuration. It
 writes one combined export beneath its configurable `EXPORT_ROOT`, retaining
 the source dataset in every sample path and manifest row.
 
+`notebooks/audit_crypt_primitive_fits.ipynb` audits an existing export and can
+compare it with a complete or partial candidate export using matched organoids.
+
 ## Reconstructive export
 
 The tutorial and batch script share the maintained factories in `profiles.py`.

@@ -68,7 +68,7 @@ WHITELIST_PATH = None
 
 OVERWRITE = False
 VERBOSE = True
-DRY_RUN = True
+DRY_RUN = False
 STRICT = False
 MAX_MESHES = None
 

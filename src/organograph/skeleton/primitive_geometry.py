@@ -1,4 +1,4 @@
-"""Geometry helpers for fitting and visualizing skeleton primitives."""
+"""Shared geometry for current skeleton primitives."""
 
 from __future__ import annotations
 
@@ -11,399 +11,81 @@ from organograph.skeleton.geometry import as_points
 
 
 def component_points(vertices, component) -> np.ndarray:
-    """Return component points from either point coordinates or vertex indices."""
+    """Return component points from either coordinates or vertex indices."""
     if component is None:
         return as_points(vertices)
-    arr = np.asarray(component)
-    if arr.ndim == 2 and arr.shape[1] == 3:
-        return as_points(arr)
-    idx = np.asarray(list(component) if isinstance(component, set) else component, dtype=np.int64)
-    if idx.ndim != 1:
-        raise ValueError("Component must be an (N, 3) point array or 1D vertex indices")
-    return as_points(vertices)[idx]
+    array = np.asarray(component)
+    if array.ndim == 2 and array.shape[1] == 3:
+        return as_points(array)
+    indices = np.asarray(list(component) if isinstance(component, set) else component, dtype=np.int64)
+    if indices.ndim != 1:
+        raise ValueError("Component must be an (N, 3) array or 1D vertex indices")
+    return as_points(vertices)[indices]
 
 
 def polyline_lengths(points) -> tuple[np.ndarray, np.ndarray, float]:
-    """Return segment lengths, cumulative vertex arclengths, and total length."""
-    pts = as_points(points)
-    if pts.shape[0] < 2:
-        return np.empty(0, dtype=float), np.zeros(pts.shape[0], dtype=float), 0.0
-    seg = pts[1:] - pts[:-1]
-    lengths = np.linalg.norm(seg, axis=1)
+    """Return segment lengths, cumulative arclengths, and total length."""
+    points = as_points(points)
+    if points.shape[0] < 2:
+        return np.empty(0), np.zeros(points.shape[0]), 0.0
+    lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
     cumulative = np.concatenate([[0.0], np.cumsum(lengths)])
     return lengths, cumulative, float(cumulative[-1])
 
 
-def point_segment_projection(points, a, b):
-    """Project points onto one segment and return closest points and parameters."""
-    pts = as_points(points)
-    a = np.asarray(a, dtype=float)
-    b = np.asarray(b, dtype=float)
-    ab = b - a
-    denom = float(np.dot(ab, ab))
-    if denom <= 1e-12:
-        t = np.zeros(pts.shape[0], dtype=float)
-        closest = np.repeat(a[None, :], pts.shape[0], axis=0)
-        return closest, t
-    t = np.clip(((pts - a) @ ab) / denom, 0.0, 1.0)
-    closest = a[None, :] + t[:, None] * ab[None, :]
-    return closest, t
+def point_segment_projection(points, start, end):
+    """Project points onto one segment and return points and parameters."""
+    points = as_points(points)
+    start = np.asarray(start, dtype=float)
+    end = np.asarray(end, dtype=float)
+    segment = end - start
+    denominator = float(np.dot(segment, segment))
+    if denominator <= 1e-12:
+        parameters = np.zeros(points.shape[0])
+        return np.repeat(start[None, :], points.shape[0], axis=0), parameters
+    parameters = np.clip(((points - start) @ segment) / denominator, 0.0, 1.0)
+    return start + parameters[:, None] * segment, parameters
 
 
 def project_points_to_polyline(points, centerline):
-    """Project points to a piecewise-linear centerline.
-
-    Returns a dictionary with closest points, distances, normalized arclength
-    coordinates, absolute arclength coordinates, and segment indices.
-    """
-    pts = as_points(points)
+    """Project points to a polyline and return distances and arclength coordinates."""
+    points = as_points(points)
     line = as_points(centerline)
-    seg_lengths, cumulative, total = polyline_lengths(line)
+    lengths, cumulative, total = polyline_lengths(line)
     if line.shape[0] == 0:
         raise ValueError("Centerline cannot be empty")
     if line.shape[0] == 1 or total <= 1e-12:
-        closest = np.repeat(line[:1], pts.shape[0], axis=0)
-        distances = np.linalg.norm(pts - closest, axis=1)
+        closest = np.repeat(line[:1], points.shape[0], axis=0)
         return {
             "closest_points": closest,
-            "distances": distances,
-            "s": np.zeros(pts.shape[0], dtype=float),
-            "arclength": np.zeros(pts.shape[0], dtype=float),
-            "segment_index": np.zeros(pts.shape[0], dtype=np.int64),
+            "distances": np.linalg.norm(points - closest, axis=1),
+            "s": np.zeros(points.shape[0]),
+            "arclength": np.zeros(points.shape[0]),
+            "segment_index": np.zeros(points.shape[0], dtype=np.int64),
         }
-
-    best_dist2 = np.full(pts.shape[0], np.inf, dtype=float)
-    best_closest = np.zeros_like(pts)
-    best_arclength = np.zeros(pts.shape[0], dtype=float)
-    best_segment = np.zeros(pts.shape[0], dtype=np.int64)
-    for i, length in enumerate(seg_lengths):
-        closest, t = point_segment_projection(pts, line[i], line[i + 1])
-        dist2 = np.sum((pts - closest) ** 2, axis=1)
-        update = dist2 < best_dist2
-        best_dist2[update] = dist2[update]
+    best_distance2 = np.full(points.shape[0], np.inf)
+    best_closest = np.zeros_like(points)
+    best_arclength = np.zeros(points.shape[0])
+    best_segment = np.zeros(points.shape[0], dtype=np.int64)
+    for index, length in enumerate(lengths):
+        closest, parameter = point_segment_projection(points, line[index], line[index + 1])
+        distance2 = np.sum((points - closest) ** 2, axis=1)
+        update = distance2 < best_distance2
+        best_distance2[update] = distance2[update]
         best_closest[update] = closest[update]
-        best_arclength[update] = cumulative[i] + t[update] * length
-        best_segment[update] = i
-
+        best_arclength[update] = cumulative[index] + parameter[update] * length
+        best_segment[update] = index
     return {
         "closest_points": best_closest,
-        "distances": np.sqrt(best_dist2),
+        "distances": np.sqrt(best_distance2),
         "s": best_arclength / total,
         "arclength": best_arclength,
         "segment_index": best_segment,
     }
 
 
-def sample_quadratic_bezier(
-    start,
-    control,
-    end,
-    *,
-    n_samples: int = 64,
-) -> np.ndarray:
-    """Sample one quadratic Bézier centerline segment."""
-    start = np.asarray(start, dtype=float)
-    control = np.asarray(control, dtype=float)
-    end = np.asarray(end, dtype=float)
-    if start.shape != (3,) or control.shape != (3,) or end.shape != (3,):
-        raise ValueError("Bézier start, control, and end must be 3-vectors")
-    u = np.linspace(0.0, 1.0, max(2, int(n_samples)))
-    return (
-        (1.0 - u)[:, None] ** 2 * start
-        + 2.0 * (1.0 - u)[:, None] * u[:, None] * control
-        + u[:, None] ** 2 * end
-    )
-
-
-def sample_cubic_bezier(
-    start,
-    control_1,
-    control_2,
-    end,
-    *,
-    n_samples: int = 64,
-) -> np.ndarray:
-    """Sample one cubic Bézier centerline segment."""
-    points = [
-        np.asarray(point, dtype=float)
-        for point in (start, control_1, control_2, end)
-    ]
-    if any(point.shape != (3,) for point in points):
-        raise ValueError("Bézier points must be 3-vectors")
-    start, control_1, control_2, end = points
-    u = np.linspace(0.0, 1.0, max(2, int(n_samples)))
-    return (
-        (1.0 - u)[:, None] ** 3 * start
-        + 3.0 * (1.0 - u)[:, None] ** 2 * u[:, None] * control_1
-        + 3.0 * (1.0 - u)[:, None] * u[:, None] ** 2 * control_2
-        + u[:, None] ** 3 * end
-    )
-
-
-def estimate_bulged_crypt_centerline(
-    attachment_position,
-    crypt_position,
-    tip_position,
-    *,
-    n_samples: int = 64,
-) -> dict[str, Any]:
-    """Fit one cubic curve through a bulged crypt's three skeleton nodes.
-
-    The initial Bézier handle is constrained to the attachment-to-crypt-node
-    direction. The second handle is then chosen so the curve passes through
-    the crypt node, with the remaining scalar handle length selected to
-    minimize integrated squared acceleration. This gives a smooth single
-    segment whose attachment tangent agrees exactly with the skeleton edge.
-    """
-    attachment = np.asarray(attachment_position, dtype=float)
-    crypt = np.asarray(crypt_position, dtype=float)
-    tip = np.asarray(tip_position, dtype=float)
-    if any(point.shape != (3,) for point in (attachment, crypt, tip)):
-        raise ValueError("Bulged crypt centerline nodes must be 3-vectors")
-    if not all(np.all(np.isfinite(point)) for point in (attachment, crypt, tip)):
-        raise ValueError("Bulged crypt centerline nodes must be finite")
-
-    proximal = crypt - attachment
-    distal = tip - crypt
-    proximal_length = float(np.linalg.norm(proximal))
-    distal_length = float(np.linalg.norm(distal))
-    if proximal_length <= 1e-12 or distal_length <= 1e-12:
-        raise ValueError("Bulged crypt centerline nodes must be distinct")
-
-    node_parameter = float(
-        np.clip(
-            proximal_length / (proximal_length + distal_length),
-            0.2,
-            0.8,
-        )
-    )
-    t = node_parameter
-    a0 = (1.0 - t) ** 3
-    a1 = 3.0 * (1.0 - t) ** 2 * t
-    a2 = 3.0 * (1.0 - t) * t**2
-    a3 = t**3
-
-    control_2_zero = (
-        crypt - a0 * attachment - a1 * attachment - a3 * tip
-    ) / a2
-    control_2_slope = -(a1 / a2) * proximal
-
-    acceleration_start_zero = control_2_zero - attachment
-    acceleration_start_slope = control_2_slope - 2.0 * proximal
-    acceleration_end_zero = tip - 2.0 * control_2_zero + attachment
-    acceleration_end_slope = -2.0 * control_2_slope + proximal
-    linear_term = (
-        2.0 * np.dot(acceleration_start_zero, acceleration_start_slope)
-        + np.dot(acceleration_start_slope, acceleration_end_zero)
-        + np.dot(acceleration_start_zero, acceleration_end_slope)
-        + 2.0 * np.dot(acceleration_end_zero, acceleration_end_slope)
-    )
-    quadratic_term = (
-        np.dot(acceleration_start_slope, acceleration_start_slope)
-        + np.dot(acceleration_start_slope, acceleration_end_slope)
-        + np.dot(acceleration_end_slope, acceleration_end_slope)
-    )
-    handle_scale = (
-        float(np.clip(-linear_term / (2.0 * quadratic_term), 0.05, 3.0))
-        if quadratic_term > 1e-12
-        else 1.0 / 3.0
-    )
-    control_1 = attachment + handle_scale * proximal
-    control_2 = control_2_zero + handle_scale * control_2_slope
-    centerline = sample_cubic_bezier(
-        attachment,
-        control_1,
-        control_2,
-        tip,
-        n_samples=n_samples,
-    )
-    return {
-        "centerline_points": centerline,
-        "control_points": np.vstack([attachment, control_1, control_2, tip]),
-        "control_parameters": np.array([0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0]),
-        "crypt_node_parameter": node_parameter,
-        "crypt_node_on_centerline": True,
-        "initial_tangent": control_1 - attachment,
-        "initial_tangent_source": "attachment_to_crypt_edge",
-        "method": "skeleton_anchored_bulged_cubic_bezier",
-    }
-
-
-def fit_quadratic_bezier_control(
-    start,
-    end,
-    observations,
-    parameters,
-    *,
-    weights=None,
-    regularization: float = 0.05,
-) -> np.ndarray:
-    """Fit the single control point of a quadratic Bézier segment."""
-    start = np.asarray(start, dtype=float)
-    end = np.asarray(end, dtype=float)
-    observations = as_points(observations)
-    parameters = np.asarray(parameters, dtype=float).reshape(-1)
-    if observations.shape[0] != parameters.size:
-        raise ValueError("observations and parameters must have matching lengths")
-    if observations.shape[0] == 0:
-        return 0.5 * (start + end)
-
-    u = np.clip(parameters, 1e-6, 1.0 - 1e-6)
-    coefficient = 2.0 * (1.0 - u) * u
-    target = (
-        observations
-        - (1.0 - u)[:, None] ** 2 * start
-        - u[:, None] ** 2 * end
-    )
-    if weights is None:
-        weights = np.ones_like(u)
-    weights = np.asarray(weights, dtype=float).reshape(-1)
-    if weights.size != u.size:
-        raise ValueError("weights must match the observation count")
-    weights = np.maximum(weights, 0.0)
-
-    prior = 0.5 * (start + end)
-    scale = max(float(np.sum(weights * coefficient**2)), 1e-12)
-    penalty = max(float(regularization), 0.0) * scale
-    numerator = np.sum(
-        (weights * coefficient)[:, None] * target,
-        axis=0,
-    ) + penalty * prior
-    denominator = scale + penalty
-    return numerator / max(denominator, 1e-12)
-
-
-def estimate_smooth_crypt_centerline(
-    vertices,
-    component_vertices,
-    distance_field,
-    neck_position,
-    tip_position,
-    *,
-    neck_level: float = 1.0,
-    n_bands: int = 7,
-    n_samples: int = 64,
-    min_band_points: int = 3,
-    control_regularization: float = 0.05,
-    constriction_position=None,
-    constriction_level: float | None = None,
-    constriction_weight: float = 4.0,
-) -> dict[str, Any]:
-    """Estimate a smooth internal crypt centerline from geodesic bands.
-
-    The normalized crypt-axis field is expected to be approximately zero at
-    the geodesic bottom and ``neck_level`` at the neckline. Surface vertices
-    are grouped into proximal-to-distal bands; each band centroid is an
-    internal ring-center estimate. Those centers collectively fit the one
-    control point of a quadratic Bézier segment with fixed neckline and tip.
-    """
-    vertices = as_points(vertices)
-    indices = np.asarray(
-        list(component_vertices) if isinstance(component_vertices, set) else component_vertices,
-        dtype=np.int64,
-    ).reshape(-1)
-    field = np.asarray(distance_field, dtype=float).reshape(-1)
-    neck = np.asarray(neck_position, dtype=float)
-    tip = np.asarray(tip_position, dtype=float)
-    if field.size != vertices.shape[0]:
-        raise ValueError("distance_field must contain one value per mesh vertex")
-    if indices.size == 0:
-        raise ValueError("component_vertices cannot be empty")
-    level = float(neck_level)
-    if not np.isfinite(level) or level <= 0.0:
-        raise ValueError("neck_level must be positive")
-
-    valid = indices[(indices >= 0) & (indices < vertices.shape[0])]
-    valid = valid[np.isfinite(field[valid])]
-    if valid.size < 3:
-        raise ValueError("Too few component vertices have finite axis distances")
-
-    axis_s = 1.0 - np.clip(field[valid] / level, 0.0, 1.0)
-    n_bands = max(3, int(n_bands))
-    targets = np.linspace(0.0, 1.0, n_bands)
-    half_width = 0.5 / float(n_bands - 1)
-    minimum = max(1, int(min_band_points))
-    ring_centers = []
-    ring_parameters = []
-    band_sizes = []
-
-    for target in targets[1:-1]:
-        selected = np.where(np.abs(axis_s - target) <= half_width)[0]
-        if selected.size < minimum:
-            order = np.argsort(np.abs(axis_s - target))
-            selected = order[: min(max(minimum, valid.size // n_bands), valid.size)]
-        if selected.size == 0:
-            continue
-        ring_centers.append(np.mean(vertices[valid[selected]], axis=0))
-        ring_parameters.append(float(target))
-        band_sizes.append(int(selected.size))
-
-    ring_centers = np.asarray(ring_centers, dtype=float).reshape(-1, 3)
-    ring_parameters = np.asarray(ring_parameters, dtype=float)
-    fit_centers = ring_centers.copy()
-    fit_parameters = ring_parameters.copy()
-    fit_weights = np.asarray(band_sizes, dtype=float)
-    constriction_parameter = None
-    constriction_used = False
-    if constriction_position is not None:
-        constriction = np.asarray(constriction_position, dtype=float)
-        c_level = 1.0 if constriction_level is None else float(constriction_level)
-        c_parameter = 1.0 - c_level / level
-        if (
-            constriction.shape == (3,)
-            and np.all(np.isfinite(constriction))
-            and 0.0 < c_parameter < 1.0
-            and float(constriction_weight) > 0.0
-        ):
-            reference_weight = (
-                float(np.median(fit_weights))
-                if fit_weights.size
-                else 1.0
-            )
-            anchor_weight = max(reference_weight, 1.0) * float(constriction_weight)
-            fit_centers = np.vstack([fit_centers, constriction])
-            fit_parameters = np.append(fit_parameters, c_parameter)
-            fit_weights = np.append(fit_weights, anchor_weight)
-            constriction_parameter = float(c_parameter)
-            constriction_used = True
-
-    control = fit_quadratic_bezier_control(
-        neck,
-        tip,
-        fit_centers,
-        fit_parameters,
-        weights=fit_weights,
-        regularization=control_regularization,
-    )
-    centerline = sample_quadratic_bezier(
-        neck,
-        control,
-        tip,
-        n_samples=n_samples,
-    )
-    return {
-        "centerline_points": centerline,
-        "control_points": np.vstack([neck, control, tip]),
-        "control_parameters": np.array([0.0, 0.5, 1.0]),
-        "bezier_control_point": control,
-        "ring_centers": ring_centers,
-        "ring_parameters": ring_parameters,
-        "band_sizes": band_sizes,
-        "constriction_used": constriction_used,
-        "constriction_parameter": constriction_parameter,
-        "constriction_weight": (
-            float(constriction_weight) if constriction_used else None
-        ),
-        "method": (
-            "geodesic_bands_constriction_anchored_quadratic_bezier"
-            if constriction_used
-            else "geodesic_band_centroids_quadratic_bezier"
-        ),
-    }
-
-
 def point_at_polyline_arclength(points, fraction: float) -> np.ndarray:
-    """Return the point at a normalized arc-length fraction of a polyline."""
+    """Return the point at a normalized polyline arclength."""
     line = as_points(points)
     lengths, cumulative, total = polyline_lengths(line)
     if line.shape[0] == 0:
@@ -424,69 +106,48 @@ def capped_tube_radius(
     r_tip: float,
     *,
     body_s: float = 0.5,
+    center_s: float | None = None,
     taper_start: float = 0.85,
     constriction_s: float | None = None,
     r_constriction: float | None = None,
 ) -> np.ndarray:
-    """Shape-preserving smooth radius profile that closes at the crypt tip.
-
-    A cubic Hermite interpolant is applied to squared radius through
-    ``r_neck`` at s=0, ``r_body`` at ``body_s``, ``r_tip`` at
-    ``taper_start``, and zero at s=1. Interpolating squared radius preserves
-    non-negativity and gives a rounded square-root closure at the tip without
-    introducing a separately parameterized cap interval.
-    """
+    """Evaluate the shape-preserving squared-radius crypt profile."""
     values = np.asarray(s, dtype=float)
-    body = float(body_s)
-    start = float(taper_start)
-    if not (0.0 < body < start < 1.0):
-        raise ValueError("Radius positions must satisfy 0 < body_s < taper_start < 1")
-
+    center = float(body_s if center_s is None else center_s)
+    taper = float(taper_start)
+    if not 0.0 < center < taper < 1.0:
+        raise ValueError("Radius positions must satisfy 0 < center_s < s_taper < 1")
     clipped = np.clip(values, 0.0, 1.0)
     if constriction_s is not None and r_constriction is not None:
         constriction = float(constriction_s)
-        if not (0.0 < constriction < body):
-            raise ValueError(
-                "constriction_s must satisfy 0 < constriction_s < body_s"
-            )
-        control_s = np.array(
-            [0.0, constriction, body, start, 1.0],
-            dtype=float,
-        )
-        control_radius = np.array(
-            [r_neck, r_constriction, r_body, r_tip, 0.0],
-            dtype=float,
-        )
+        if not 0.0 < constriction < center:
+            raise ValueError("s_constriction must satisfy 0 < s_constriction < s_center")
+        control_s = np.array([0.0, constriction, center, taper, 1.0])
+        control_radius = np.array([r_neck, r_constriction, r_body, r_tip, 0.0])
     else:
-        control_s = np.array([0.0, body, start, 1.0], dtype=float)
-        control_radius = np.array([r_neck, r_body, r_tip, 0.0], dtype=float)
-    control_radius = np.maximum(control_radius, 0.0)
-    squared_radius = PchipInterpolator(
-        control_s,
-        control_radius**2,
-        extrapolate=False,
+        control_s = np.array([0.0, center, taper, 1.0])
+        control_radius = np.array([r_neck, r_body, r_tip, 0.0])
+    squared = PchipInterpolator(
+        control_s, np.maximum(control_radius, 0.0) ** 2, extrapolate=False
     )(clipped)
-    out = np.sqrt(np.maximum(squared_radius, 0.0))
-    out[values >= 1.0] = 0.0
-    return out
+    output = np.sqrt(np.maximum(squared, 0.0))
+    output[values >= 1.0] = 0.0
+    return output
 
 
 def bend_angles_for_polyline(points) -> list[float]:
-    """Return angles between consecutive straight segments of a polyline."""
-    pts = as_points(points)
-    if pts.shape[0] < 3:
-        return []
+    """Return angles between consecutive polyline segments."""
+    points = as_points(points)
     angles = []
-    for i in range(1, pts.shape[0] - 1):
-        v0 = pts[i] - pts[i - 1]
-        v1 = pts[i + 1] - pts[i]
-        n0 = float(np.linalg.norm(v0))
-        n1 = float(np.linalg.norm(v1))
-        if n0 <= 1e-12 or n1 <= 1e-12:
-            angles.append(float("nan"))
-            continue
-        cosang = float(np.dot(v0, v1) / (n0 * n1))
-        angles.append(float(np.arccos(np.clip(cosang, -1.0, 1.0))))
+    for index in range(1, points.shape[0] - 1):
+        first = points[index] - points[index - 1]
+        second = points[index + 1] - points[index]
+        denominator = float(np.linalg.norm(first) * np.linalg.norm(second))
+        angles.append(
+            float("nan")
+            if denominator <= 1e-12
+            else float(np.arccos(np.clip(np.dot(first, second) / denominator, -1.0, 1.0)))
+        )
     return angles
 
 

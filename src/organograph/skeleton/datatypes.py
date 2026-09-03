@@ -1,9 +1,9 @@
 """Data structures for biology-aware organoid skeleton graphs.
 
 These classes represent compact skeletons derived from crypt detections, not
-generic medial axes.  Edges are straight segments.  Crypt bending is represented
-by inserting explicit bend nodes, so derived descriptors such as tortuosity and
-bend angle are computed from graph geometry rather than stored independently.
+generic medial axes. Graph edges are straight segments. A crypt-center node
+marks the volume center of its fitted tube primitive, while that primitive uses
+a constrained smooth centerline between attachment and tip.
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ NODE_TYPES = {
     "body",
     "neck",
     "attachment",
-    "constriction",
+    "constriction",  # Historical exports only; current fits keep this in the radius profile.
     "crypt",
     "bend",
     "branch",

@@ -6,8 +6,6 @@ from collections import defaultdict, deque
 from typing import Any
 
 import numpy as np
-from scipy.optimize import least_squares
-from scipy.special import expit
 
 from organograph.skeleton.datatypes import SkeletonGraph
 from organograph.skeleton.geometry import as_points
@@ -16,16 +14,19 @@ from organograph.skeleton.primitive.blobs import (
     fit_blob_primitive_to_points,
 )
 from organograph.skeleton.primitive.common import _residual_summary
+from organograph.skeleton.primitive.crypt_geometry import fit_crypt_geometry
+from organograph.skeleton.primitive.radius_profiles import (
+    RadiusProfileObservations,
+    fitted_radius_volume_center,
+    fit_interpretable_radius_profile,
+)
 from organograph.skeleton.primitive_geometry import (
     bend_angles_for_polyline,
     capped_tube_radius,
-    estimate_bulged_crypt_centerline,
     component_points,
-    estimate_smooth_crypt_centerline,
     point_at_polyline_arclength,
     polyline_lengths,
     project_points_to_polyline,
-    sample_quadratic_bezier,
     sanitize_id,
 )
 from organograph.skeleton.primitives import PrimitiveAttachment, PrimitiveFit
@@ -78,99 +79,41 @@ def crypt_terminal_paths(graph: SkeletonGraph, crypt_id) -> list[list[str]]:
         out.append(path[last_neck_index:])
     return out
 
-def _radius_from_window(
-    distances: np.ndarray,
-    s: np.ndarray,
-    lo: float,
-    hi: float,
-    *,
-    quantile: float,
-) -> float:
-    mask = (s >= float(lo)) & (s <= float(hi)) & np.isfinite(distances)
-    if not np.any(mask):
-        center = 0.5 * (float(lo) + float(hi))
-        order = np.argsort(np.abs(s - center))
-        keep = order[: max(1, min(10, order.size))]
-        vals = distances[keep]
-    else:
-        vals = distances[mask]
-    vals = vals[np.isfinite(vals)]
-    if vals.size == 0:
-        return float("nan")
-    return float(np.quantile(vals, quantile))
-
-def _logit(value: float) -> float:
-    value = float(np.clip(value, 1e-6, 1.0 - 1e-6))
-    return float(np.log(value / (1.0 - value)))
-
-def _decode_profile_positions(
-    body_raw: float,
-    taper_raw: float,
-    *,
-    body_position_bounds: tuple[float, float],
-    min_taper_gap: float,
-    max_taper_position: float,
-) -> tuple[float, float]:
-    body_min, body_max = map(float, body_position_bounds)
-    body_s = body_min + (body_max - body_min) * float(expit(body_raw))
-    taper_min = body_s + float(min_taper_gap)
-    taper_room = max(float(max_taper_position) - taper_min, 0.0)
-    taper_s = taper_min + taper_room * float(expit(taper_raw))
-    return body_s, taper_s
-
-def _initial_position_variables(
-    body_s: float,
-    taper_s: float,
-    *,
-    body_position_bounds: tuple[float, float],
-    min_taper_gap: float,
-    max_taper_position: float,
-) -> tuple[float, float]:
-    body_min, body_max = map(float, body_position_bounds)
-    body_frac = (float(body_s) - body_min) / max(body_max - body_min, 1e-12)
-    body_raw = _logit(body_frac)
-    decoded_body, _ = _decode_profile_positions(
-        body_raw,
-        0.0,
-        body_position_bounds=body_position_bounds,
-        min_taper_gap=min_taper_gap,
-        max_taper_position=max_taper_position,
-    )
-    taper_min = decoded_body + float(min_taper_gap)
-    taper_frac = (float(taper_s) - taper_min) / max(
-        float(max_taper_position) - taper_min,
-        1e-12,
-    )
-    return body_raw, _logit(taper_frac)
-
 def fit_crypt_tube_to_points(
     points,
     centerline_points,
     *,
     path_node_ids: list[str] | None = None,
+    center_s: float = 0.5,
     radius_quantile: float = 0.5,
-    neck_window: tuple[float, float] = (0.0, 0.2),
-    body_window: tuple[float, float] = (0.4, 0.6),
+    neck_window: tuple[float, float] = (0.0, 0.05),
     tip_window: tuple[float, float] | None = None,
     optimize_radius_profile: bool = True,
-    initial_body_position: float = 0.5,
-    initial_taper_position: float = 0.85,
-    body_position_bounds: tuple[float, float] = (0.2, 0.7),
-    min_taper_gap: float = 0.1,
-    max_taper_position: float = 0.9,
-    distal_taper_start: float | None = None,
+    fixed_taper_position: float = 0.85,
+    outside_volume_weight: float = 2.0,
     constriction_s: float | None = None,
     constriction_window_half_width: float = 0.04,
+    profile_n_bins: int = 20,
+    profile_min_points_per_bin: int = 2,
+    profile_min_supported_bins: int = 6,
+    max_constriction_to_neighbor_fraction: float = 0.98,
+    tip_projection_tolerance: float = 1e-6,
+    opening_normal=None,
+    opening_frame_blend_fraction: float = 0.15,
+    contour_s=None,
+    contour_radii=None,
+    volume_center_max_iterations: int = 8,
+    volume_center_tolerance: float = 1e-4,
     metadata: dict[str, Any] | None = None,
 ) -> PrimitiveFit:
     """Fit a tapered capped tube to crypt component points.
 
     The supplied centerline is represented by dense straight samples of the
-    fitted smooth curve. Attachment, body, and distal taper radii are estimated
-    from point distances to that curve. Budded crypt paths can additionally
-    provide ``constriction_s`` to fit an explicit internal minimum radius.
-    Radii and the ordered control positions ``s_body`` and ``s_taper`` are
-    jointly optimized, and the profile closes smoothly at the crypt-tip node.
+    endpoint-normal constrained Hermite curve. Maintained workflows provide contour-derived radius
+    observations, avoiding dependence on mesh tessellation density. Direct
+    point-cloud callers fall back to equal-arclength bins. The distal cap onset
+    is fixed, a detected constriction remains a local radius minimum, and the
+    profile closes smoothly at the crypt-tip node.
     """
     pts = as_points(points)
     centerline = as_points(centerline_points)
@@ -182,167 +125,137 @@ def fit_crypt_tube_to_points(
     projection = project_points_to_polyline(pts, centerline)
     distances = projection["distances"]
     s = projection["s"]
-    q = float(radius_quantile)
-    if not (0.0 < q <= 1.0):
-        q = 0.5
-    if distal_taper_start is not None:
-        initial_taper_position = float(distal_taper_start)
-    body_min, body_max = map(float, body_position_bounds)
-    gap = float(min_taper_gap)
-    taper_max = float(max_taper_position)
-    if not (0.0 < body_min < body_max < 1.0):
-        raise ValueError("body_position_bounds must satisfy 0 < min < max < 1")
-    if gap <= 0.0 or body_max + gap > taper_max or taper_max >= 1.0:
-        raise ValueError(
-            "Profile safeguards must allow body_s + min_taper_gap <= max_taper_position < 1"
+    normalized_opening = None
+    if opening_normal is not None:
+        normalized_opening = np.asarray(opening_normal, dtype=float)
+        if normalized_opening.shape != (3,) or not np.all(np.isfinite(normalized_opening)):
+            raise ValueError("opening_normal must be a finite 3-vector")
+        opening_norm = float(np.linalg.norm(normalized_opening))
+        if opening_norm <= 1e-12:
+            raise ValueError("opening_normal must be non-zero")
+        normalized_opening = normalized_opening / opening_norm
+    frame_blend = float(opening_frame_blend_fraction)
+    if not 0.0 < frame_blend <= 1.0:
+        raise ValueError("opening_frame_blend_fraction must lie in (0, 1]")
+    observations_override = None
+    if contour_s is not None and contour_radii is not None:
+        observed_s = np.asarray(contour_s, dtype=float).reshape(-1)
+        observed_radii = np.asarray(contour_radii, dtype=float).reshape(-1)
+        valid = (
+            np.isfinite(observed_s)
+            & np.isfinite(observed_radii)
+            & (observed_radii >= 0.0)
         )
-    constriction_position = None
-    if constriction_s is not None:
-        constriction_position = float(constriction_s)
-        if not (0.0 < constriction_position < body_max):
-            constriction_position = None
-    effective_body_min = body_min
-    if constriction_position is not None:
-        effective_body_min = max(body_min, constriction_position + 0.05)
-        if effective_body_min >= body_max:
-            constriction_position = None
-            effective_body_min = body_min
-    effective_body_bounds = (effective_body_min, body_max)
-    body_s = float(np.clip(initial_body_position, *effective_body_bounds))
-    taper_start = float(
-        np.clip(initial_taper_position, body_s + gap, taper_max)
-    )
-    if tip_window is None:
-        tip_window = (max(0.5, taper_start - 0.1), taper_start)
-
-    r_neck = _radius_from_window(distances, s, *neck_window, quantile=q)
-    r_body = _radius_from_window(distances, s, *body_window, quantile=q)
-    r_tip = _radius_from_window(distances, s, *tip_window, quantile=q)
-    r_constriction = None
-    if constriction_position is not None:
-        half_width = max(float(constriction_window_half_width), 1e-3)
-        r_constriction = _radius_from_window(
+        observed_s = observed_s[valid]
+        observed_radii = observed_radii[valid]
+        observations_override = RadiusProfileObservations(
+            s=observed_s,
+            radii=observed_radii,
+            counts=np.ones(observed_s.size, dtype=np.int64),
+            bin_edges=np.linspace(0.0, 1.0, max(observed_s.size + 1, 2)),
+            n_input_points=int(observed_s.size),
+            n_excluded_tip_points=0,
+        )
+    initial_center_s = float(center_s)
+    current_center_s = initial_center_s
+    center_history = []
+    profile_fit = None
+    maximum_iterations = max(1, int(volume_center_max_iterations))
+    tolerance = max(float(volume_center_tolerance), 0.0)
+    lower_center_bound = 1e-3
+    if constriction_s is not None and np.isfinite(float(constriction_s)):
+        lower_center_bound = max(lower_center_bound, float(constriction_s) + 1e-3)
+    upper_center_bound = float(fixed_taper_position) - 1e-3
+    for iteration in range(maximum_iterations):
+        profile_fit = fit_interpretable_radius_profile(
             distances,
             s,
-            max(0.0, constriction_position - half_width),
-            min(1.0, constriction_position + half_width),
-            quantile=q,
+            s_center=current_center_s,
+            fixed_taper_position=fixed_taper_position,
+            radius_quantile=radius_quantile,
+            neck_window=neck_window,
+            tip_window=tip_window,
+            optimize=bool(optimize_radius_profile and pts.shape[0] >= 10),
+            outside_volume_weight=outside_volume_weight,
+            constriction_s=constriction_s,
+            constriction_window_half_width=constriction_window_half_width,
+            n_bins=profile_n_bins,
+            min_points_per_bin=profile_min_points_per_bin,
+            min_supported_bins=profile_min_supported_bins,
+            max_constriction_to_neighbor_fraction=max_constriction_to_neighbor_fraction,
+            tip_projection_tolerance=tip_projection_tolerance,
+            observations_override=observations_override,
         )
-    radii = np.asarray(
-        [r_neck, r_body, r_tip]
-        + ([r_constriction] if r_constriction is not None else []),
-        dtype=float,
+        volume_center_s = fitted_radius_volume_center(
+            r_attachment=profile_fit.r_attachment,
+            r_center=profile_fit.r_center,
+            r_distal=profile_fit.r_distal,
+            s_center=profile_fit.s_center,
+            s_taper=profile_fit.s_taper,
+            r_constriction=profile_fit.r_constriction,
+            s_constriction=profile_fit.s_constriction,
+        )
+        volume_center_s = float(
+            np.clip(volume_center_s, lower_center_bound, upper_center_bound)
+        )
+        center_history.append(
+            {
+                "iteration": iteration,
+                "profile_center_s": float(current_center_s),
+                "volume_center_s": volume_center_s,
+            }
+        )
+        if abs(volume_center_s - current_center_s) <= tolerance:
+            current_center_s = volume_center_s
+            break
+        current_center_s = volume_center_s
+    assert profile_fit is not None
+    if abs(profile_fit.s_center - current_center_s) > tolerance:
+        profile_fit = fit_interpretable_radius_profile(
+            distances,
+            s,
+            s_center=current_center_s,
+            fixed_taper_position=fixed_taper_position,
+            radius_quantile=radius_quantile,
+            neck_window=neck_window,
+            tip_window=tip_window,
+            optimize=bool(optimize_radius_profile and pts.shape[0] >= 10),
+            outside_volume_weight=outside_volume_weight,
+            constriction_s=constriction_s,
+            constriction_window_half_width=constriction_window_half_width,
+            n_bins=profile_n_bins,
+            min_points_per_bin=profile_min_points_per_bin,
+            min_supported_bins=profile_min_supported_bins,
+            max_constriction_to_neighbor_fraction=max_constriction_to_neighbor_fraction,
+            tip_projection_tolerance=tip_projection_tolerance,
+            observations_override=observations_override,
+        )
+    r_neck = profile_fit.r_neck
+    r_body = profile_fit.r_body
+    r_tip = profile_fit.r_distal
+    r_constriction = profile_fit.r_constriction
+    constriction_position = profile_fit.s_constriction
+    body_s = profile_fit.s_center
+    taper_start = profile_fit.s_taper
+    volume_center_s = fitted_radius_volume_center(
+        r_attachment=r_neck,
+        r_center=r_body,
+        r_distal=r_tip,
+        s_center=body_s,
+        s_taper=taper_start,
+        r_constriction=r_constriction,
+        s_constriction=constriction_position,
     )
-    fallback_radius = float(np.nanmedian(distances)) if np.any(np.isfinite(distances)) else 0.0
-    radii = np.where(np.isfinite(radii), radii, fallback_radius)
-    radii = np.maximum(radii, 1e-8)
-    r_neck, r_body, r_tip = map(float, radii[:3])
-    if radii.size > 3:
-        r_constriction = float(radii[3])
-
-    optimization_info = {
-        "attempted": bool(optimize_radius_profile),
-        "success": False,
-        "message": "fixed_initial_profile",
-        "nfev": 0,
-    }
-    if optimize_radius_profile and pts.shape[0] >= 10:
-        body_raw, taper_raw = _initial_position_variables(
-            body_s,
-            taper_start,
-            body_position_bounds=effective_body_bounds,
-            min_taper_gap=gap,
-            max_taper_position=taper_max,
-        )
-        fitted_radii = [r_neck, r_body, r_tip]
-        if r_constriction is not None:
-            fitted_radii.append(r_constriction)
-        n_radii = len(fitted_radii)
-        x0 = np.array(
-            [*(np.log(fitted_radii)), body_raw, taper_raw],
-            dtype=float,
-        )
-        finite_distances = distances[np.isfinite(distances)]
-        scale = float(np.nanmedian(finite_distances)) if finite_distances.size else 1.0
-        scale = max(scale, 1e-6)
-
-        def profile_residuals(x):
-            fitted = np.exp(x[:n_radii])
-            rn, rb, rt = fitted[:3]
-            rc = float(fitted[3]) if n_radii == 4 else None
-            sb, st = _decode_profile_positions(
-                x[n_radii],
-                x[n_radii + 1],
-                body_position_bounds=effective_body_bounds,
-                min_taper_gap=gap,
-                max_taper_position=taper_max,
-            )
-            predicted_radius = capped_tube_radius(
-                s,
-                rn,
-                rb,
-                rt,
-                body_s=sb,
-                taper_start=st,
-                constriction_s=constriction_position,
-                r_constriction=rc,
-            )
-            return (distances - predicted_radius) / scale
-
-        max_radius = max(float(np.nanmax(finite_distances)) if finite_distances.size else scale, scale)
-        lower = np.array(
-            [*[np.log(1e-8)] * n_radii, -8.0, -8.0],
-            dtype=float,
-        )
-        upper = np.array(
-            [*[np.log(max_radius * 10.0)] * n_radii, 8.0, 8.0],
-            dtype=float,
-        )
-        try:
-            result = least_squares(
-                profile_residuals,
-                x0,
-                bounds=(lower, upper),
-                loss="soft_l1",
-                f_scale=1.0,
-                max_nfev=500,
-            )
-            if result.success and np.all(np.isfinite(result.x)):
-                fitted = np.exp(result.x[:n_radii])
-                r_neck, r_body, r_tip = map(float, fitted[:3])
-                if n_radii == 4:
-                    r_constriction = float(fitted[3])
-                body_s, taper_start = _decode_profile_positions(
-                    result.x[n_radii],
-                    result.x[n_radii + 1],
-                    body_position_bounds=effective_body_bounds,
-                    min_taper_gap=gap,
-                    max_taper_position=taper_max,
-                )
-                optimization_info.update(
-                    {
-                        "success": True,
-                        "message": str(result.message),
-                        "nfev": int(result.nfev),
-                        "cost": float(result.cost),
-                    }
-                )
-            else:
-                optimization_info.update(
-                    {
-                        "message": str(result.message),
-                        "nfev": int(result.nfev),
-                    }
-                )
-        except (ValueError, FloatingPointError) as exc:
-            optimization_info["message"] = f"fallback_after_error: {exc}"
+    volume_center_s = float(
+        np.clip(volume_center_s, lower_center_bound, upper_center_bound)
+    )
 
     predicted = capped_tube_radius(
         s,
         r_neck,
         r_body,
         r_tip,
-        body_s=body_s,
+        center_s=body_s,
         taper_start=taper_start,
         constriction_s=constriction_position,
         r_constriction=r_constriction,
@@ -388,33 +301,54 @@ def fit_crypt_tube_to_points(
             "r_neck": r_neck,
             "r_attachment": r_neck,
             "r_body": r_body,
+            "r_center": r_body,
             "r_tip": r_tip,
             "r_taper": r_tip,
+            "r_distal": r_tip,
             "r_constriction": r_constriction,
             "s_constriction": constriction_position,
             "s_body": body_s,
+            "s_center": body_s,
+            "crypt_node_s": volume_center_s,
             "s_taper": taper_start,
-            "radius_quantile": q,
-            "radius_profile": "shape_preserving_cubic_squared_radius",
+            "radius_quantile": float(radius_quantile),
+            "radius_profile": "semantic_landmarks_shape_preserving_squared_radius_v2",
             "distal_taper_start": taper_start,
             "distal_taper": "smooth_squared_radius_to_zero",
             "cap": "integrated_squared_radius_closure",
             "neck_window": neck_window,
-            "body_window": body_window,
             "tip_window": tip_window,
             "profile_safeguards": {
-                "body_position_bounds": effective_body_bounds,
-                "min_taper_gap": gap,
-                "max_taper_position": taper_max,
+                "fixed_taper_position": float(taper_start),
+                "outside_volume_weight": float(outside_volume_weight),
+                "max_constriction_to_neighbor_fraction": float(
+                    max_constriction_to_neighbor_fraction
+                ),
+                "tip_projection_tolerance": float(tip_projection_tolerance),
             },
+            "opening_normal": normalized_opening,
+            "opening_frame_blend_fraction": frame_blend,
         },
         fit_error=summary["rmse"],
         residuals=summary,
         derived_parameters=derived,
         metadata={
-            "fit_method": "point_distances_to_piecewise_linear_centerline",
+            "fit_method": "semantic_landmark_radii_with_asymmetric_volume_proxy",
             "n_points": int(pts.shape[0]),
-            "profile_optimization": optimization_info,
+            "profile_observations": {
+                "s": profile_fit.observations.s,
+                "radii": profile_fit.observations.radii,
+                "counts": profile_fit.observations.counts,
+                "bin_edges": profile_fit.observations.bin_edges,
+            },
+            "profile_optimization": profile_fit.diagnostics,
+            "volume_center": {
+                "source": "fitted_radius_squared_volume_centroid",
+                "initial_mesh_center_s": initial_center_s,
+                "final_profile_center_s": float(body_s),
+                "crypt_node_s": volume_center_s,
+                "iterations": center_history,
+            },
             **dict(metadata or {}),
         },
     )
@@ -705,212 +639,123 @@ def _resolve_crypt_paths(graph: SkeletonGraph, key) -> list[tuple[str, list[str]
         raise ValueError(f"No crypt paths found for crypt/component key {key!r}")
     return [(f"crypt_{sanitize_id(key)}_path_{i}", path) for i, path in enumerate(paths)]
 
+
 def attach_crypt_tube_primitives(
     graph: SkeletonGraph,
     vertices,
     crypt_components: dict[Any, Any],
     *,
     centerline_data: dict[Any, dict[str, Any]] | None = None,
-    smooth_centerline: bool = True,
-    smooth_bulged_centerlines: bool = True,
-    centerline_n_bands: int = 7,
+    mesh=None,
+    geodesic_fn=None,
+    geodesic_kwargs: dict[str, Any] | None = None,
+    centerline_n_contours: int = 10,
     centerline_n_samples: int = 64,
-    centerline_constriction_weight: float = 4.0,
+    opening_frame_blend_fraction: float = 0.15,
     update_crypt_nodes: bool = True,
     **fit_kwargs,
 ) -> dict[str, PrimitiveAttachment]:
-    """Fit tapered capped tubes to crypt components.
+    """Fit one ratio-contour/Hermite tube for each terminal crypt.
 
-    ``crypt_components`` can be keyed by crypt id, by tip node id, or by an
-    explicit tuple/list of path node ids.  Values can be vertex indices into
-    ``vertices`` or direct ``(N, 3)`` point arrays. When normalized geodesic
-    fields are provided in ``centerline_data``, ring centroids are sampled
-    along the crypt axis and collectively fit one quadratic Bézier segment.
+    Tip selection is already final at detection time. The primitive stage has
+    no competing tip or spline candidates: it derives one boundary-to-tip
+    coordinate, measures its contours, and fits one endpoint-normal constrained
+    curve. ``geodesic_fn`` and ``geodesic_kwargs`` are accepted only so callers
+    can pass a shared workflow context; restricted mesh distances are computed
+    internally and cannot shortcut outside the crypt component.
     """
     vertices = as_points(vertices)
+    if mesh is None or not hasattr(mesh, "f"):
+        raise ValueError("mesh with triangular faces is required for crypt contour fitting")
     centerline_data = dict(centerline_data or {})
     out = {}
     for key, component in crypt_components.items():
         points = component_points(vertices, component)
         for attachment_id, path in _resolve_crypt_paths(graph, key):
-            graph_centerline = np.vstack(
-                [graph.node(node_id).position for node_id in path]
-            )
-            centerline = graph_centerline
-            centerline_metadata = {
-                "method": "straight_skeleton_path",
-                "control_points": graph_centerline,
-                "control_parameters": np.linspace(0.0, 1.0, graph_centerline.shape[0]),
-            }
             data = centerline_data.get(key)
             if data is None and path[-1] in centerline_data:
                 data = centerline_data[path[-1]]
-            profile = None if data is None else data.get("neck_profile")
-            neck_kind = profile.get("kind") if isinstance(profile, dict) else None
-            path_smooth_centerline = bool(smooth_centerline)
-            if neck_kind == "transition" and not bool(smooth_bulged_centerlines):
-                path_smooth_centerline = False
-                centerline = graph_centerline[[0, -1]]
-                centerline_metadata = {
-                    "method": "straight_attachment_to_tip",
-                    "control_points": centerline,
-                    "control_parameters": np.array([0.0, 1.0]),
-                    "bulged_centerline_smoothing_disabled": True,
-                }
-            elif neck_kind == "transition" and bool(smooth_bulged_centerlines):
-                crypt_nodes = [
-                    graph.node(node_id).position
-                    for node_id in path[1:-1]
-                    if graph.node(node_id).node_type == "crypt"
-                ]
-                if crypt_nodes:
-                    try:
-                        centerline_metadata = estimate_bulged_crypt_centerline(
-                            graph_centerline[0],
-                            crypt_nodes[0],
-                            graph_centerline[-1],
-                            n_samples=centerline_n_samples,
-                        )
-                        centerline = centerline_metadata["centerline_points"]
-                    except ValueError as exc:
-                        path_smooth_centerline = False
-                        centerline = graph_centerline[[0, -1]]
-                        centerline_metadata = {
-                            "method": "straight_attachment_to_tip_fallback",
-                            "control_points": centerline,
-                            "control_parameters": np.array([0.0, 1.0]),
-                            "fallback_reason": str(exc),
-                        }
-            path_constrictions = [
-                graph.node(node_id).position
-                for node_id in path
-                if graph.node(node_id).node_type == "constriction"
+            data = dict(data or {})
+            crypt_nodes = [
+                graph.node(node_id)
+                for node_id in path[1:-1]
+                if graph.node(node_id).node_type == "crypt"
             ]
-
-            if (
-                path_smooth_centerline
-                and neck_kind != "transition"
-                and data is not None
-                and data.get("distance_field") is not None
-            ):
-                indices = data.get("vertex_indices", component)
-                constriction_level = (
-                    profile.get("constriction_level")
-                    if isinstance(profile, dict)
-                    else None
+            tip_node = graph.node(path[-1])
+            tip_vertex_id = data.get("hks_tip_vertex_id")
+            if tip_vertex_id is None:
+                tip_vertex_id = int(
+                    np.argmin(np.linalg.norm(vertices - tip_node.position[None, :], axis=1))
                 )
-                try:
-                    centerline_metadata = estimate_smooth_crypt_centerline(
-                        vertices,
-                        indices,
-                        data["distance_field"],
-                        graph_centerline[0],
-                        graph_centerline[-1],
-                        neck_level=float(data.get("neck_level", 1.0)),
-                        n_bands=centerline_n_bands,
-                        n_samples=centerline_n_samples,
-                        constriction_position=(
-                            path_constrictions[0] if path_constrictions else None
-                        ),
-                        constriction_level=constriction_level,
-                        constriction_weight=centerline_constriction_weight,
-                    )
-                    centerline = centerline_metadata["centerline_points"]
-                except ValueError as exc:
-                    centerline_metadata = {
-                        **centerline_metadata,
-                        "fallback_reason": str(exc),
-                    }
-            elif (
-                path_smooth_centerline
-                and neck_kind != "transition"
-                and graph_centerline.shape[0] >= 3
-            ):
-                control = np.mean(graph_centerline[1:-1], axis=0)
-                centerline = sample_quadratic_bezier(
-                    graph_centerline[0],
-                    control,
-                    graph_centerline[-1],
-                    n_samples=centerline_n_samples,
-                )
-                centerline_metadata = {
-                    "method": "quadratic_bezier_from_skeleton_path",
-                    "control_points": np.vstack(
-                        [graph_centerline[0], control, graph_centerline[-1]]
-                    ),
-                    "control_parameters": np.array([0.0, 0.5, 1.0]),
-                }
-
-            if (
-                update_crypt_nodes
-                and path_smooth_centerline
-                and not centerline_metadata.get("crypt_node_on_centerline", False)
-            ):
-                midpoint = point_at_polyline_arclength(centerline, 0.5)
-                for node_id in path[1:-1]:
-                    node = graph.node(node_id)
-                    if node.node_type != "crypt":
-                        continue
-                    node.metadata.setdefault(
-                        "position_before_centerline_refinement",
-                        node.position.tolist(),
-                    )
-                    node.position = midpoint.copy()
-                    node.metadata.update(
-                        {
-                            "position_refined_from_smooth_centerline": True,
-                            "centerline_attachment_id": attachment_id,
-                        }
-                    )
-
+            geometry = fit_crypt_geometry(
+                vertices,
+                np.asarray(mesh.f, dtype=np.int64),
+                data.get("vertex_indices", component),
+                graph.node(path[0]).position,
+                tip_vertex_id,
+                boundary_vertices=data.get("candidate_boundary_vertices"),
+                opening_normal=data.get("attachment_surface_normal"),
+                n_contours=centerline_n_contours,
+                n_samples=centerline_n_samples,
+            )
             local_fit_kwargs = dict(fit_kwargs)
-            if path_constrictions and "constriction_s" not in local_fit_kwargs:
-                projected = project_points_to_polyline(
-                    np.asarray(path_constrictions[:1], dtype=float),
-                    centerline,
+            local_fit_kwargs["center_s"] = geometry.initial_center_s
+            local_fit_kwargs["opening_normal"] = geometry.opening_normal
+            local_fit_kwargs["opening_frame_blend_fraction"] = float(opening_frame_blend_fraction)
+            profile = data.get("neck_profile")
+            constriction_position = data.get("constriction_position")
+            if isinstance(profile, dict) and profile.get("kind") == "constriction" and constriction_position is not None:
+                local_fit_kwargs["constriction_s"] = float(
+                    project_points_to_polyline(
+                        np.asarray(constriction_position, dtype=float).reshape(1, 3),
+                        geometry.centerline_points,
+                    )["s"][0]
                 )
-                local_fit_kwargs["constriction_s"] = float(projected["s"][0])
-
             fit = fit_crypt_tube_to_points(
                 points,
-                centerline,
+                geometry.centerline_points,
                 path_node_ids=path,
+                contour_s=geometry.contour_s,
+                contour_radii=geometry.contour_radii,
                 metadata={
                     "component": "crypt",
                     "component_key": str(key),
-                    "centerline_method": centerline_metadata["method"],
-                    "centerline_control_points": centerline_metadata["control_points"],
-                    "centerline_control_parameters": centerline_metadata[
-                        "control_parameters"
-                    ],
-                    "centerline_band_sizes": centerline_metadata.get("band_sizes", []),
-                    "centerline_constriction_used": centerline_metadata.get(
-                        "constriction_used",
-                        False,
-                    ),
-                    "centerline_constriction_parameter": centerline_metadata.get(
-                        "constriction_parameter"
-                    ),
-                    "centerline_constriction_weight": centerline_metadata.get(
-                        "constriction_weight"
-                    ),
-                    "centerline_fallback_reason": centerline_metadata.get(
-                        "fallback_reason"
-                    ),
-                    "centerline_crypt_node_parameter": centerline_metadata.get(
-                        "crypt_node_parameter"
-                    ),
-                    "centerline_initial_tangent_source": centerline_metadata.get(
-                        "initial_tangent_source"
-                    ),
-                    "smooth_bulged_centerlines": bool(smooth_bulged_centerlines),
-                    "bulged_centerline_smoothing_disabled": centerline_metadata.get(
-                        "bulged_centerline_smoothing_disabled",
-                        False,
-                    ),
+                    "tip_source": "detection_final_tip",
+                    "tip_vertex_id": tip_vertex_id,
+                    "centerline_kind": geometry.centerline_kind,
+                    "centerline_method": geometry.metadata["method"],
+                    "centerline_start_tangent": geometry.start_tangent,
+                    "centerline_end_tangent": geometry.end_tangent,
+                    "centerline_tangent_length": geometry.tangent_length,
+                    "centerline_fit_rmse": geometry.metadata["centerline_fit_rmse"],
+                    "opening_normal_source": "host_primitive_surface_gradient",
+                    "tip_normal": geometry.tip_normal,
+                    "ratio_contours": {
+                        "s": geometry.contour_s,
+                        "centers": geometry.contour_centers,
+                        "radii": geometry.contour_radii,
+                        "areas": geometry.contour_areas,
+                        "perimeters": geometry.contour_perimeters,
+                    },
                 },
                 **local_fit_kwargs,
             )
+            tip_node.position = vertices[int(tip_vertex_id)].copy()
+            if update_crypt_nodes:
+                crypt_node_s = float(fit.parameters["crypt_node_s"])
+                crypt_center = point_at_polyline_arclength(
+                    geometry.centerline_points, crypt_node_s
+                )
+                for node in crypt_nodes:
+                    node.position = crypt_center.copy()
+                    node.metadata.update(
+                        {
+                            "position_source": "fitted_tube_volume_center",
+                            "centerline_attachment_id": attachment_id,
+                            "centerline_s": crypt_node_s,
+                            "initial_mesh_centerline_s": geometry.initial_center_s,
+                        }
+                    )
             attachment = fit.to_attachment(
                 attachment_type="path",
                 attachment_id=attachment_id,

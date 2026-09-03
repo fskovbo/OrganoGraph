@@ -11,6 +11,7 @@ import numpy as np
 from organograph.skeleton import (
     PrimitiveAttachment,
     PrimitiveFitResult,
+    SHAPE_QUALITY_SCHEMA_VERSION,
     SkeletonGraph,
     SkeletonizationResult,
     definitive_filter_options,
@@ -20,8 +21,10 @@ from organograph.skeleton import (
     load_shape_export_graph,
     save_shape_export,
     shape_export_payload,
+    shape_quality_payload,
 )
-from organograph.skeleton.primitive_geometry import sample_cubic_bezier
+from organograph.skeleton.legacy_curves import sample_sinusoidal_bend
+from organograph.skeleton.primitive.crypt_geometry import sample_tangent_hermite
 
 
 def _shape_result(*, with_branch: bool = False) -> PrimitiveFitResult:
@@ -53,20 +56,16 @@ def _shape_result(*, with_branch: bool = False) -> PrimitiveFitResult:
         attachment_id="body",
         target_ids=["body"],
     )
-    controls = np.array(
-        [
-            [1.0, 0.0, 0.0],
-            [1.25, 0.35, 0.0],
-            [1.75, 0.35, 0.0],
-            [2.0, 0.0, 0.0],
-        ]
-    )
+    controls = np.array([[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]])
+    bend_vector = np.array([0.0, 0.35, 0.0])
     graph.add_primitive_attachment(
         "crypt_9_tube",
         PrimitiveAttachment(
             primitive_type="tapered_capped_tube",
             parameters={
-                "centerline_points": sample_cubic_bezier(*controls, n_samples=64),
+                "centerline_points": sample_sinusoidal_bend(
+                    controls[0], controls[1], bend_vector, n_samples=64
+                ),
                 "r_neck": 0.2,
                 "r_attachment": 0.2,
                 "r_body": 0.45,
@@ -76,12 +75,15 @@ def _shape_result(*, with_branch: bool = False) -> PrimitiveFitResult:
                 "s_taper": 0.82,
                 "r_constriction": None,
                 "s_constriction": None,
+                "opening_normal": np.array([1.0, 0.0, 0.0]),
+                "opening_frame_blend_fraction": 0.15,
             },
             fit_error=0.1,
             residuals={"rmse": 0.1},
             metadata={
-                "centerline_method": "skeleton_anchored_bulged_cubic_bezier",
+                "centerline_method": "geodesic_band_centroids_sinusoidal_bend",
                 "centerline_control_points": controls,
+                "centerline_bend_vector": bend_vector,
                 "centerline_band_sizes": [8, 9, 10],
             },
             attachment_type="path",
@@ -122,7 +124,7 @@ def _shape_result(*, with_branch: bool = False) -> PrimitiveFitResult:
     )
 
 
-class ShapeExportV2Test(unittest.TestCase):
+class ShapeExportV4Test(unittest.TestCase):
     def test_definitive_profile_matches_exported_tutorial_settings(self):
         filter_options = definitive_filter_options()
         skeleton_config = definitive_skeletonization_config(
@@ -139,16 +141,25 @@ class ShapeExportV2Test(unittest.TestCase):
             primitive_config.body_branch_neck_kwargs["radius_quantile"],
             0.25,
         )
-        self.assertTrue(
-            primitive_config.crypt_tube_kwargs["smooth_bulged_centerlines"]
+        self.assertEqual(
+            primitive_config.crypt_tube_kwargs["fixed_taper_position"], 0.85
         )
+        self.assertEqual(
+            primitive_config.crypt_tube_kwargs["outside_volume_weight"], 2.0
+        )
+        self.assertEqual(
+            primitive_config.crypt_tube_kwargs["centerline_n_contours"], 10
+        )
+        self.assertNotIn("centerline_n_bands", primitive_config.crypt_tube_kwargs)
+        self.assertNotIn("tangent_cone_degrees", primitive_config.crypt_tube_kwargs)
+        self.assertNotIn("smooth_centerline", primitive_config.crypt_tube_kwargs)
         self.assertEqual(primitive_config.crypt_overlap.samples, 8192)
 
     def test_payload_is_minimal_and_reconstructs_final_geometry(self):
         result = _shape_result()
         payload = shape_export_payload(result)
 
-        self.assertEqual(payload["schema_version"], "organograph_shape_v2")
+        self.assertEqual(payload["schema_version"], "organograph_shape_v5")
         self.assertEqual(set(payload), {
             "schema_version",
             "sample",
@@ -176,6 +187,55 @@ class ShapeExportV2Test(unittest.TestCase):
             atol=1e-12,
         )
         self.assertEqual(reconstructed_tube.parameters["r_neck"], 0.2)
+        self.assertEqual(
+            payload["primitives"][1]["parameters"]["r_attachment"], 0.2
+        )
+        self.assertNotIn("s_body", payload["primitives"][1]["parameters"])
+        np.testing.assert_allclose(
+            payload["primitives"][1]["parameters"]["opening_normal"],
+            [1.0, 0.0, 0.0],
+        )
+        self.assertEqual(
+            payload["primitives"][1]["parameters"]["centerline_type"],
+            "sinusoidal_bend",
+        )
+        np.testing.assert_allclose(
+            payload["primitives"][1]["parameters"]["centerline_bend_vector"],
+            [0.0, 0.35, 0.0],
+        )
+
+    def test_tangent_hermite_is_exported_compactly_and_reconstructed(self):
+        result = _shape_result()
+        tube = result.graph.primitive_attachments["crypt_9_tube"]
+        endpoints = np.array([[1.0, 0.0, 0.0], [2.0, 0.0, 0.0]])
+        start_tangent = np.array([0.8, 0.3, 0.0])
+        end_tangent = np.array([0.8, -0.2, 0.0])
+        tube.parameters["centerline_points"] = sample_tangent_hermite(
+            endpoints[0], endpoints[1], start_tangent, end_tangent, n_samples=64
+        )
+        tube.metadata = {
+            "centerline_method": "boundary_tip_ratio_contours_tangent_constrained_hermite",
+            "centerline_start_tangent": start_tangent,
+            "centerline_end_tangent": end_tangent,
+        }
+
+        payload = shape_export_payload(result)
+        parameters = next(
+            item["parameters"] for item in payload["primitives"] if item["role"] == "crypt"
+        )
+        self.assertEqual(parameters["centerline_type"], "tangent_hermite")
+        self.assertEqual(np.asarray(parameters["centerline_control_points"]).shape, (2, 3))
+        reconstructed = graph_from_shape_export_payload(payload)
+        fitted = reconstructed.primitive_attachments["crypt_9_tube"]
+        np.testing.assert_allclose(
+            fitted.parameters["centerline_points"], tube.parameters["centerline_points"]
+        )
+        source = graph_from_shape_export_payload(payload, coordinate_system="source")
+        source_tube = source.primitive_attachments["crypt_9_tube"]
+        self.assertAlmostEqual(
+            float(np.linalg.norm(source_tube.parameters["centerline_start_tangent"])),
+            2.0 * float(np.linalg.norm(start_tangent)),
+        )
 
     def test_source_coordinates_restore_positions_scales_and_orientations(self):
         result = _shape_result()
@@ -193,6 +253,27 @@ class ShapeExportV2Test(unittest.TestCase):
         np.testing.assert_allclose(body.parameters["orientation"], expected_rotation)
         tube = source_graph.primitive_attachments["crypt_9_tube"]
         self.assertAlmostEqual(tube.parameters["r_body"], 0.9)
+        np.testing.assert_allclose(
+            tube.parameters["opening_normal"], [0.0, -1.0, 0.0], atol=1e-12
+        )
+        np.testing.assert_allclose(
+            tube.parameters["centerline_bend_vector"], [0.7, 0.0, 0.0], atol=1e-12
+        )
+
+    def test_legacy_v2_payload_remains_loadable_for_baseline_audits(self):
+        payload = shape_export_payload(_shape_result())
+        payload["schema_version"] = "organograph_shape_v2"
+        tube = next(item for item in payload["primitives"] if item["role"] == "crypt")
+        parameters = tube["parameters"]
+        parameters["r_neck"] = parameters.pop("r_attachment")
+        parameters["r_body"] = parameters.pop("r_center")
+        parameters["r_tip"] = parameters.pop("r_distal")
+        parameters["s_body"] = parameters.pop("s_center")
+
+        graph = graph_from_shape_export_payload(payload)
+        reconstructed = graph.primitive_attachments["crypt_9_tube"].parameters
+        self.assertEqual(reconstructed["r_attachment"], 0.2)
+        self.assertEqual(reconstructed["s_center"], 0.45)
 
     def test_save_and_load_use_strict_json(self):
         result = _shape_result()
@@ -201,8 +282,23 @@ class ShapeExportV2Test(unittest.TestCase):
             raw = Path(paths["json"]).read_text(encoding="utf-8")
             self.assertNotIn("NaN", raw)
             self.assertNotIn("Infinity", raw)
+            quality_raw = Path(paths["quality_json"]).read_text(encoding="utf-8")
+            self.assertNotIn("NaN", quality_raw)
+            self.assertNotIn("Infinity", quality_raw)
             loaded = load_shape_export_graph(paths["json"])
             self.assertEqual(len(loaded.nodes), len(result.graph.nodes))
+
+    def test_quality_sidecar_keeps_diagnostics_out_of_shape_payload(self):
+        result = _shape_result()
+        quality = shape_quality_payload(result)
+
+        self.assertEqual(quality["schema_version"], SHAPE_QUALITY_SCHEMA_VERSION)
+        self.assertEqual(len(quality["crypt_primitives"]), 1)
+        record = quality["crypt_primitives"][0]
+        self.assertEqual(record["primitive_id"], "crypt_9_tube")
+        self.assertEqual(record["fit_error"], 0.1)
+        self.assertEqual(record["residuals"]["rmse"], 0.1)
+        self.assertNotIn("fit_error", json.dumps(shape_export_payload(result)))
 
     def test_nonfinite_required_geometry_is_rejected(self):
         result = _shape_result()

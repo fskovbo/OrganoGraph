@@ -69,17 +69,6 @@ class BranchValidationConfig:
     min_perimeter_prominence_fraction: float = 0.01
 
 
-@dataclass
-class BodyTransitionConfig:
-    """Conservative correction for implausibly broad body-attached crypts."""
-
-    enabled: bool = True
-    max_crypt_to_host_width_ratio: float = 0.80
-    host_width_quantile: float = 0.75
-    min_second_derivative_score: float = 0.60
-    min_attachment_level: float = 0.25
-
-
 def _default_body_barrier_options() -> dict[str, Any]:
     return {
         "primitive_type": "superellipsoid",
@@ -110,7 +99,7 @@ def _default_branch_barrier_options() -> dict[str, Any]:
 
 @dataclass
 class BarrierConfig:
-    """Body/branch barrier fitting, ownership, and boundary crossing settings."""
+    """Body/branch barrier fitting, ownership, and opening projection settings."""
 
     body_fit_options: dict[str, Any] = field(default_factory=_default_body_barrier_options)
     branch_fit_options: dict[str, Any] = field(default_factory=_default_branch_barrier_options)
@@ -120,19 +109,7 @@ class BarrierConfig:
     min_branch_vertices: int = 20
     sample_fraction: float = 1.0
     sample_seed: int | None = 0
-    crossing_surface_level: float = 1.0
-    crossing_min_axis_level: float = 0.03
-    crossing_samples: int = 40
-    crossing_persistence: int = 2
-
-    def crossing_kwargs(self) -> dict[str, Any]:
-        return {
-            "surface_level": self.crossing_surface_level,
-            "min_axis_level": self.crossing_min_axis_level,
-            "max_axis_level": None,
-            "n_samples": self.crossing_samples,
-            "persistence": self.crossing_persistence,
-        }
+    opening_grid_resolution: int = 31
 
 
 @dataclass
@@ -146,21 +123,12 @@ class MeshPreparationConfig:
 
 
 @dataclass
-class GraphConfig:
-    """Fixed graph-topology settings for the crypt-center waypoint."""
-
-    max_dimensionless_curvature: float | None = 0.5
-    curvature_penalty: float = 8.0
-
-
-@dataclass
 class DetectionConfig:
     """Configuration of the complete barrier-aware detection stage."""
 
     candidates: CandidateDetectionConfig = field(default_factory=CandidateDetectionConfig)
     necks: NeckProfileConfig = field(default_factory=NeckProfileConfig)
     branches: BranchValidationConfig = field(default_factory=BranchValidationConfig)
-    body_transition: BodyTransitionConfig = field(default_factory=BodyTransitionConfig)
     barriers: BarrierConfig = field(default_factory=BarrierConfig)
     mesh: MeshPreparationConfig = field(default_factory=MeshPreparationConfig)
 
@@ -168,7 +136,6 @@ class DetectionConfig:
         self.candidates = _coerce(CandidateDetectionConfig, self.candidates)
         self.necks = _coerce(NeckProfileConfig, self.necks)
         self.branches = _coerce(BranchValidationConfig, self.branches)
-        self.body_transition = _coerce(BodyTransitionConfig, self.body_transition)
         self.barriers = _coerce(BarrierConfig, self.barriers)
         self.mesh = _coerce(MeshPreparationConfig, self.mesh)
 
@@ -178,11 +145,9 @@ class SkeletonizationConfig:
     """Settings for the single supported barrier-aware skeleton workflow."""
 
     detection: DetectionConfig = field(default_factory=DetectionConfig)
-    graph: GraphConfig = field(default_factory=GraphConfig)
 
     def __post_init__(self):
         self.detection = _coerce(DetectionConfig, self.detection)
-        self.graph = _coerce(GraphConfig, self.graph)
 
     def to_dict(self) -> dict[str, Any]:
         return _plain(self)

@@ -53,12 +53,12 @@ class DetectionResult:
     detection_mesh: Any | None = None
 
     @property
-    def attachment_crossings(self) -> list[dict[str, Any]]:
-        return list(self.diagnostics.get("attachment_crossings", []))
+    def attachment_projections(self) -> list[dict[str, Any]]:
+        return list(self.diagnostics.get("attachment_projections", []))
 
     @property
     def failed_attachments(self) -> list[dict[str, Any]]:
-        return list(self.diagnostics.get("attachment_crossing_failures", []))
+        return list(self.diagnostics.get("attachment_projection_failures", []))
 
 
 @dataclass
@@ -85,7 +85,7 @@ class SkeletonizationResult:
 
     @property
     def failed_attachments(self) -> list[dict[str, Any]]:
-        return list(self.intermediates.get("attachment_crossing_failures", []))
+        return list(self.intermediates.get("attachment_projection_failures", []))
 
     def to_dict(self, *, include_intermediates: bool = False) -> dict[str, Any]:
         data = {

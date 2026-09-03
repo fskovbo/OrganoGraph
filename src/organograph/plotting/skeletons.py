@@ -683,6 +683,28 @@ def _polyline_point_at_s(centerline, s):
     return point, tangent
 
 
+def _tube_section_axis(parameters, tangent, s):
+    """Blend a deterministic opening normal into the transported tube axis."""
+    opening = parameters.get("opening_normal")
+    if opening is None:
+        return tangent
+    opening = np.asarray(opening, dtype=float)
+    norm = float(np.linalg.norm(opening))
+    if opening.shape != (3,) or not np.all(np.isfinite(opening)) or norm <= 1e-12:
+        return tangent
+    opening = opening / norm
+    # A plane is unchanged when its normal is negated. Choose the short
+    # rotation to avoid a degenerate interpolation for opposing directions.
+    if float(np.dot(opening, tangent)) < 0.0:
+        opening = -opening
+    blend_end = float(parameters.get("opening_frame_blend_fraction", 0.15))
+    blend_end = max(blend_end, 1e-8)
+    value = float(np.clip(float(s) / blend_end, 0.0, 1.0))
+    weight = value * value * (3.0 - 2.0 * value)
+    axis = (1.0 - weight) * opening + weight * tangent
+    return axis / max(float(np.linalg.norm(axis)), 1e-12)
+
+
 def _tube_surface(parameters, *, n_s=32, n_theta=16):
     centerline = np.asarray(parameters["centerline_points"], dtype=float)
     radii = (
@@ -701,16 +723,19 @@ def _tube_surface(parameters, *, n_s=32, n_theta=16):
     previous_normal = None
     for s in s_values:
         center, tangent = _polyline_point_at_s(centerline, s)
+        section_axis = _tube_section_axis(parameters, tangent, s)
         if previous_normal is None:
             ref = np.array([0.0, 0.0, 1.0])
-            if abs(float(np.dot(ref, tangent))) > 0.9:
+            if abs(float(np.dot(ref, section_axis))) > 0.9:
                 ref = np.array([0.0, 1.0, 0.0])
-            normal = np.cross(tangent, ref)
+            normal = np.cross(section_axis, ref)
             normal = normal / max(np.linalg.norm(normal), 1e-12)
         else:
-            normal = previous_normal - tangent * float(np.dot(previous_normal, tangent))
+            normal = previous_normal - section_axis * float(
+                np.dot(previous_normal, section_axis)
+            )
             normal = normal / max(np.linalg.norm(normal), 1e-12)
-        binormal = np.cross(tangent, normal)
+        binormal = np.cross(section_axis, normal)
         binormal = binormal / max(np.linalg.norm(binormal), 1e-12)
         previous_normal = normal
         radius = float(

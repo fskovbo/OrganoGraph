@@ -19,12 +19,10 @@ from organograph.crypts.filters import (
 )
 from organograph.skeleton.config import (
     BarrierConfig,
-    BodyTransitionConfig,
     BranchValidationConfig,
     CandidateDetectionConfig,
     CryptOverlapConfig,
     DetectionConfig,
-    GraphConfig,
     MeshPreparationConfig,
     NeckProfileConfig,
     PrimitiveFitConfig,
@@ -136,7 +134,6 @@ def definitive_skeletonization_config(
                 max_growth_size_factor=3.0,
                 max_mesh_fraction=0.40,
             ),
-            body_transition=BodyTransitionConfig(enabled=True),
             barriers=BarrierConfig(
                 body_fit_options=body_barrier_options,
                 branch_fit_options=branch_barrier_options,
@@ -146,10 +143,6 @@ def definitive_skeletonization_config(
                 sample_seed=0,
             ),
             mesh=MeshPreparationConfig(smooth=False),
-        ),
-        graph=GraphConfig(
-            max_dimensionless_curvature=0.50,
-            curvature_penalty=8.0,
         ),
     )
 
@@ -165,19 +158,19 @@ def definitive_primitive_fit_config() -> PrimitiveFitConfig:
             "min_extent_radius_fraction": 0.35,
         },
         crypt_tube_kwargs={
-            "smooth_centerline": True,
-            "smooth_bulged_centerlines": True,
-            "centerline_n_bands": 7,
+            "centerline_n_contours": 10,
             "centerline_n_samples": 64,
-            "centerline_constriction_weight": 4.0,
+            "opening_frame_blend_fraction": 0.15,
             "update_crypt_nodes": True,
             "radius_quantile": 0.5,
             "optimize_radius_profile": True,
-            "initial_body_position": 0.5,
-            "initial_taper_position": 0.85,
-            "body_position_bounds": (0.2, 0.7),
-            "min_taper_gap": 0.1,
-            "max_taper_position": 0.9,
+            "fixed_taper_position": 0.85,
+            "outside_volume_weight": 2.0,
+            "profile_n_bins": 20,
+            "profile_min_points_per_bin": 2,
+            "profile_min_supported_bins": 6,
+            "max_constriction_to_neighbor_fraction": 0.98,
+            "tip_projection_tolerance": 1e-6,
         },
         crypt_overlap=CryptOverlapConfig(
             enabled=True,

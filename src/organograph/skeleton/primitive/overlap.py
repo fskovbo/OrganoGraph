@@ -584,6 +584,8 @@ _STALE_GEOMETRY_KEYS = (
     "circumference",
     "attachment_level",
     "attachment_position",
+    "attachment_surface_normal",
+    "candidate_boundary_vertices",
     "neck_position",
     "constriction_position",
     "distal_neck_boundary_position",
@@ -608,7 +610,7 @@ def recompute_merged_crypt_geometry(
     A merge initially retains one record only to provide a stable crypt ID.
     This function discards that record's positional geometry and reruns the
     definitive boundary-distance tip, circumference normalization, HKS tip,
-    neck-profile, and host-boundary crossing stages on the union region.
+    neck-profile, and projected host-opening stages on the union region.
     """
     from organograph.mesh.geodesics import compute_geodesics_dijkstra
     from organograph.crypts.axis import (
@@ -616,8 +618,8 @@ def recompute_merged_crypt_geometry(
         normalize_crypt_axis_to_neckline,
     )
     from organograph.skeleton.detection.attachments import (
-        assign_crypt_attachments_from_barrier_crossings,
-        attachment_crossing_diagnostics,
+        assign_crypt_attachments_from_projected_boundaries,
+        attachment_projection_diagnostics,
     )
     from organograph.skeleton.detection.neck_profiles import (
         _add_neck_profile_geometry,
@@ -765,30 +767,29 @@ def recompute_merged_crypt_geometry(
         return current
 
     refreshed = [refresh(detection, relation="body_crypt") for detection in detections]
-    crossing_kwargs = detection_config.barriers.crossing_kwargs()
-    refreshed = assign_crypt_attachments_from_barrier_crossings(
+    refreshed = assign_crypt_attachments_from_projected_boundaries(
         mesh.v,
         mesh.f,
         refreshed,
         barriers.body_fit,
-        crossing_kwargs=crossing_kwargs,
+        grid_resolution=detection_config.barriers.opening_grid_resolution,
         assign_body_roots=True,
         assign_branch_daughters=False,
     )
-    refreshed = assign_crypt_attachments_from_barrier_crossings(
+    refreshed = assign_crypt_attachments_from_projected_boundaries(
         mesh.v,
         mesh.f,
         refreshed,
         barriers.body_fit,
         branch_fits=barriers.branch_fits,
-        crossing_kwargs=crossing_kwargs,
+        grid_resolution=detection_config.barriers.opening_grid_resolution,
         assign_body_roots=False,
         assign_branch_daughters=True,
     )
-    crossing_records = attachment_crossing_diagnostics(refreshed)
-    diagnostics["attachment_crossings"] = crossing_records
-    diagnostics["attachment_crossing_failures"] = [
-        record for record in crossing_records if not record.get("found", False)
+    projection_records = attachment_projection_diagnostics(refreshed)
+    diagnostics["attachment_projections"] = projection_records
+    diagnostics["attachment_projection_failures"] = [
+        record for record in projection_records if not record.get("found", False)
     ]
     return refreshed, records
 

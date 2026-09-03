@@ -45,6 +45,10 @@ Fit errors, residuals, detection fields, HKS arrays, component masks, mesh
 vertex indices, fitting configs, and derived descriptors are intentionally not
 part of this reconstructive file.
 
+New export directories may also contain `quality.json`. It stores crypt fit
+diagnostics for filtering and method comparison and must not be packed as VAE
+shape features.
+
 ## Sample and eligibility
 
 `sample` contains available identity/context fields:

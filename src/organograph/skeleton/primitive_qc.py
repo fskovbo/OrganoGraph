@@ -1,6 +1,6 @@
 """Quality-control summaries for exported crypt tube primitives.
 
-This module evaluates reconstructive ``organograph_shape_v2`` exports without
+This module evaluates reconstructive v5 and legacy v2-v4 exports without
 rerunning skeletonization or primitive fitting. The resulting records are
 intended for retrospective audits and baseline-versus-candidate comparisons;
 QC flags are not fitted biological parameters and should not be encoded by a
@@ -10,26 +10,30 @@ shape model.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
 
 from organograph.skeleton.export import load_shape_export_json
-from organograph.skeleton.primitive_geometry import (
-    capped_tube_radius,
+from organograph.skeleton.legacy_curves import (
     sample_cubic_bezier,
     sample_quadratic_bezier,
+    sample_sinusoidal_bend,
 )
+from organograph.skeleton.primitive_geometry import capped_tube_radius
+from organograph.skeleton.primitive.crypt_geometry import sample_tangent_hermite
+from organograph.skeleton.legacy_curves import sample_circular_arc
 
 
 @dataclass(frozen=True)
 class CryptPrimitiveQCConfig:
     """Thresholds used to flag potentially unstable crypt primitive fits."""
 
-    body_position_bounds: tuple[float, float] = (0.2, 0.7)
-    max_taper_position: float = 0.9
-    min_taper_gap: float = 0.1
+    center_position_bounds: tuple[float, float] = (0.05, 0.80)
+    fixed_taper_position: float = 0.85
+    min_center_taper_gap: float = 0.05
     position_tolerance: float = 0.01
     max_neck_to_body_ratio: float = 2.0
     max_distal_to_body_ratio: float = 1.0
@@ -40,10 +44,10 @@ class CryptPrimitiveQCConfig:
 
 
 QC_FLAG_COLUMNS = (
-    "flag_s_body_lower_bound",
-    "flag_s_body_upper_bound",
-    "flag_s_taper_upper_bound",
-    "flag_min_taper_gap",
+    "flag_s_center_lower_clamp",
+    "flag_s_center_upper_clamp",
+    "flag_nonfixed_taper",
+    "flag_min_center_taper_gap",
     "flag_missing_budded_constriction",
     "flag_invalid_constriction_minimum",
     "flag_large_neck_to_body_ratio",
@@ -87,6 +91,33 @@ def _sample_centerline(parameters: dict[str, Any]) -> np.ndarray:
         return sample_quadratic_bezier(*controls, n_samples=n_samples)
     if curve_type == "cubic_bezier" and controls.shape == (4, 3):
         return sample_cubic_bezier(*controls, n_samples=n_samples)
+    if curve_type == "sinusoidal_bend" and controls.shape == (2, 3):
+        bend = np.asarray(parameters.get("centerline_bend_vector"), dtype=float)
+        if bend.shape == (3,):
+            return sample_sinusoidal_bend(
+                controls[0], controls[1], bend, n_samples=n_samples
+            )
+    if curve_type == "circular_arc" and controls.shape == (2, 3):
+        sagitta = np.asarray(parameters.get("centerline_sagitta_vector"), dtype=float)
+        if sagitta.shape == (3,):
+            return sample_circular_arc(
+                controls[0], controls[1], sagitta, n_samples=n_samples
+            )
+    if curve_type == "tangent_hermite" and controls.shape == (2, 3):
+        start_tangent = np.asarray(
+            parameters.get("centerline_start_tangent"), dtype=float
+        )
+        end_tangent = np.asarray(
+            parameters.get("centerline_end_tangent"), dtype=float
+        )
+        if start_tangent.shape == (3,) and end_tangent.shape == (3,):
+            return sample_tangent_hermite(
+                controls[0],
+                controls[1],
+                start_tangent,
+                end_tangent,
+                n_samples=n_samples,
+            )
     if controls.ndim == 2 and controls.shape[1:] == (3,) and controls.shape[0] >= 2:
         return controls
     return np.empty((0, 3), dtype=float)
@@ -114,13 +145,17 @@ def _profile_diagnostics(parameters: dict[str, Any], config: CryptPrimitiveQCCon
     if r_constriction is None or s_constriction is None:
         return float("nan"), float("nan"), False
     try:
+        r_attachment = float(parameters.get("r_attachment", parameters.get("r_neck")))
+        r_center = float(parameters.get("r_center", parameters.get("r_body")))
+        r_distal = float(parameters.get("r_distal", parameters.get("r_tip")))
+        s_center = float(parameters.get("s_center", parameters.get("s_body")))
         s = np.linspace(0.0, 1.0, max(32, int(config.profile_samples)))
         radii = capped_tube_radius(
             s,
-            float(parameters["r_neck"]),
-            float(parameters["r_body"]),
-            float(parameters["r_tip"]),
-            body_s=float(parameters["s_body"]),
+            r_attachment,
+            r_center,
+            r_distal,
+            center_s=s_center,
             taper_start=float(parameters["s_taper"]),
             constriction_s=float(s_constriction),
             r_constriction=float(r_constriction),
@@ -128,7 +163,7 @@ def _profile_diagnostics(parameters: dict[str, Any], config: CryptPrimitiveQCCon
     except (KeyError, TypeError, ValueError):
         return float("nan"), float("nan"), False
 
-    body_s = float(parameters["s_body"])
+    body_s = float(parameters.get("s_center", parameters.get("s_body")))
     proximal = s <= body_s
     if not np.any(proximal):
         return float("nan"), float("nan"), False
@@ -136,7 +171,7 @@ def _profile_diagnostics(parameters: dict[str, Any], config: CryptPrimitiveQCCon
     proximal_r = radii[proximal]
     minimum_index = int(np.argmin(proximal_r))
     minimum_s = float(proximal_s[minimum_index])
-    neighboring_radius = min(float(parameters["r_neck"]), float(parameters["r_body"]))
+    neighboring_radius = min(r_attachment, r_center)
     depth = _safe_ratio(neighboring_radius - float(r_constriction), neighboring_radius)
     tolerance = max(2.0 / max(int(config.profile_samples), 32), 0.02)
     minimum_near_constriction = abs(minimum_s - float(s_constriction)) <= tolerance
@@ -148,8 +183,9 @@ def crypt_primitive_qc_records(
     *,
     shape_path: str | Path | None = None,
     config: CryptPrimitiveQCConfig | None = None,
+    quality_payload: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Extract one QC record per crypt primitive from a v2 payload."""
+    """Extract one QC record per crypt primitive from a v5 or legacy v2-v4 payload."""
     config = config or CryptPrimitiveQCConfig()
     sample = dict(payload.get("sample") or {})
     node_types = {
@@ -157,22 +193,52 @@ def crypt_primitive_qc_records(
         for node in (payload.get("skeleton") or {}).get("nodes", [])
     }
     body_scale = _body_scale(payload)
+    quality_by_primitive = {
+        str(record.get("primitive_id")): record
+        for record in (quality_payload or {}).get("crypt_primitives", [])
+    }
     records = []
     for primitive in payload.get("primitives") or []:
         if primitive.get("role") != "crypt":
             continue
         parameters = dict(primitive.get("parameters") or {})
+        quality = quality_by_primitive.get(str(primitive.get("primitive_id")), {})
+        optimization = dict(quality.get("profile_optimization") or {})
+        candidate_selection = dict(quality.get("candidate_selection") or {})
+        residuals = dict(quality.get("residuals") or {})
         target_ids = [str(value) for value in primitive.get("target_node_ids") or []]
         target_types = [node_types.get(value, "unknown") for value in target_ids]
-        r_neck = float(parameters.get("r_neck", np.nan))
-        r_body = float(parameters.get("r_body", np.nan))
-        r_distal = float(parameters.get("r_tip", np.nan))
+        r_neck = float(parameters.get("r_attachment", parameters.get("r_neck", np.nan)))
+        r_body = float(parameters.get("r_center", parameters.get("r_body", np.nan)))
+        r_distal = float(parameters.get("r_distal", parameters.get("r_tip", np.nan)))
         r_constriction = parameters.get("r_constriction")
         s_constriction = parameters.get("s_constriction")
-        s_body = float(parameters.get("s_body", np.nan))
+        s_body = float(parameters.get("s_center", parameters.get("s_body", np.nan)))
         s_taper = float(parameters.get("s_taper", np.nan))
         centerline = _sample_centerline(parameters)
         centerline_length = _centerline_length(centerline)
+        controls = np.asarray(parameters.get("centerline_control_points"), dtype=float)
+        bend_vector = np.asarray(parameters.get("centerline_bend_vector"), dtype=float)
+        if parameters.get("centerline_type") == "circular_arc":
+            bend_vector = np.asarray(
+                parameters.get("centerline_sagitta_vector"), dtype=float
+            )
+        dimensionless_bend = float("nan")
+        if controls.shape == (2, 3) and bend_vector.shape == (3,):
+            dimensionless_bend = _safe_ratio(
+                float(np.linalg.norm(bend_vector)),
+                float(np.linalg.norm(controls[1] - controls[0])),
+            )
+        elif controls.shape == (2, 3) and centerline.shape[0] >= 2:
+            chord = controls[1] - controls[0]
+            chord_length = float(np.linalg.norm(chord))
+            if chord_length > 1e-12:
+                relative = centerline - controls[0]
+                chord_s = np.clip((relative @ chord) / chord_length**2, 0.0, 1.0)
+                baseline = controls[0] + chord_s[:, None] * chord
+                dimensionless_bend = float(
+                    np.max(np.linalg.norm(centerline - baseline, axis=1)) / chord_length
+                )
         subtype = (
             "budded"
             if "constriction" in target_types
@@ -190,22 +256,24 @@ def crypt_primitive_qc_records(
         )
 
         flags = {
-            "flag_s_body_lower_bound": bool(
+            "flag_s_center_lower_clamp": bool(
                 np.isfinite(s_body)
-                and s_body <= config.body_position_bounds[0] + config.position_tolerance
+                and s_body <= config.center_position_bounds[0] + config.position_tolerance
             ),
-            "flag_s_body_upper_bound": bool(
+            "flag_s_center_upper_clamp": bool(
                 np.isfinite(s_body)
-                and s_body >= config.body_position_bounds[1] - config.position_tolerance
+                and s_body >= config.center_position_bounds[1] - config.position_tolerance
             ),
-            "flag_s_taper_upper_bound": bool(
+            "flag_nonfixed_taper": bool(
                 np.isfinite(s_taper)
-                and s_taper >= config.max_taper_position - config.position_tolerance
+                and abs(s_taper - config.fixed_taper_position)
+                > config.position_tolerance
             ),
-            "flag_min_taper_gap": bool(
+            "flag_min_center_taper_gap": bool(
                 np.isfinite(s_body)
                 and np.isfinite(s_taper)
-                and s_taper - s_body <= config.min_taper_gap + config.position_tolerance
+                and s_taper - s_body
+                <= config.min_center_taper_gap + config.position_tolerance
             ),
             "flag_missing_budded_constriction": subtype == "budded" and not has_constriction,
             "flag_invalid_constriction_minimum": bool(
@@ -267,12 +335,16 @@ def crypt_primitive_qc_records(
                 "body_scale": body_scale,
                 "centerline_length": centerline_length,
                 "length_to_body_scale": _safe_ratio(centerline_length, body_scale),
+                "centerline_dimensionless_bend": dimensionless_bend,
                 "r_neck": r_neck,
+                "r_attachment": r_neck,
                 "r_body": r_body,
+                "r_center": r_body,
                 "r_distal": r_distal,
                 "r_constriction": r_constriction,
                 "s_constriction": s_constriction,
                 "s_body": s_body,
+                "s_center": s_body,
                 "s_taper": s_taper,
                 "taper_gap": s_taper - s_body,
                 "neck_to_body_ratio": _safe_ratio(r_neck, r_body),
@@ -285,6 +357,47 @@ def crypt_primitive_qc_records(
                 "qc_severity": severe,
                 "qc_flags": "; ".join(active_flags),
                 "has_qc_flag": bool(active_flags),
+                "fit_rmse": residuals.get("rmse", quality.get("fit_error")),
+                "fit_mae": residuals.get("mae"),
+                "optimizer_success": optimization.get("success"),
+                "optimizer_nfev": optimization.get("nfev"),
+                "optimizer_cost": optimization.get("cost"),
+                "n_fit_points": quality.get("n_points"),
+                "n_supported_bins": optimization.get("n_supported_bins"),
+                "profile_observation_rmse": optimization.get("observation_rmse"),
+                "outside_volume_proxy": optimization.get("outside_volume_proxy"),
+                "missing_volume_proxy": optimization.get("missing_volume_proxy"),
+                "candidate_score": optimization.get("candidate_score"),
+                "candidate_selection_score": candidate_selection.get(
+                    "selected_score"
+                ),
+                "selected_tip_source": quality.get("tip_source"),
+                "selected_tip_vertex_id": quality.get("tip_vertex_id"),
+                "selected_centerline_kind": quality.get("centerline_kind"),
+                "centerline_initial_tangent_source": quality.get(
+                    "centerline_initial_tangent_source"
+                ),
+                "raw_centroid_projection_s": quality.get(
+                    "raw_centroid_projection_s"
+                ),
+                "host_intersection_fraction": quality.get(
+                    "host_intersection_fraction"
+                ),
+                "host_penetration_rms": quality.get("host_penetration_rms"),
+                "host_penetration_max": quality.get("host_penetration_max"),
+                "host_penetration_normalized": quality.get(
+                    "host_penetration_normalized"
+                ),
+                "distal_constraint_active": optimization.get(
+                    "distal_constraint_active"
+                ),
+                "constriction_constraint_active": optimization.get(
+                    "constriction_constraint_active"
+                ),
+                "constriction_status": optimization.get("constriction_status"),
+                "centerline_fallback_reason": quality.get(
+                    "centerline_fallback_reason"
+                ),
                 **flags,
             }
         )
@@ -292,7 +405,7 @@ def crypt_primitive_qc_records(
 
 
 def discover_shape_exports(export_root: str | Path) -> list[Path]:
-    """Find v2 ``shape.json`` files below an export root."""
+    """Find reconstructive ``shape.json`` files below an export root."""
     root = Path(export_root).expanduser().resolve()
     if not root.exists():
         raise FileNotFoundError(f"Export root does not exist: {root}")
@@ -326,8 +439,18 @@ def load_crypt_primitive_qc(
             continue
         if unbranched_only and bool(sample.get("has_branches", False)):
             continue
+        quality_payload = None
+        quality_path = shape_path.with_name("quality.json")
+        if quality_path.exists():
+            with quality_path.open("r", encoding="utf-8") as handle:
+                quality_payload = json.load(handle)
         records.extend(
-            crypt_primitive_qc_records(payload, shape_path=shape_path, config=config)
+            crypt_primitive_qc_records(
+                payload,
+                shape_path=shape_path,
+                config=config,
+                quality_payload=quality_payload,
+            )
         )
         loaded_samples += 1
         if max_samples is not None and loaded_samples >= int(max_samples):

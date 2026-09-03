@@ -1,6 +1,6 @@
 """Minimal, reconstructive exports for final skeleton and primitive fits.
 
-The v2 export contains only identity/context, reversible coordinate transforms,
+The v5 export contains only identity/context, reversible coordinate transforms,
 graph topology, node positions, and the primitive degrees of freedom required
 to recreate the final visualization. Detection arrays, component ownership,
 residuals, and fitting objectives are intentionally excluded.
@@ -20,10 +20,13 @@ from typing import Any
 import numpy as np
 
 from organograph.skeleton.datatypes import SkeletonGraph
-from organograph.skeleton.primitive_geometry import (
+from organograph.skeleton.legacy_curves import (
+    sample_circular_arc,
     sample_cubic_bezier,
     sample_quadratic_bezier,
+    sample_sinusoidal_bend,
 )
+from organograph.skeleton.primitive.crypt_geometry import sample_tangent_hermite
 from organograph.skeleton.primitives import PrimitiveAttachment
 from organograph.skeleton.results import (
     OrganoidShapeResult,
@@ -32,7 +35,13 @@ from organograph.skeleton.results import (
 )
 
 
-SHAPE_EXPORT_SCHEMA_VERSION = "organograph_shape_v2"
+SHAPE_EXPORT_SCHEMA_VERSION = "organograph_shape_v5"
+LEGACY_SHAPE_EXPORT_SCHEMA_VERSIONS = {
+    "organograph_shape_v2",
+    "organograph_shape_v3",
+    "organograph_shape_v4",
+}
+SHAPE_QUALITY_SCHEMA_VERSION = "organograph_shape_quality_v4"
 _SAMPLE_FIELDS = (
     "dataset",
     "timepoint",
@@ -120,6 +129,25 @@ def _finite_json(value: Any, *, path: str = "root") -> Any:
             for index, item in enumerate(value)
         ]
     raise TypeError(f"Unsupported export value at {path}: {type(value).__name__}")
+
+
+def _nullable_quality_json(value: Any) -> Any:
+    """Convert diagnostic values to JSON, replacing non-finite values by null."""
+    if isinstance(value, np.generic):
+        value = value.item()
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, np.ndarray):
+        return _nullable_quality_json(value.tolist())
+    if isinstance(value, dict):
+        return {str(key): _nullable_quality_json(item) for key, item in value.items()}
+    if isinstance(value, set):
+        value = sorted(value, key=str)
+    if isinstance(value, (list, tuple)):
+        return [_nullable_quality_json(item) for item in value]
+    return str(value)
 
 
 def _metadata_sources(coerced: _CoercedShape, metadata: dict[str, Any] | None):
@@ -250,7 +278,15 @@ def _curve_record(attachment: PrimitiveAttachment) -> dict[str, Any]:
         dtype=float,
     )
     method = str(metadata.get("centerline_method", ""))
-    if "cubic_bezier" in method or controls.shape[0] == 4:
+    if "tangent_constrained_hermite" in method:
+        curve_type = "tangent_hermite"
+        controls = centerline[[0, -1]]
+    elif "circular_arc" in method:
+        curve_type = "circular_arc"
+        controls = centerline[[0, -1]]
+    elif "sinusoidal_bend" in method:
+        curve_type = "sinusoidal_bend"
+    elif "cubic_bezier" in method or controls.shape[0] == 4:
         curve_type = "cubic_bezier"
     elif "quadratic_bezier" in method or controls.shape[0] == 3:
         curve_type = "quadratic_bezier"
@@ -263,11 +299,34 @@ def _curve_record(attachment: PrimitiveAttachment) -> dict[str, Any]:
             f"Primitive {attachment.attachment_id!r} has invalid centerline controls"
         )
     n_samples = int(centerline.shape[0]) if centerline.ndim == 2 else 64
-    return {
+    record = {
         "centerline_type": curve_type,
         "centerline_control_points": controls,
         "centerline_samples": max(2, n_samples),
     }
+    if curve_type == "sinusoidal_bend":
+        bend = np.asarray(metadata.get("centerline_bend_vector"), dtype=float)
+        if bend.shape != (3,):
+            raise ValueError(
+                f"Primitive {attachment.attachment_id!r} has an invalid bend vector"
+            )
+        record["centerline_bend_vector"] = bend
+    elif curve_type == "circular_arc":
+        sagitta = np.asarray(metadata.get("centerline_sagitta_vector"), dtype=float)
+        if sagitta.shape != (3,):
+            raise ValueError(
+                f"Primitive {attachment.attachment_id!r} has an invalid arc sagitta"
+            )
+        record["centerline_sagitta_vector"] = sagitta
+    elif curve_type == "tangent_hermite":
+        for key in ("centerline_start_tangent", "centerline_end_tangent"):
+            tangent = np.asarray(metadata.get(key), dtype=float)
+            if tangent.shape != (3,):
+                raise ValueError(
+                    f"Primitive {attachment.attachment_id!r} has an invalid {key}"
+                )
+            record[key] = tangent
+    return record
 
 
 def _compact_parameters(attachment: PrimitiveAttachment) -> dict[str, Any]:
@@ -293,18 +352,28 @@ def _compact_parameters(attachment: PrimitiveAttachment) -> dict[str, Any]:
             "epsilon_2": source["epsilon_2"],
         }
     if primitive_type == _TUBE_TYPE:
-        r_tip = source["r_taper"] if "r_taper" in source else source["r_tip"]
-        return {
+        r_distal = source.get(
+            "r_distal", source.get("r_taper", source.get("r_tip"))
+        )
+        output = {
             **_curve_record(attachment),
-            "r_neck": source["r_neck"],
-            "r_body": source["r_body"],
-            "r_tip": r_tip,
-            "s_body": source.get("s_body", 0.5),
+            "r_attachment": (
+                source["r_attachment"] if "r_attachment" in source else source["r_neck"]
+            ),
+            "r_center": source["r_center"] if "r_center" in source else source["r_body"],
+            "r_distal": r_distal,
+            "s_center": source.get("s_center", source.get("s_body", 0.5)),
             "s_taper": source.get("s_taper", source.get("distal_taper_start", 0.85)),
             "r_constriction": source.get("r_constriction"),
             "s_constriction": source.get("s_constriction"),
-            "radius_profile": "shape_preserving_cubic_squared_radius_v1",
+            "radius_profile": "semantic_landmarks_squared_radius_v2",
         }
+        if source.get("opening_normal") is not None:
+            output["opening_normal"] = source["opening_normal"]
+            output["opening_frame_blend_fraction"] = source.get(
+                "opening_frame_blend_fraction", 0.15
+            )
+        return output
     if primitive_type == _NECK_TYPE:
         centerline = np.asarray(source["centerline_points"], dtype=float)
         return {
@@ -314,7 +383,7 @@ def _compact_parameters(attachment: PrimitiveAttachment) -> dict[str, Any]:
         }
     raise ValueError(
         f"Unsupported reconstructive primitive type {primitive_type!r}; "
-        "add an explicit v2 parameter adapter before exporting it"
+        "add an explicit parameter adapter before exporting it"
     )
 
 
@@ -370,7 +439,7 @@ def shape_export_payload(
     primitive_result: PrimitiveFitResult | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build one compact v2 payload from the final fitted primitive graph."""
+    """Build one compact v5 payload from the final fitted primitive graph."""
     coerced = _coerce_shape_result(result, primitive_result=primitive_result)
     sample = _sample_record(coerced, metadata)
     payload = {
@@ -389,8 +458,9 @@ def shape_export_payload(
 def validate_shape_export_payload(payload: dict[str, Any]) -> None:
     """Validate topology, transforms, primitive targets, and finite geometry."""
     _finite_json(payload)
-    if payload.get("schema_version") != SHAPE_EXPORT_SCHEMA_VERSION:
-        raise ValueError(f"Expected schema {SHAPE_EXPORT_SCHEMA_VERSION!r}")
+    schema = payload.get("schema_version")
+    if schema not in {SHAPE_EXPORT_SCHEMA_VERSION, *LEGACY_SHAPE_EXPORT_SCHEMA_VERSIONS}:
+        raise ValueError(f"Unsupported shape export schema {schema!r}")
     skeleton = payload.get("skeleton") or {}
     nodes = skeleton.get("nodes") or []
     edges = skeleton.get("edges") or []
@@ -458,7 +528,7 @@ def validate_shape_export_payload(payload: dict[str, Any]) -> None:
             _validate_neck_parameters(primitive, parameters)
         else:
             raise ValueError(
-                f"Unsupported primitive type in v2 payload: {primitive_type!r}"
+                f"Unsupported primitive type in shape payload: {primitive_type!r}"
             )
     transform = payload.get("coordinate_transform") or {}
     forward = np.asarray(transform.get("source_to_fitted"), dtype=float)
@@ -501,7 +571,14 @@ def _validate_blob_parameters(
 def _validate_curve(primitive_id: str, parameters: dict[str, Any]) -> None:
     controls = np.asarray(parameters.get("centerline_control_points"), dtype=float)
     curve_type = parameters.get("centerline_type")
-    expected = {"line": 2, "quadratic_bezier": 3, "cubic_bezier": 4}
+    expected = {
+        "line": 2,
+        "quadratic_bezier": 3,
+        "cubic_bezier": 4,
+        "sinusoidal_bend": 2,
+        "circular_arc": 2,
+        "tangent_hermite": 2,
+    }
     if controls.ndim != 2 or controls.shape[1:] != (3,) or controls.shape[0] < 2:
         raise ValueError(f"Primitive {primitive_id!r} has invalid centerline controls")
     if curve_type in expected and controls.shape[0] != expected[curve_type]:
@@ -511,6 +588,32 @@ def _validate_curve(primitive_id: str, parameters: dict[str, Any]) -> None:
         )
     if curve_type not in {*expected, "polyline"}:
         raise ValueError(f"Primitive {primitive_id!r} has unknown centerline type")
+    if curve_type == "sinusoidal_bend":
+        bend = np.asarray(parameters.get("centerline_bend_vector"), dtype=float)
+        if bend.shape != (3,):
+            raise ValueError(
+                f"Primitive {primitive_id!r} sinusoidal bend requires a 3-vector"
+            )
+        chord = controls[1] - controls[0]
+        tolerance = 1e-7 * max(float(np.linalg.norm(chord)), 1.0)
+        if abs(float(np.dot(bend, chord))) > tolerance:
+            raise ValueError(
+                f"Primitive {primitive_id!r} bend vector must be transverse"
+            )
+    if curve_type == "circular_arc":
+        sagitta = np.asarray(parameters.get("centerline_sagitta_vector"), dtype=float)
+        if sagitta.shape != (3,):
+            raise ValueError(
+                f"Primitive {primitive_id!r} circular arc requires a 3-vector sagitta"
+            )
+    if curve_type == "tangent_hermite":
+        for key in ("centerline_start_tangent", "centerline_end_tangent"):
+            tangent = np.asarray(parameters.get(key), dtype=float)
+            if tangent.shape != (3,) or np.linalg.norm(tangent) <= 1e-12:
+                raise ValueError(
+                    f"Primitive {primitive_id!r} tangent Hermite curve requires "
+                    f"a non-zero {key}"
+                )
 
 
 def _validate_tube_parameters(
@@ -519,14 +622,20 @@ def _validate_tube_parameters(
 ) -> None:
     primitive_id = primitive["primitive_id"]
     _validate_curve(primitive_id, parameters)
-    for key in ("r_neck", "r_body", "r_tip"):
+    is_v3 = "r_attachment" in parameters
+    radius_keys = (
+        ("r_attachment", "r_center", "r_distal")
+        if is_v3
+        else ("r_neck", "r_body", "r_tip")
+    )
+    for key in radius_keys:
         if float(parameters.get(key, 0.0)) <= 0.0:
             raise ValueError(f"Crypt tube {primitive_id!r} {key} must be positive")
-    s_body = float(parameters.get("s_body", -1.0))
+    s_body = float(parameters.get("s_center", parameters.get("s_body", -1.0)))
     s_taper = float(parameters.get("s_taper", -1.0))
     if not 0.0 < s_body < s_taper < 1.0:
         raise ValueError(
-            f"Crypt tube {primitive_id!r} requires 0 < s_body < s_taper < 1"
+            f"Crypt tube {primitive_id!r} requires 0 < s_center < s_taper < 1"
         )
     r_constriction = parameters.get("r_constriction")
     s_constriction = parameters.get("s_constriction")
@@ -538,6 +647,16 @@ def _validate_tube_parameters(
     if r_constriction is not None:
         if float(r_constriction) <= 0.0 or not 0.0 <= float(s_constriction) <= 1.0:
             raise ValueError(f"Crypt tube {primitive_id!r} has an invalid constriction")
+    opening_normal = parameters.get("opening_normal")
+    if opening_normal is not None:
+        opening_normal = np.asarray(opening_normal, dtype=float)
+        if opening_normal.shape != (3,) or np.linalg.norm(opening_normal) <= 1e-12:
+            raise ValueError(f"Crypt tube {primitive_id!r} has an invalid opening normal")
+        blend = float(parameters.get("opening_frame_blend_fraction", 0.15))
+        if not 0.0 < blend <= 1.0:
+            raise ValueError(
+                f"Crypt tube {primitive_id!r} has an invalid opening-frame blend"
+            )
 
 
 def _validate_neck_parameters(
@@ -562,14 +681,47 @@ def _expanded_parameters(record: dict[str, Any]) -> dict[str, Any]:
         centerline = sample_quadratic_bezier(*controls, n_samples=n_samples)
     elif curve_type == "cubic_bezier":
         centerline = sample_cubic_bezier(*controls, n_samples=n_samples)
+    elif curve_type == "sinusoidal_bend":
+        centerline = sample_sinusoidal_bend(
+            controls[0],
+            controls[1],
+            compact["centerline_bend_vector"],
+            n_samples=n_samples,
+        )
+    elif curve_type == "circular_arc":
+        centerline = sample_circular_arc(
+            controls[0],
+            controls[1],
+            compact["centerline_sagitta_vector"],
+            n_samples=n_samples,
+        )
+    elif curve_type == "tangent_hermite":
+        centerline = sample_tangent_hermite(
+            controls[0],
+            controls[1],
+            compact["centerline_start_tangent"],
+            compact["centerline_end_tangent"],
+            n_samples=n_samples,
+        )
     else:
         centerline = controls
     expanded = {**compact, "centerline_points": centerline}
     if primitive_type == _TUBE_TYPE:
+        r_attachment = compact.get("r_attachment", compact.get("r_neck"))
+        r_center = compact.get("r_center", compact.get("r_body"))
+        r_distal = compact.get("r_distal", compact.get("r_tip"))
+        s_center = compact.get("s_center", compact.get("s_body", 0.5))
         expanded.update(
             {
-                "r_attachment": compact["r_neck"],
-                "r_taper": compact["r_tip"],
+                "r_attachment": r_attachment,
+                "r_neck": r_attachment,
+                "r_center": r_center,
+                "r_body": r_center,
+                "r_distal": r_distal,
+                "r_tip": r_distal,
+                "r_taper": r_distal,
+                "s_center": s_center,
+                "s_body": s_center,
                 "distal_taper_start": compact["s_taper"],
             }
         )
@@ -581,7 +733,7 @@ def graph_from_shape_export_payload(
     *,
     coordinate_system: str = "fitted",
 ) -> SkeletonGraph:
-    """Reconstruct the final graph and primitive attachments from a v2 payload."""
+    """Reconstruct a final graph from a v5 or legacy v2-v4 payload."""
     validate_shape_export_payload(payload)
     graph = SkeletonGraph(
         metadata={"sample": dict(payload.get("sample") or {})},
@@ -657,6 +809,24 @@ def _transform_graph_to_source(graph: SkeletonGraph, transform: dict[str, Any]) 
         for key in ("centerline_points", "centerline_control_points"):
             if key in parameters and parameters[key] is not None:
                 parameters[key] = _transform_points(parameters[key], matrix)
+        if parameters.get("opening_normal") is not None:
+            opening_normal = rotation @ np.asarray(
+                parameters["opening_normal"], dtype=float
+            )
+            parameters["opening_normal"] = opening_normal / max(
+                float(np.linalg.norm(opening_normal)), 1e-12
+            )
+        if parameters.get("centerline_bend_vector") is not None:
+            parameters["centerline_bend_vector"] = linear @ np.asarray(
+                parameters["centerline_bend_vector"], dtype=float
+            )
+        if parameters.get("centerline_sagitta_vector") is not None:
+            parameters["centerline_sagitta_vector"] = linear @ np.asarray(
+                parameters["centerline_sagitta_vector"], dtype=float
+            )
+        for key in ("centerline_start_tangent", "centerline_end_tangent"):
+            if parameters.get(key) is not None:
+                parameters[key] = linear @ np.asarray(parameters[key], dtype=float)
         if "orientation" in parameters:
             parameters["orientation"] = rotation @ np.asarray(
                 parameters["orientation"], dtype=float
@@ -668,7 +838,9 @@ def _transform_graph_to_source(graph: SkeletonGraph, transform: dict[str, Any]) 
             "r_neck",
             "r_attachment",
             "r_body",
+            "r_center",
             "r_tip",
+            "r_distal",
             "r_taper",
             "r_constriction",
             "radius",
@@ -680,6 +852,81 @@ def _transform_graph_to_source(graph: SkeletonGraph, transform: dict[str, Any]) 
     graph.coordinate_frame = {"kind": "original_mesh"}
 
 
+def shape_quality_payload(
+    result: SkeletonGraph | SkeletonizationResult | PrimitiveFitResult | OrganoidShapeResult,
+    *,
+    primitive_result: PrimitiveFitResult | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a non-VAE sidecar containing crypt fitting diagnostics.
+
+    Unlike ``shape.json``, this payload is explicitly operational: optimizer
+    state, residuals, support counts, and constraint activation are useful for
+    filtering and fitting experiments but are not reconstructive shape degrees
+    of freedom.
+    """
+    coerced = _coerce_shape_result(result, primitive_result=primitive_result)
+    sample = _sample_record(coerced, metadata)
+    crypt_records = []
+    for scope, owner_id, attachment in _all_attachments(coerced.graph):
+        if attachment.primitive_type != _TUBE_TYPE:
+            continue
+        crypt_records.append(
+            {
+                "primitive_id": str(attachment.attachment_id or owner_id),
+                "attachment_scope": scope,
+                "owner_id": str(owner_id),
+                "target_node_ids": list(attachment.target_ids),
+                "fit_error": attachment.fit_error,
+                "residuals": dict(attachment.residuals),
+                "n_points": attachment.metadata.get("n_points"),
+                "fit_method": attachment.metadata.get("fit_method"),
+                "centerline_method": attachment.metadata.get("centerline_method"),
+                "tip_source": attachment.metadata.get("tip_source"),
+                "tip_vertex_id": attachment.metadata.get("tip_vertex_id"),
+                "centerline_kind": attachment.metadata.get("centerline_kind"),
+                "centerline_sagitta_vector": attachment.metadata.get(
+                    "centerline_sagitta_vector"
+                ),
+                "centerline_start_tangent": attachment.metadata.get(
+                    "centerline_start_tangent"
+                ),
+                "centerline_end_tangent": attachment.metadata.get(
+                    "centerline_end_tangent"
+                ),
+                "centerline_tangent_length": attachment.metadata.get(
+                    "centerline_tangent_length"
+                ),
+                "centerline_fit_rmse": attachment.metadata.get(
+                    "centerline_fit_rmse"
+                ),
+                "opening_normal_source": attachment.metadata.get(
+                    "opening_normal_source"
+                ),
+                "tip_normal": attachment.metadata.get("tip_normal"),
+                "ratio_contours": dict(
+                    attachment.metadata.get("ratio_contours") or {}
+                ),
+                "profile_optimization": dict(
+                    attachment.metadata.get("profile_optimization") or {}
+                ),
+                "profile_observations": dict(
+                    attachment.metadata.get("profile_observations") or {}
+                ),
+                "volume_center": dict(
+                    attachment.metadata.get("volume_center") or {}
+                ),
+            }
+        )
+    return _nullable_quality_json(
+        {
+            "schema_version": SHAPE_QUALITY_SCHEMA_VERSION,
+            "sample": sample,
+            "crypt_primitives": crypt_records,
+        }
+    )
+
+
 def save_shape_export(
     result: SkeletonGraph | SkeletonizationResult | PrimitiveFitResult | OrganoidShapeResult,
     output_dir,
@@ -687,8 +934,9 @@ def save_shape_export(
     primitive_result: PrimitiveFitResult | None = None,
     metadata: dict[str, Any] | None = None,
     prefix: str = "shape",
+    save_quality: bool = True,
 ) -> dict[str, str]:
-    """Write one strict, compact v2 JSON export and return its path."""
+    """Write compact shape JSON and an optional non-VAE quality sidecar."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     payload = shape_export_payload(
@@ -701,11 +949,28 @@ def save_shape_export(
         json.dumps(payload, indent=2, sort_keys=True, allow_nan=False),
         encoding="utf-8",
     )
-    return {"json": str(path)}
+    paths = {"json": str(path)}
+    if save_quality:
+        quality_path = output_dir / "quality.json"
+        quality_path.write_text(
+            json.dumps(
+                shape_quality_payload(
+                    result,
+                    primitive_result=primitive_result,
+                    metadata=metadata,
+                ),
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            ),
+            encoding="utf-8",
+        )
+        paths["quality_json"] = str(quality_path)
+    return paths
 
 
 def load_shape_export_json(path) -> dict[str, Any]:
-    """Load and validate a compact v2 shape payload."""
+    """Load and validate a compact v5 or legacy v2-v4 shape payload."""
     with Path(path).open("r", encoding="utf-8") as handle:
         payload = json.load(handle)
     validate_shape_export_payload(payload)
@@ -713,7 +978,7 @@ def load_shape_export_json(path) -> dict[str, Any]:
 
 
 def load_shape_export_graph(path, *, coordinate_system: str = "fitted") -> SkeletonGraph:
-    """Load a v2 export directly as a fitted- or original-coordinate graph."""
+    """Load an export directly as a fitted- or original-coordinate graph."""
     return graph_from_shape_export_payload(
         load_shape_export_json(path),
         coordinate_system=coordinate_system,
@@ -723,16 +988,26 @@ def load_shape_export_graph(path, *, coordinate_system: str = "fitted") -> Skele
 def write_export_readme(path, *, dataset: str | None = None) -> None:
     """Write the compact batch-export data dictionary."""
     dataset_line = f"Dataset: `{dataset}`.\n\n" if dataset else ""
-    text = f"""# OrganoGraph Shape Export v2
+    text = f"""# OrganoGraph Shape Export v5
 
-{dataset_line}Each organoid directory contains one `shape.json` with the final
+{dataset_line}Each organoid directory contains `shape.json` with the final
 skeleton and fitted primitives shown by `notebooks/tutorial_skeleton.ipynb`.
-Detection arrays, component masks, fit errors, and residuals are not included.
+New exports also contain `quality.json` with crypt optimizer, support, and
+residual diagnostics. This sidecar is for filtering and fitting audits; it is
+not part of the VAE shape representation.
+
+Detection arrays and component masks are not included. Fit errors and residuals
+remain excluded from `shape.json`.
 
 The file contains sample identity and VAE eligibility, reversible original-mesh
 coordinate transforms, graph nodes and edges, and reconstructive primitive
 parameters. Crypt array order is explicitly non-semantic; use `crypt_id` and
 graph connectivity or permutation-invariant matching.
+
+Crypt tubes use endpoint-normal Hermite centerlines and semantic
+attachment/center/distal radii. Their cap onset is a fixed reconstruction
+setting (`s_taper=0.85`), not a VAE degree of freedom. The graph crypt node is
+placed at the fitted tube volume center computed from `r(s)^2`.
 
 Use `organograph.skeleton.load_shape_export_graph(path)` to reconstruct the
 prepared-mesh graph, or pass `coordinate_system="source"` to restore positions,

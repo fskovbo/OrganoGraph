@@ -7,10 +7,12 @@ The output is a compact reconstructive format for a separate VAE project. Each
 organoid gets a directory containing:
 
     shape.json
+    quality.json
 
 The JSON payload preserves the final skeleton, fitted primitive geometry, and
-the reversible transform to original mesh coordinates. Fitting diagnostics and
-segmentation arrays are intentionally omitted.
+the reversible transform to original mesh coordinates. Fitting diagnostics are
+kept in the separate quality payload and are never part of the VAE input;
+segmentation arrays are intentionally omitted from both files.
 """
 
 from __future__ import annotations
@@ -54,14 +56,20 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 
 DATA_ROOT = (PROJECT_ROOT.parent / "NicoleData").resolve()
+# DATASET_TIMEPOINTS = {
+#     "20250929": ["day3p5", "day4", "day4p5", "day4p5-more"],
+#     "20251201": ["day4p5"],
+# }
+
 DATASET_TIMEPOINTS = {
-    "20250929": ["day3p5", "day4", "day4p5", "day4p5-more"],
+    "20250929": ["day4", "day4p5"],
     "20251201": ["day4p5"],
 }
 
+
 # All configured datasets are written into this one VAE-ready export dataset.
 # Dataset names remain part of each sample path to avoid label collisions.
-EXPORT_ROOT = (DATA_ROOT / "combined_skeleton_primitive_exports_v2").resolve()
+EXPORT_ROOT = (DATA_ROOT / "combined_skeleton_primitive_exports_fixed").resolve()
 
 VOCAB_PATH = PROJECT_ROOT / "sim" / "vocab_with_meta.npz"
 WHITELIST_PATH = None
@@ -69,8 +77,8 @@ WHITELIST_PATH = None
 OVERWRITE = False
 VERBOSE = True
 DRY_RUN = False
-STRICT = False
-MAX_MESHES = None
+STRICT = True
+MAX_MESHES = 300
 
 MESH_PREPARATION = definitive_mesh_preparation()
 NORMALIZE_MESH = MESH_PREPARATION["normalize_mesh"]
@@ -477,6 +485,7 @@ def main(argv: list[str] | None = None) -> int:
                     "mesh_path": str(mesh_path),
                     "output_dir": str(organoid_dir),
                     "json_path": export_paths.get("json", ""),
+                    "quality_json_path": export_paths.get("quality_json", ""),
                     "has_branches": has_branches,
                     "vae_eligible": not has_branches,
                     **summary,

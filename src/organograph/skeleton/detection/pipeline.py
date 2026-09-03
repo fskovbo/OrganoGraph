@@ -8,17 +8,17 @@ from organograph.skeleton.config import DetectionConfig
 from organograph.skeleton.detection.branch_validation import _grow_parent_patch_to_neck, _validate_split_branch_geometry
 from organograph.skeleton.detection.mesh_regions import _boundary_edges_for_region, _low_pass_smoothed_mesh_for_detection, _mesh_edges_from_faces
 from organograph.skeleton.detection.neck_profiles import _add_neck_profile_geometry
-from organograph.skeleton.detection.region_refinement import _refine_body_transition_width_outliers
 from organograph.skeleton.detection.tips import _select_hks_tips_from_axis
 from organograph.skeleton.primitive.barriers import (
     fit_branch_barrier_primitives,
+    exclude_host_vertices_from_detections,
     fit_barrier_primitive_sampled,
     exclude_host_vertices_from_patches,
     host_mask_from_barrier,
 )
 from organograph.skeleton.detection.attachments import (
-    attachment_crossing_diagnostics,
-    assign_crypt_attachments_from_barrier_crossings,
+    attachment_projection_diagnostics,
+    assign_crypt_attachments_from_projected_boundaries,
 )
 from organograph.skeleton.results import BarrierStageResult, DetectionResult
 
@@ -96,8 +96,8 @@ def detect_crypts_for_skeleton(
 
     The body barrier is fitted before HKS detection. Circumference profiles are
     used only to classify transition versus constriction; host-side component
-    boundaries always come from persistent crossings of fitted body or branch
-    barriers. This is the sole supported skeletonization path.
+    openings are projected directly to fitted body or branch barriers. This is
+    the sole supported skeletonization path.
     """
     from organograph.crypts.filters import apply_filters
     from organograph.crypts.vocab import detect_crypts_by_encoding, subdivide_crypts_by_encoding
@@ -107,7 +107,6 @@ def detect_crypts_for_skeleton(
     candidate_config = config.candidates
     neck_config = config.necks
     branch_config = config.branches
-    transition_config = config.body_transition
     barrier_config = config.barriers
     mesh_config = config.mesh
 
@@ -471,25 +470,12 @@ def detect_crypts_for_skeleton(
             )
         detections.append(det)
 
-    if transition_config.enabled:
-        detections = _refine_body_transition_width_outliers(
-            detection_mesh,
-            detections,
-            max_crypt_to_host_width_ratio=transition_config.max_crypt_to_host_width_ratio,
-            host_width_quantile=transition_config.host_width_quantile,
-            min_second_derivative_score=transition_config.min_second_derivative_score,
-            min_attachment_level=transition_config.min_attachment_level,
-            window_length=neck_window_length,
-            polyorder=neck_polyorder,
-        )
-
-    crossing_config = barrier_config.crossing_kwargs()
-    detections = assign_crypt_attachments_from_barrier_crossings(
+    detections = assign_crypt_attachments_from_projected_boundaries(
         detection_mesh.v,
         detection_mesh.f,
         detections,
         body_barrier_fit,
-        crossing_kwargs=crossing_config,
+        grid_resolution=barrier_config.opening_grid_resolution,
         assign_body_roots=True,
         assign_branch_daughters=False,
     )
@@ -508,18 +494,35 @@ def detect_crypts_for_skeleton(
     for branch_mask in branch_masks.values():
         protected_mask |= np.asarray(branch_mask, dtype=bool)
 
-    detections = assign_crypt_attachments_from_barrier_crossings(
+    # Daughter candidates are trimmed by their own branch host before their
+    # opening rings and final primitive components are established.
+    for detection in detections:
+        daughters = detection.get("daughters") or []
+        if not daughters:
+            continue
+        branch_id = f"crypt_{detection.get('crypt_id')}_branch"
+        branch_mask = branch_masks.get(branch_id)
+        if branch_mask is None:
+            continue
+        detection["daughters"] = exclude_host_vertices_from_detections(
+            daughters,
+            branch_mask,
+            recursive=False,
+            metadata_key="branch_barrier_region_filter",
+        )
+
+    detections = assign_crypt_attachments_from_projected_boundaries(
         detection_mesh.v,
         detection_mesh.f,
         detections,
         body_barrier_fit,
         branch_fits=branch_fits,
-        crossing_kwargs=crossing_config,
+        grid_resolution=barrier_config.opening_grid_resolution,
         assign_body_roots=False,
         assign_branch_daughters=True,
     )
     boundary_detections = detections
-    crossing_diagnostics = attachment_crossing_diagnostics(boundary_detections)
+    attachment_diagnostics = attachment_projection_diagnostics(boundary_detections)
     body_barrier_info.update(
         {
             "branch_fits": branch_fits,
@@ -529,8 +532,7 @@ def detect_crypts_for_skeleton(
                 barrier_config.branch_ownership_level
             ),
             "protected_mask": protected_mask,
-            "crossing_config": crossing_config,
-            "post_crossing_host_vertex_exclusion": False,
+            "opening_grid_resolution": int(barrier_config.opening_grid_resolution),
         }
     )
 
@@ -549,9 +551,9 @@ def detect_crypts_for_skeleton(
         "split_validations": split_validations,
         "detection_mesh_smoothed": bool(mesh_config.smooth),
         "boundary_detections": boundary_detections,
-        "attachment_crossings": crossing_diagnostics,
-        "attachment_crossing_failures": [
-            record for record in crossing_diagnostics if not record.get("found", False)
+        "attachment_projections": attachment_diagnostics,
+        "attachment_projection_failures": [
+            record for record in attachment_diagnostics if not record.get("found", False)
         ],
         **seg_vars,
     }

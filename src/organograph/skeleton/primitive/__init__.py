@@ -15,6 +15,12 @@ from organograph.skeleton.primitive.blobs import (
     fit_ellipsoid_to_points,
 )
 from organograph.skeleton.primitive.components import primitive_components_from_crypt_detections
+from organograph.skeleton.primitive.crypt_geometry import (
+    CryptGeometryFit,
+    boundary_tip_ratio_field,
+    fit_crypt_geometry,
+    sample_tangent_hermite,
+)
 from organograph.skeleton.primitive.necks import attach_body_branch_neck_primitives, fit_straight_neck_cylinder
 from organograph.skeleton.primitive.overlap import (
     CryptDetectionMergeResult,
@@ -38,6 +44,7 @@ __all__ = [
     "BarrierPrimitiveConfig",
     "BarrierPrimitiveFit",
     "CryptDetectionMergeResult",
+    "CryptGeometryFit",
     "CryptOverlapAssessment",
     "TerminalCryptReference",
     "assess_crypt_primitive_overlaps",
@@ -45,6 +52,7 @@ __all__ = [
     "attach_body_primitive",
     "attach_branch_primitives",
     "attach_crypt_tube_primitives",
+    "boundary_tip_ratio_field",
     "barrier_primitive_level",
     "barrier_primitive_vertices_like_mesh",
     "crypt_terminal_paths",
@@ -53,6 +61,7 @@ __all__ = [
     "fit_barrier_primitive_sampled",
     "fit_blob_primitive_to_points",
     "fit_crypt_tube_to_points",
+    "fit_crypt_geometry",
     "fit_ellipsoid_to_points",
     "fit_straight_neck_cylinder",
     "merge_overlapping_crypt_detections",
@@ -60,5 +69,6 @@ __all__ = [
     "primitive_attachments_to_dataframe",
     "primitive_components_from_crypt_detections",
     "relative_height_field",
+    "sample_tangent_hermite",
     "tube_overlap_fraction",
 ]

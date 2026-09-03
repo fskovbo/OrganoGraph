@@ -11,19 +11,13 @@ from organograph.skeleton.detection.branch_validation import (
     _grow_parent_patch_to_neck,
     _validate_split_branch_geometry,
 )
-from organograph.skeleton.detection.graph_builder import (
-    _penalize_short_crypt_bending,
-    build_skeleton_graph,
-)
+from organograph.skeleton.detection.graph_builder import build_skeleton_graph
 from organograph.skeleton.detection.neck_profiles import analyze_neck_circumference_profile
-from organograph.skeleton.detection.region_refinement import (
-    _earlier_second_derivative_transition_level,
-    _refine_body_transition_width_outliers,
-)
 from organograph.skeleton.detection.tips import _select_hks_tips_from_axis
 from organograph.skeleton.detection.attachments import (
-    assign_crypt_attachments_from_barrier_crossings,
-    find_barrier_boundary_crossing,
+    assign_crypt_attachments_from_projected_boundaries,
+    barrier_surface_normal,
+    find_projected_opening_attachment,
 )
 from organograph.skeleton.detection.pipeline import detect_crypts_for_skeleton
 from organograph.skeleton import (
@@ -75,7 +69,9 @@ from organograph.skeleton.primitive.barriers import (
     host_mask_from_barrier,
     sampled_vertex_indices,
 )
-from organograph.skeleton.primitive_geometry import estimate_smooth_crypt_centerline
+from organograph.skeleton.primitive.crypt_geometry import sample_tangent_hermite
+from organograph.skeleton.primitive.radius_profiles import fitted_radius_volume_center
+from organograph.plotting.skeletons import _tube_surface
 from organograph.skeleton.primitive.blobs import blob_surface_radius
 from organograph.plotting.skeletons import _centerline_curvature_profile, _primitive_mesh
 from organograph.mesh.geodesics import compute_geodesics_dijkstra
@@ -515,7 +511,7 @@ class SkeletonTests(unittest.TestCase):
             delta=0.011,
         )
 
-    def test_explicit_neck_profile_builds_attachment_and_constriction_nodes(self):
+    def test_constriction_is_kept_in_profile_not_graph_topology(self):
         graph = build_skeleton_graph(
             VERTICES,
             FACES,
@@ -541,22 +537,17 @@ class SkeletonTests(unittest.TestCase):
         )
 
         self.assertIn("crypt_budded_attachment", graph.nodes)
-        self.assertIn("crypt_budded_constriction", graph.nodes)
+        self.assertNotIn("crypt_budded_constriction", graph.nodes)
         self.assertEqual(
             graph.node("crypt_budded_attachment").node_type,
             "attachment",
         )
-        self.assertEqual(
-            graph.node("crypt_budded_constriction").node_type,
-            "constriction",
-        )
-        self.assertEqual(
-            graph.edge("crypt_budded_attachment_to_constriction").source,
-            "crypt_budded_attachment",
-        )
         path = crypt_terminal_paths(graph, "budded")[0]
         self.assertEqual(path[0], "crypt_budded_attachment")
-        self.assertIn("crypt_budded_constriction", path)
+        self.assertEqual(
+            graph.node("crypt_budded_attachment").metadata["neck_profile"]["kind"],
+            "constriction",
+        )
 
     def test_transition_profile_builds_attachment_without_constriction(self):
         graph = build_skeleton_graph(
@@ -802,134 +793,18 @@ class SkeletonTests(unittest.TestCase):
             rejected["branch_geometry_validation"]["body_radius_check_passed"]
         )
 
-    def test_short_crypt_bend_penalty_reduces_lateral_waypoint_offset(self):
-        source = np.array([0.0, 0.0, 0.0])
-        tip = np.array([1.0, 0.0, 0.0])
-        candidate = np.array([0.5, 1.0, 0.0])
-        vertices = np.array(
-            [
-                [0.1, 0.2, 0.0],
-                [0.3, -0.2, 0.0],
-                [0.5, 0.2, 0.0],
-                [0.7, -0.2, 0.0],
-                [0.9, 0.2, 0.0],
-            ]
+    def test_tangent_hermite_has_fixed_endpoints_and_endpoint_directions(self):
+        curve = sample_tangent_hermite(
+            [0.0, 0.0, 0.0],
+            [2.0, 0.0, 0.0],
+            [1.0, 0.4, 0.0],
+            [1.0, -0.3, 0.0],
+            n_samples=33,
         )
-
-        refined, diagnostics = _penalize_short_crypt_bending(
-            vertices,
-            np.arange(len(vertices)),
-            source,
-            candidate,
-            tip,
-            max_dimensionless_curvature=0.05,
-            penalty_strength=12.0,
-        )
-
-        self.assertTrue(diagnostics["applied"])
-        self.assertLess(abs(refined[1]), abs(candidate[1]))
-        self.assertLess(
-            diagnostics["final_dimensionless_curvature"],
-            diagnostics["original_dimensionless_curvature"],
-        )
-
-    def test_body_transition_width_outlier_uses_earlier_second_derivative_peak(self):
-        vertices, faces = make_grid_mesh(9, 9)
-        mesh = SimpleNamespace(v=vertices, f=faces)
-        levels = np.linspace(0.05, 1.0, 120)
-        circumference = 5.0 + 16.0 * levels + 8.0 * np.logaddexp(
-            0.0,
-            35.0 * (levels - 0.55),
-        ) / 35.0
-        detection = {
-            "crypt_id": "wide",
-            "crypt_vertices": np.arange(len(vertices)),
-            "bottom_vertex_id": 4 * 9,
-            "d_crypt": vertices[:, 0] / 8.0,
-            "attachment_level": 1.0,
-            "attachment_position": [8.0, 4.0, 0.0],
-            "circumference_levels": levels,
-            "circumference": circumference,
-            "neck_profile": {
-                "kind": "transition",
-                "relation": "body_crypt",
-                "attachment_level": 1.0,
-            },
-        }
-
-        refined = _refine_body_transition_width_outliers(
-            mesh,
-            [detection],
-            max_crypt_to_host_width_ratio=0.8,
-            min_second_derivative_score=0.5,
-            min_attachment_level=0.3,
-        )[0]
-
-        diagnostics = refined["body_transition_width_validation"]
-        self.assertTrue(diagnostics["refined"])
-        self.assertEqual(diagnostics["reason"], "earlier_second_derivative_transition")
-        self.assertLess(refined["attachment_level"], 1.0)
-        self.assertAlmostEqual(refined["attachment_level"], 0.55, delta=0.08)
-
-    def test_second_derivative_transition_selects_earliest_plausible_peak(self):
-        levels = np.linspace(0.05, 1.0, 160)
-        smooth = (
-            4.0
-            + 5.0 * levels
-            + 4.0 * np.logaddexp(0.0, 45.0 * (levels - 0.32)) / 45.0
-            + 9.0 * np.logaddexp(0.0, 45.0 * (levels - 0.72)) / 45.0
-        )
-
-        level, details = _earlier_second_derivative_transition_level(
-            levels,
-            smooth,
-            current_level=1.0,
-            min_level=0.25,
-            min_score=0.5,
-            window_length=9,
-        )
-
-        self.assertIsNotNone(level)
-        self.assertAlmostEqual(level, 0.32, delta=0.06)
-        self.assertGreaterEqual(len(details["accepted_candidate_levels"]), 2)
-        self.assertAlmostEqual(level, details["accepted_candidate_levels"][0])
-
-    def test_body_transition_width_outlier_shrinks_to_threshold_without_peak(self):
-        vertices, faces = make_grid_mesh(9, 9)
-        mesh = SimpleNamespace(v=vertices, f=faces)
-        levels = np.linspace(0.05, 1.0, 120)
-        circumference = 5.0 + 22.0 * levels
-        detection = {
-            "crypt_id": "wide",
-            "crypt_vertices": np.arange(len(vertices)),
-            "bottom_vertex_id": 4 * 9,
-            "d_crypt": vertices[:, 0] / 8.0,
-            "attachment_level": 1.0,
-            "attachment_position": [8.0, 4.0, 0.0],
-            "circumference_levels": levels,
-            "circumference": circumference,
-            "neck_profile": {
-                "kind": "transition",
-                "relation": "body_crypt",
-                "attachment_level": 1.0,
-            },
-        }
-
-        refined = _refine_body_transition_width_outliers(
-            mesh,
-            [detection],
-            max_crypt_to_host_width_ratio=0.8,
-            min_second_derivative_score=0.99,
-            min_attachment_level=0.3,
-        )[0]
-
-        diagnostics = refined["body_transition_width_validation"]
-        self.assertTrue(diagnostics["refined"])
-        self.assertIn("width_threshold", diagnostics["reason"])
-        self.assertLessEqual(
-            diagnostics["refined_crypt_to_host_width_ratio"],
-            0.8 + 1e-6,
-        )
+        np.testing.assert_allclose(curve[[0, -1]], [[0, 0, 0], [2, 0, 0]])
+        self.assertGreater(np.dot(curve[1] - curve[0], [1.0, 0.4, 0.0]), 0.0)
+        self.assertGreater(np.dot(curve[-1] - curve[-2], [1.0, -0.3, 0.0]), 0.0)
+        np.testing.assert_allclose(curve[:, 2], 0.0)
 
     def test_final_hks_tip_selection_uses_refined_axis_bottom_fraction(self):
         vertices, faces = make_grid_mesh(7, 7)
@@ -1068,7 +943,6 @@ class SkeletonTests(unittest.TestCase):
                 }
             ],
             body_center=[0.0, 0.0, -1.0],
-            bend_max_dimensionless_curvature=None,
         )
 
         self.assertEqual(len(graph.nodes_for_crypt("centroid", node_type="crypt")), 1)
@@ -1241,81 +1115,43 @@ class SkeletonTests(unittest.TestCase):
         self.assertGreater(surface_faces.shape[0], 0)
         self.assertTrue(np.all(np.isfinite(surface_vertices)))
 
-    def test_barrier_crossing_follows_geodesic_ring_centers(self):
-        vertices, faces, distance_field = make_axis_ring_mesh()
+    def test_projected_opening_attachment_lies_on_host_surface(self):
+        angles = np.linspace(0.0, 2.0 * np.pi, 24, endpoint=False)
+        vertices = np.vstack(
+            [
+                np.column_stack(
+                    [np.ones(angles.size), 0.3 * np.cos(angles), 0.3 * np.sin(angles)]
+                ),
+                [2.0, 0.0, 0.0],
+            ]
+        )
+        faces = np.asarray(
+            [[i, (i + 1) % angles.size, angles.size] for i in range(angles.size)],
+            dtype=np.int64,
+        )
         host_fit = BarrierPrimitiveFit(
             center=np.zeros(3),
             axes=np.eye(3),
             radii=np.ones(3),
         )
+        opening = find_projected_opening_attachment(
+            vertices, faces, np.arange(vertices.shape[0]), host_fit
+        )
+        self.assertTrue(opening["found"])
+        np.testing.assert_allclose(opening["position"], [1.0, 0.0, 0.0], atol=0.04)
+        self.assertAlmostEqual(opening["primitive_level"], 1.0, delta=1e-5)
+        normal = barrier_surface_normal(opening["position"], host_fit)
+        np.testing.assert_allclose(normal, [1.0, 0.0, 0.0], atol=0.04)
 
-        crossing = find_barrier_boundary_crossing(
+        refined = assign_crypt_attachments_from_projected_boundaries(
             vertices,
             faces,
-            distance_field,
+            [{"crypt_id": "a", "crypt_vertices": np.arange(vertices.shape[0])}],
             host_fit,
-            prefer_vertices=np.arange(vertices.shape[0]),
-            n_samples=32,
-            persistence=2,
         )
-
-        self.assertTrue(crossing["found"])
-        self.assertAlmostEqual(crossing["axis_level"], 1.0, delta=0.02)
-        np.testing.assert_allclose(crossing["position"], [1.0, 0.0, 0.0], atol=0.03)
-        self.assertAlmostEqual(crossing["primitive_level"], 1.0, delta=0.03)
-
-    def test_barrier_crossing_replaces_inside_and_outside_attachments(self):
-        vertices, faces, distance_field = make_axis_ring_mesh()
-        host_fit = BarrierPrimitiveFit(
-            center=np.zeros(3),
-            axes=np.eye(3),
-            radii=np.ones(3),
+        self.assertTrue(
+            refined[0]["metadata"]["projected_opening_attachment"]["found"]
         )
-        detections = [
-            {
-                "crypt_id": "inside",
-                "crypt_vertices": np.arange(vertices.shape[0]),
-                "bottom_vertex_id": 0,
-                "d_crypt": distance_field,
-                "attachment_level": 1.5,
-                "attachment_position": [0.0, 0.0, 0.0],
-                "neck_position": [0.0, 0.0, 0.0],
-                "neck_profile": {"kind": "transition", "attachment_level": 1.5},
-            },
-            {
-                "crypt_id": "outside",
-                "crypt_vertices": np.arange(vertices.shape[0]),
-                "bottom_vertex_id": 0,
-                "d_crypt": distance_field,
-                "attachment_level": 0.5,
-                "attachment_position": [2.0, 0.0, 0.0],
-                "neck_position": [2.0, 0.0, 0.0],
-                "neck_profile": {"kind": "transition", "attachment_level": 0.5},
-            },
-        ]
-
-        refined = assign_crypt_attachments_from_barrier_crossings(
-            vertices,
-            faces,
-            detections,
-            host_fit,
-            crossing_kwargs={"n_samples": 32, "persistence": 2},
-        )
-
-        for detection in refined:
-            np.testing.assert_allclose(
-                detection["attachment_position"],
-                [1.0, 0.0, 0.0],
-                atol=0.03,
-            )
-            np.testing.assert_allclose(
-                detection["neck_position"],
-                detection["attachment_position"],
-            )
-            self.assertTrue(
-                detection["metadata"]["barrier_boundary_crossing"]["found"]
-            )
-        self.assertEqual(detections[0]["attachment_position"], [0.0, 0.0, 0.0])
 
     def test_body_barrier_fit_precedes_hks_candidate_detection(self):
         events = []
@@ -1480,7 +1316,6 @@ class SkeletonTests(unittest.TestCase):
             config=PrimitiveFitConfig(
                 refine_host_primitives=False,
                 crypt_tube_kwargs={
-                    "smooth_centerline": False,
                     "optimize_radius_profile": False,
                 },
                 crypt_overlap=CryptOverlapConfig(
@@ -1733,9 +1568,9 @@ class SkeletonTests(unittest.TestCase):
             centerline,
             radius_quantile=0.5,
             neck_window=(0.0, 0.01),
-            body_window=(0.48, 0.52),
             tip_window=(0.84, 0.86),
-            distal_taper_start=0.85,
+            center_s=0.5,
+            fixed_taper_position=0.85,
             optimize_radius_profile=False,
         )
 
@@ -1749,7 +1584,7 @@ class SkeletonTests(unittest.TestCase):
             "smooth_squared_radius_to_zero",
         )
 
-    def test_tube_fit_optimizes_ordered_profile_positions(self):
+    def test_tube_fit_uses_derived_center_and_fixed_taper_positions(self):
         centerline = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 10.0]])
         points = make_tube_points(
             centerline,
@@ -1761,20 +1596,76 @@ class SkeletonTests(unittest.TestCase):
         fit = fit_crypt_tube_to_points(
             points,
             centerline,
-            initial_body_position=0.5,
-            initial_taper_position=0.85,
+            center_s=0.35,
+            fixed_taper_position=0.85,
         )
 
-        self.assertGreaterEqual(fit.parameters["s_body"], 0.2)
-        self.assertLessEqual(fit.parameters["s_body"], 0.7)
-        self.assertGreaterEqual(
-            fit.parameters["s_taper"],
-            fit.parameters["s_body"] + 0.1 - 1e-12,
+        expected_center = fitted_radius_volume_center(
+            r_attachment=fit.parameters["r_attachment"],
+            r_center=fit.parameters["r_center"],
+            r_distal=fit.parameters["r_distal"],
+            s_center=fit.parameters["s_center"],
+            s_taper=fit.parameters["s_taper"],
         )
-        self.assertLessEqual(fit.parameters["s_taper"], 0.9)
-        self.assertAlmostEqual(fit.parameters["s_body"], 0.35, delta=0.05)
-        self.assertAlmostEqual(fit.parameters["s_taper"], 0.76, delta=0.05)
+        self.assertAlmostEqual(fit.parameters["crypt_node_s"], expected_center)
+        self.assertNotAlmostEqual(fit.parameters["crypt_node_s"], 0.35, places=3)
+        self.assertEqual(fit.parameters["s_taper"], 0.85)
         self.assertTrue(fit.metadata["profile_optimization"]["success"])
+        self.assertEqual(
+            fit.metadata["volume_center"]["source"],
+            "fitted_radius_squared_volume_centroid",
+        )
+
+    def test_tube_fit_uses_equal_arclength_radius_observations(self):
+        centerline = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 10.0]])
+        points = make_tube_points(
+            centerline,
+            radii=(0.8, 2.0, 0.6),
+            n_s=41,
+            body_s=0.35,
+            distal_taper_start=0.76,
+        )
+        body_slice = points[(points[:, 2] >= 3.0) & (points[:, 2] <= 4.0)]
+        oversampled = np.vstack([points, *([body_slice] * 20)])
+
+        reference = fit_crypt_tube_to_points(points, centerline)
+        biased = fit_crypt_tube_to_points(oversampled, centerline)
+
+        for parameter in ("r_neck", "r_body", "r_tip", "s_body", "s_taper"):
+            self.assertAlmostEqual(
+                reference.parameters[parameter],
+                biased.parameters[parameter],
+                delta=0.04,
+            )
+        observations = biased.metadata["profile_observations"]
+        self.assertEqual(len(observations["s"]), 20)
+        self.assertGreater(max(observations["counts"]), min(observations["counts"]))
+
+    def test_tube_fit_enforces_distal_and_constriction_radius_semantics(self):
+        centerline = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 10.0]])
+        points = make_tube_points(
+            centerline,
+            radii=(1.0, 1.2, 1.5),
+            n_s=61,
+            body_s=0.5,
+            distal_taper_start=0.82,
+            constriction_s=0.18,
+            r_constriction=1.1,
+        )
+        fit = fit_crypt_tube_to_points(
+            points,
+            centerline,
+            constriction_s=0.18,
+            fixed_taper_position=0.82,
+        )
+
+        self.assertLess(fit.parameters["r_tip"], fit.parameters["r_body"])
+        self.assertLess(
+            fit.parameters["r_constriction"],
+            min(fit.parameters["r_neck"], fit.parameters["r_body"]),
+        )
+        diagnostics = fit.metadata["profile_optimization"]
+        self.assertGreaterEqual(diagnostics["n_supported_bins"], 6)
 
     def test_tube_radius_profile_is_smooth_at_taper_control(self):
         from organograph.skeleton.primitive_geometry import capped_tube_radius
@@ -1821,8 +1712,7 @@ class SkeletonTests(unittest.TestCase):
             points,
             centerline,
             constriction_s=0.18,
-            initial_body_position=0.5,
-            initial_taper_position=0.82,
+            fixed_taper_position=0.82,
         )
 
         self.assertAlmostEqual(fit.parameters["s_constriction"], 0.18)
@@ -1838,101 +1728,6 @@ class SkeletonTests(unittest.TestCase):
         self.assertAlmostEqual(
             fit.derived_parameters["constriction_ratio"],
             fit.parameters["r_constriction"] / fit.parameters["r_body"],
-        )
-
-    def test_smooth_crypt_centerline_uses_geodesic_band_centers(self):
-        vertices = []
-        distances = []
-        n_rings = 21
-        n_theta = 20
-        for s in np.linspace(0.0, 1.0, n_rings):
-            angle = 0.5 * math.pi * s
-            center = np.array([math.sin(angle), 0.0, 1.0 - math.cos(angle)])
-            tangent = np.array([math.cos(angle), 0.0, math.sin(angle)])
-            normal = np.array([-math.sin(angle), 0.0, math.cos(angle)])
-            for theta in np.linspace(0.0, 2.0 * math.pi, n_theta, endpoint=False):
-                offset = 0.15 * (
-                    math.cos(theta) * normal
-                    + math.sin(theta) * np.array([0.0, 1.0, 0.0])
-                )
-                vertices.append(center + offset)
-                distances.append(1.0 - s)
-        vertices = np.asarray(vertices, dtype=float)
-        result = estimate_smooth_crypt_centerline(
-            vertices,
-            np.arange(vertices.shape[0]),
-            np.asarray(distances),
-            neck_position=[0.0, 0.0, 0.0],
-            tip_position=[1.0, 0.0, 1.0],
-            n_bands=7,
-            n_samples=65,
-        )
-
-        centerline = result["centerline_points"]
-        np.testing.assert_allclose(centerline[0], [0.0, 0.0, 0.0])
-        np.testing.assert_allclose(centerline[-1], [1.0, 0.0, 1.0])
-        expected_midpoint = np.array([math.sqrt(0.5), 0.0, 1.0 - math.sqrt(0.5)])
-        np.testing.assert_allclose(centerline[32], expected_midpoint, atol=0.04)
-        self.assertEqual(
-            result["method"],
-            "geodesic_band_centroids_quadratic_bezier",
-        )
-
-    def test_smooth_centerline_is_influenced_by_constriction_center(self):
-        vertices = []
-        distances = []
-        neck_level = 1.25
-        for s in np.linspace(0.0, 1.0, 21):
-            center = np.array([0.0, 0.0, s])
-            for theta in np.linspace(0.0, 2.0 * math.pi, 16, endpoint=False):
-                vertices.append(
-                    center
-                    + 0.1
-                    * np.array([math.cos(theta), math.sin(theta), 0.0])
-                )
-                distances.append(neck_level * (1.0 - s))
-        vertices = np.asarray(vertices, dtype=float)
-        distances = np.asarray(distances, dtype=float)
-        constriction = np.array([0.4, 0.0, 0.2])
-
-        unanchored = estimate_smooth_crypt_centerline(
-            vertices,
-            np.arange(vertices.shape[0]),
-            distances,
-            neck_position=[0.0, 0.0, 0.0],
-            tip_position=[0.0, 0.0, 1.0],
-            neck_level=neck_level,
-            n_samples=101,
-        )
-        anchored = estimate_smooth_crypt_centerline(
-            vertices,
-            np.arange(vertices.shape[0]),
-            distances,
-            neck_position=[0.0, 0.0, 0.0],
-            tip_position=[0.0, 0.0, 1.0],
-            neck_level=neck_level,
-            n_samples=101,
-            constriction_position=constriction,
-            constriction_level=1.0,
-            constriction_weight=4.0,
-        )
-
-        unanchored_distance = np.linalg.norm(
-            unanchored["centerline_points"][20] - constriction
-        )
-        anchored_distance = np.linalg.norm(
-            anchored["centerline_points"][20] - constriction
-        )
-        self.assertLess(anchored_distance, unanchored_distance)
-        self.assertTrue(anchored["constriction_used"])
-        self.assertAlmostEqual(anchored["constriction_parameter"], 0.2)
-        self.assertEqual(
-            anchored["method"],
-            "geodesic_bands_constriction_anchored_quadratic_bezier",
-        )
-        np.testing.assert_allclose(
-            anchored["centerline_points"][[0, -1]],
-            [[0.0, 0.0, 0.0], [0.0, 0.0, 1.0]],
         )
 
     def test_bent_tube_fit_reports_length_and_bend_angle(self):
@@ -1995,7 +1790,24 @@ class SkeletonTests(unittest.TestCase):
                 ]
             )
         )
-        attach_crypt_tube_primitives(graph, VERTICES, {"a": tube_points})
+        fit = fit_crypt_tube_to_points(
+            tube_points,
+            np.vstack(
+                [
+                    graph.node("crypt_a_neck").position,
+                    graph.node("crypt_a_crypt").position,
+                    graph.node("crypt_a_tip").position,
+                ]
+            ),
+        )
+        graph.add_primitive_attachment(
+            "crypt_a_path_0",
+            fit.to_attachment(
+                attachment_type="path",
+                attachment_id="crypt_a_path_0",
+                target_ids=["crypt_a_neck", "crypt_a_crypt", "crypt_a_tip"],
+            ),
+        )
 
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "skeleton_with_primitives.json"
@@ -2007,140 +1819,7 @@ class SkeletonTests(unittest.TestCase):
         self.assertEqual(len(loaded.primitive_attachments), 1)
         attachment = next(iter(loaded.primitive_attachments.values()))
         self.assertEqual(attachment.primitive_type, "tapered_capped_tube")
-        self.assertGreater(len(attachment.parameters["centerline_points"]), 3)
-        self.assertTrue(
-            loaded.node("crypt_a_crypt").metadata[
-                "position_refined_from_smooth_centerline"
-            ]
-        )
-
-    def test_bulged_crypt_centerline_smoothing_can_be_disabled(self):
-        graph = build_skeleton_graph(
-            VERTICES,
-            FACES,
-            [
-                {
-                    "crypt_id": "bulged",
-                    "attachment_position": [0.0, 0.0, 0.0],
-                    "tip_position": [0.0, 0.0, 2.0],
-                    "crypt_vertices": [1, 2, 4],
-                    "neck_profile": {
-                        "kind": "transition",
-                        "attachment_level": 1.0,
-                    },
-                }
-            ],
-            body_center=[0.0, 0.0, -1.0],
-        )
-        original_crypt_position = graph.node("crypt_bulged_crypt").position.copy()
-        graph_centerline = np.vstack(
-            [
-                graph.node("crypt_bulged_attachment").position,
-                graph.node("crypt_bulged_crypt").position,
-                graph.node("crypt_bulged_tip").position,
-            ]
-        )
-        tube_points = make_tube_points(graph_centerline)
-
-        attachments = attach_crypt_tube_primitives(
-            graph,
-            VERTICES,
-            {"bulged": tube_points},
-            centerline_data={
-                "bulged": {
-                    "vertex_indices": [1, 2, 4],
-                    "distance_field": np.linspace(0.0, 1.0, VERTICES.shape[0]),
-                    "neck_level": 1.0,
-                    "neck_profile": {"kind": "transition", "attachment_level": 1.0},
-                }
-            },
-            smooth_centerline=True,
-            smooth_bulged_centerlines=False,
-        )
-
-        attachment = next(iter(attachments.values()))
-        self.assertEqual(attachment.metadata["centerline_method"], "straight_attachment_to_tip")
-        self.assertTrue(attachment.metadata["bulged_centerline_smoothing_disabled"])
-        np.testing.assert_allclose(
-            attachment.parameters["centerline_points"],
-            graph_centerline[[0, -1]],
-        )
-        np.testing.assert_allclose(
-            graph.node("crypt_bulged_crypt").position,
-            original_crypt_position,
-        )
-        self.assertNotIn(
-            "position_refined_from_smooth_centerline",
-            graph.node("crypt_bulged_crypt").metadata,
-        )
-
-    def test_bulged_centerline_starts_along_attachment_to_crypt_edge(self):
-        attachment_position = np.array([0.0, 0.0, 0.0])
-        crypt_position = np.array([0.7, 0.45, 0.0])
-        tip_position = np.array([2.0, 0.0, 0.0])
-        graph = build_skeleton_graph(
-            VERTICES,
-            FACES,
-            [
-                {
-                    "crypt_id": "bulged",
-                    "attachment_position": attachment_position,
-                    "crypt_position": crypt_position,
-                    "tip_position": tip_position,
-                    "neck_profile": {
-                        "kind": "transition",
-                        "attachment_level": 1.0,
-                    },
-                }
-            ],
-            body_center=[0.0, 0.0, -1.0],
-        )
-        tube_points = make_tube_points(
-            np.vstack([attachment_position, crypt_position, tip_position])
-        )
-
-        attachments = attach_crypt_tube_primitives(
-            graph,
-            VERTICES,
-            {"bulged": tube_points},
-            centerline_data={
-                "bulged": {
-                    "neck_profile": {
-                        "kind": "transition",
-                        "attachment_level": 1.0,
-                    }
-                }
-            },
-            smooth_centerline=True,
-            smooth_bulged_centerlines=True,
-            centerline_n_samples=101,
-        )
-
-        attachment = next(iter(attachments.values()))
-        centerline = np.asarray(attachment.parameters["centerline_points"])
-        initial_direction = centerline[1] - centerline[0]
-        skeleton_direction = crypt_position - attachment_position
-        self.assertGreater(float(np.dot(initial_direction, skeleton_direction)), 0.0)
-        self.assertLess(
-            float(np.linalg.norm(np.cross(initial_direction, skeleton_direction))),
-            1e-4,
-        )
-        self.assertLess(
-            float(np.min(np.linalg.norm(centerline - crypt_position, axis=1))),
-            0.03,
-        )
-        np.testing.assert_allclose(
-            graph.node("crypt_bulged_crypt").position,
-            crypt_position,
-        )
-        self.assertEqual(
-            attachment.metadata["centerline_method"],
-            "skeleton_anchored_bulged_cubic_bezier",
-        )
-        self.assertEqual(
-            attachment.metadata["centerline_initial_tangent_source"],
-            "attachment_to_crypt_edge",
-        )
+        self.assertGreaterEqual(len(attachment.parameters["centerline_points"]), 2)
 
     def test_blend_attachments_are_visualization_only(self):
         graph = SkeletonGraph()

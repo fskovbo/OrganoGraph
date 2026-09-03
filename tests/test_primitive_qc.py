@@ -90,6 +90,42 @@ class CryptPrimitiveQCTest(unittest.TestCase):
         self.assertFalse(record["flag_missing_budded_constriction"])
         self.assertFalse(record["flag_invalid_constriction_minimum"])
 
+    def test_reads_optional_quality_diagnostics(self):
+        quality = {
+            "crypt_primitives": [
+                {
+                    "primitive_id": "crypt_0_path_0",
+                    "fit_error": 0.12,
+                    "residuals": {"rmse": 0.12, "mae": 0.08},
+                    "n_points": 240,
+                    "tip_source": "hks",
+                    "tip_vertex_id": 42,
+                    "centerline_kind": "smooth",
+                    "profile_optimization": {
+                        "success": True,
+                        "nfev": 9,
+                        "n_supported_bins": 18,
+                        "observation_rmse": 0.05,
+                        "outside_volume_proxy": 0.03,
+                        "missing_volume_proxy": 0.04,
+                        "candidate_score": 0.10,
+                    },
+                }
+            ]
+        }
+        record = crypt_primitive_qc_records(
+            _payload(),
+            quality_payload=quality,
+        )[0]
+
+        self.assertEqual(record["fit_rmse"], 0.12)
+        self.assertEqual(record["fit_mae"], 0.08)
+        self.assertTrue(record["optimizer_success"])
+        self.assertEqual(record["n_supported_bins"], 18)
+        self.assertEqual(record["selected_tip_source"], "hks")
+        self.assertEqual(record["selected_centerline_kind"], "smooth")
+        self.assertAlmostEqual(record["candidate_score"], 0.10)
+
 
 if __name__ == "__main__":
     unittest.main()

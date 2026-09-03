@@ -14,9 +14,6 @@ from organograph.skeleton.detection.common import (
     _point_from_keys,
     _point_from_vertex,
 )
-from organograph.skeleton.detection.mesh_regions import (
-    _radial_distances_to_axis,
-)
 from organograph.skeleton.detection.neck_profiles import _neck_position
 from organograph.skeleton.geometry import as_points, centroid
 
@@ -66,123 +63,6 @@ def _crypt_position(vertices, detection: dict[str, Any]) -> np.ndarray:
         return centroid(as_points(vertices)[patch])
     return _tip_position(vertices, detection)
 
-def _penalize_short_crypt_bending(
-    vertices,
-    crypt_vertices,
-    source_position,
-    intermediate_position,
-    tip_position,
-    *,
-    max_dimensionless_curvature: float | None,
-    penalty_strength: float,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    """Softly pull a crypt waypoint toward its chord when bending is excessive."""
-    source = np.asarray(source_position, dtype=float)
-    candidate = np.asarray(intermediate_position, dtype=float)
-    tip = np.asarray(tip_position, dtype=float)
-    limit = (
-        None
-        if max_dimensionless_curvature is None
-        else float(max_dimensionless_curvature)
-    )
-    diagnostics = {
-        "applied": False,
-        "max_dimensionless_curvature": limit,
-        "penalty_strength": float(penalty_strength),
-        "original_dimensionless_curvature": None,
-        "final_dimensionless_curvature": None,
-        "waypoint_lateral_scale": 1.0,
-    }
-    chord = tip - source
-    chord_length = float(np.linalg.norm(chord))
-    patch = _coerce_patch(crypt_vertices)
-    if (
-        limit is None
-        or limit <= 0.0
-        or float(penalty_strength) <= 0.0
-        or chord_length <= 1e-12
-        or patch.size < 3
-    ):
-        diagnostics["reason"] = "disabled_or_insufficient_geometry"
-        return candidate, diagnostics
-
-    unit = chord / chord_length
-    longitudinal = float(
-        np.clip(
-            np.dot(candidate - source, unit),
-            0.1 * chord_length,
-            0.9 * chord_length,
-        )
-    )
-    projection = source + longitudinal * unit
-    radial = _radial_distances_to_axis(
-        as_points(vertices)[patch],
-        source,
-        chord,
-    )
-    radial = radial[np.isfinite(radial)]
-    if radial.size < 3:
-        diagnostics["reason"] = "insufficient_radius_samples"
-        return candidate, diagnostics
-    crypt_radius = float(np.median(radial))
-    if crypt_radius <= 1e-12:
-        diagnostics["reason"] = "degenerate_crypt_radius"
-        return candidate, diagnostics
-
-    def curvature(point: np.ndarray) -> tuple[float, float, float]:
-        first = point - source
-        second = tip - point
-        n_first = float(np.linalg.norm(first))
-        n_second = float(np.linalg.norm(second))
-        path_length = n_first + n_second
-        if n_first <= 1e-12 or n_second <= 1e-12 or path_length <= 1e-12:
-            return 0.0, 0.0, path_length
-        cosine = float(np.clip(np.dot(first, second) / (n_first * n_second), -1.0, 1.0))
-        angle = float(np.arccos(cosine))
-        return angle * crypt_radius / path_length, angle, path_length
-
-    original_curvature, original_angle, original_length = curvature(candidate)
-    diagnostics.update(
-        {
-            "crypt_radius": crypt_radius,
-            "original_dimensionless_curvature": original_curvature,
-            "original_bend_angle": original_angle,
-            "original_path_length": original_length,
-        }
-    )
-    if original_curvature <= limit:
-        diagnostics.update(
-            {
-                "reason": "within_curvature_limit",
-                "final_dimensionless_curvature": original_curvature,
-            }
-        )
-        return candidate, diagnostics
-
-    lateral = candidate - projection
-    alphas = np.linspace(0.0, 1.0, 101)
-    objectives = []
-    for alpha in alphas:
-        trial = projection + float(alpha) * lateral
-        trial_curvature, _, _ = curvature(trial)
-        excess = max(trial_curvature / limit - 1.0, 0.0)
-        objectives.append((1.0 - float(alpha)) ** 2 + float(penalty_strength) * excess**2)
-    best_index = int(np.argmin(objectives))
-    best_alpha = float(alphas[best_index])
-    refined = projection + best_alpha * lateral
-    final_curvature, final_angle, final_length = curvature(refined)
-    diagnostics.update(
-        {
-            "applied": best_alpha < 1.0 - 1e-12,
-            "reason": "curvature_penalty_applied",
-            "waypoint_lateral_scale": best_alpha,
-            "final_dimensionless_curvature": final_curvature,
-            "final_bend_angle": final_angle,
-            "final_path_length": final_length,
-        }
-    )
-    return refined, diagnostics
-
 def _add_crypt_tip_path(
     graph: SkeletonGraph,
     vertices,
@@ -192,27 +72,12 @@ def _add_crypt_tip_path(
     tip_id: str,
     crypt_id,
     detection: dict[str, Any],
-    crypt_vertices: np.ndarray,
-    source_position: np.ndarray,
-    tip_position: np.ndarray,
     metadata: dict[str, Any],
-    bend_max_dimensionless_curvature: float | None,
-    bend_curvature_penalty: float,
     crypt_role: str = "crypt_centroid",
 ) -> None:
-    """Connect an attachment or constriction to a tip through its crypt center."""
+    """Connect an attachment to a tip through a provisional crypt center."""
     intermediate_position = _crypt_position(vertices, detection)
     intermediate_type = "crypt"
-
-    intermediate_position, bend_diagnostics = _penalize_short_crypt_bending(
-        vertices,
-        crypt_vertices,
-        source_position,
-        intermediate_position,
-        tip_position,
-        max_dimensionless_curvature=bend_max_dimensionless_curvature,
-        penalty_strength=bend_curvature_penalty,
-    )
     intermediate_id = f"{path_prefix}_{intermediate_type}"
     graph.add_node(
         intermediate_id,
@@ -222,7 +87,7 @@ def _add_crypt_tip_path(
         metadata={
             **metadata,
             "role": crypt_role,
-            "bend_validation": _json_safe_metadata(bend_diagnostics),
+            "position_source": "provisional_component_centroid",
         },
     )
     source_type = graph.node(source_id).node_type
@@ -253,7 +118,7 @@ def _add_attachment_path(
     metadata: dict[str, Any],
     host_edge_prefix: str,
 ) -> tuple[str, np.ndarray]:
-    """Add a branch neck or a terminal attachment/constriction sequence."""
+    """Add a body-branch neck or one terminal crypt attachment."""
     profile = detection.get("neck_profile")
     if not isinstance(profile, dict):
         neck = _neck_position(vertices, faces, detection)
@@ -301,39 +166,7 @@ def _add_attachment_path(
         edge_type=f"{host_edge_prefix}_to_attachment",
         crypt_id=crypt_id,
     )
-    if profile.get("kind") != "constriction":
-        return attachment_id, attachment
-
-    constriction = _point_from_keys(
-        vertices,
-        detection,
-        ("constriction_position", "constriction_center", "neck_position"),
-    )
-    if constriction is None:
-        return attachment_id, attachment
-    constriction_id = f"{path_prefix}_constriction"
-    graph.add_node(
-        constriction_id,
-        "constriction",
-        constriction,
-        crypt_id=crypt_id,
-        metadata={
-            **junction_meta,
-            "role": "narrowest_constriction",
-            "constriction_level": profile.get("constriction_level"),
-            "distal_boundary_level": profile.get("distal_boundary_level"),
-            "c_min": profile.get("c_min"),
-            "c_half": profile.get("c_half"),
-        },
-    )
-    graph.add_edge(
-        f"{path_prefix}_attachment_to_constriction",
-        attachment_id,
-        constriction_id,
-        edge_type="attachment_to_constriction",
-        crypt_id=crypt_id,
-    )
-    return constriction_id, constriction
+    return attachment_id, attachment
 
 def _branch_center_override(
     branch_center_overrides: dict[Any, Any] | None,
@@ -379,15 +212,13 @@ def build_skeleton_graph(
     *,
     body_center,
     branch_centers: dict[Any, Any] | None = None,
-    bend_max_dimensionless_curvature: float | None = 0.5,
-    bend_curvature_penalty: float = 8.0,
     metadata: dict[str, Any] | None = None,
 ) -> SkeletonGraph:
     """Build the fixed biology-aware topology from barrier-bounded detections.
 
     Body and branch centers are supplied by their barrier primitives. Every
-    crypt path contains one centroid waypoint, so bending remains represented
-    by straight graph edges while the later tube fit may use a smooth midline.
+    crypt path contains one provisional centroid waypoint. Primitive fitting
+    later moves it to the area-weighted center of the fitted crypt geometry.
     """
     vertices = as_points(vertices)
     faces = np.asarray(faces, dtype=np.int64)
@@ -534,12 +365,7 @@ def build_skeleton_graph(
                     tip_id=tip_id,
                     crypt_id=crypt_id,
                     detection=daughter,
-                    crypt_vertices=daughter_vertices,
-                    source_position=daughter_source_position,
-                    tip_position=daughter_tips[j],
                     metadata=daughter_meta,
-                    bend_max_dimensionless_curvature=bend_max_dimensionless_curvature,
-                    bend_curvature_penalty=bend_curvature_penalty,
                     crypt_role="daughter_crypt_centroid",
                 )
             continue
@@ -561,12 +387,7 @@ def build_skeleton_graph(
             tip_id=tip_id,
             crypt_id=crypt_id,
             detection=detection,
-            crypt_vertices=crypt_vertices,
-            source_position=root_source_position,
-            tip_position=tip,
             metadata=common_meta,
-            bend_max_dimensionless_curvature=bend_max_dimensionless_curvature,
-            bend_curvature_penalty=bend_curvature_penalty,
         )
 
     return graph

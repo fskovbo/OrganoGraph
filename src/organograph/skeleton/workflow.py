@@ -71,8 +71,6 @@ def skeletonize_organoid(
         crypt_detections=detection.detections,
         body_center=detection.barriers.body_fit.center,
         branch_centers=branch_centers,
-        bend_max_dimensionless_curvature=config.graph.max_dimensionless_curvature,
-        bend_curvature_penalty=config.graph.curvature_penalty,
         metadata=metadata,
     )
     return SkeletonizationResult(
@@ -169,6 +167,11 @@ def _fit_primitives_once(
             mesh.v,
             components["crypts"],
             centerline_data=components["crypt_centerlines"],
+            mesh=mesh,
+            geodesic_fn=result.geodesic_fn,
+            geodesic_kwargs=dict(
+                result.config.detection.candidates.geodesic_kwargs
+            ),
             **dict(config.crypt_tube_kwargs),
         )
 
@@ -209,10 +212,6 @@ def _rebuild_graph_after_crypt_merge(
             else result.graph.body_node().position
         ),
         branch_centers=branch_centers,
-        bend_max_dimensionless_curvature=(
-            result.config.graph.max_dimensionless_curvature
-        ),
-        bend_curvature_penalty=result.config.graph.curvature_penalty,
         metadata=result.metadata,
     )
 

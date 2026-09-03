@@ -14,24 +14,25 @@ def component_region_from_detection(
     detection: dict[str, Any],
     n_vertices: int,
     *,
-    region_keys: tuple[str, ...] = (
-        "attachment_region_vertices",
-        "neck_region_vertices",
-        "neck_side_vertices",
-        "root_region_vertices",
-    ),
+    region_keys: tuple[str, ...] = ("crypt_vertices",),
 ) -> np.ndarray:
-    """Return the component vertices on the crypt side of a neckline.
-
-    The preferred input is an explicit neck-side region.  If absent, a full-mesh
-    normalized distance field is thresholded at ``neck_level`` (default 1.0).
-    Finally, raw crypt patch vertices are used as a fallback.  This mirrors the
-    skeleton builder's neck-bounded component logic and keeps appendices cut off
-    before fitting body or branch primitives.
-    """
+    """Return the host-trimmed HKS component used by definitive fitting."""
     region = _coerce_indices(_first_detection_value(detection, region_keys))
     if region.size:
         return np.unique(region)
+    legacy_region = _coerce_indices(
+        _first_detection_value(
+            detection,
+            (
+                "attachment_region_vertices",
+                "neck_region_vertices",
+                "neck_side_vertices",
+                "root_region_vertices",
+            ),
+        )
+    )
+    if legacy_region.size:
+        return np.unique(legacy_region)
 
     dfield = _first_detection_value(
         detection,
@@ -99,6 +100,10 @@ def primitive_components_from_crypt_detections(
                     crypts[tip_node_id] = sorted(map(int, daughter_region.tolist()))
                     crypt_centerlines[tip_node_id] = {
                         "vertex_indices": crypts[tip_node_id],
+                        "boundary_tip_vertex_id": daughter.get(
+                            "boundary_distance_bottom_vertex_id"
+                        ),
+                        "hks_tip_vertex_id": daughter.get("bottom_vertex_id"),
                         "distance_field": _first_detection_value(
                             daughter,
                             ("d_crypt", "distance_field", "dnorm", "dnorm_vertices"),
@@ -110,6 +115,15 @@ def primitive_components_from_crypt_detections(
                             )
                         ),
                         "neck_profile": daughter.get("neck_profile"),
+                        "attachment_surface_normal": daughter.get(
+                            "attachment_surface_normal"
+                        ),
+                        "candidate_boundary_vertices": daughter.get(
+                            "candidate_boundary_vertices"
+                        ),
+                        "constriction_position": daughter.get(
+                            "constriction_position"
+                        ),
                     }
 
             remove = set()
@@ -153,6 +167,10 @@ def primitive_components_from_crypt_detections(
             crypts[crypt_id] = sorted(map(int, region.tolist()))
             crypt_centerlines[crypt_id] = {
                 "vertex_indices": crypts[crypt_id],
+                "boundary_tip_vertex_id": detection.get(
+                    "boundary_distance_bottom_vertex_id"
+                ),
+                "hks_tip_vertex_id": detection.get("bottom_vertex_id"),
                 "distance_field": _first_detection_value(
                     detection,
                     ("d_crypt", "distance_field", "dnorm", "dnorm_vertices"),
@@ -164,6 +182,13 @@ def primitive_components_from_crypt_detections(
                     )
                 ),
                 "neck_profile": detection.get("neck_profile"),
+                "attachment_surface_normal": detection.get(
+                    "attachment_surface_normal"
+                ),
+                "candidate_boundary_vertices": detection.get(
+                    "candidate_boundary_vertices"
+                ),
+                "constriction_position": detection.get("constriction_position"),
             }
 
     body = sorted(all_vertices.difference(body_excluded))
@@ -182,4 +207,3 @@ def primitive_components_from_crypt_detections(
             "component_source": "neck_cut_crypt_detections",
         },
     }
-

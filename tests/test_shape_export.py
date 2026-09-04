@@ -66,15 +66,15 @@ def _shape_result(*, with_branch: bool = False) -> PrimitiveFitResult:
                 "centerline_points": sample_sinusoidal_bend(
                     controls[0], controls[1], bend_vector, n_samples=64
                 ),
-                "r_neck": 0.2,
-                "r_attachment": 0.2,
-                "r_body": 0.45,
-                "r_tip": 0.15,
-                "r_taper": 0.15,
-                "s_body": 0.45,
-                "s_taper": 0.82,
-                "r_constriction": None,
-                "s_constriction": None,
+                "radius_control_s": np.array(
+                    [0.0, 0.10, 0.20, 0.30, 0.45, 0.60, 0.75, 0.85]
+                ),
+                "radius_control_radii": np.array(
+                    [0.2, 0.25, 0.32, 0.4, 0.45, 0.4, 0.25, 0.15]
+                ),
+                "crypt_node_s": 0.45,
+                "s_taper": 0.85,
+                "radius_profile": "fixed_grid_shape_preserving_squared_radius_v1",
                 "opening_normal": np.array([1.0, 0.0, 0.0]),
                 "opening_frame_blend_fraction": 0.15,
             },
@@ -141,6 +141,10 @@ class ShapeExportV4Test(unittest.TestCase):
             primitive_config.body_branch_neck_kwargs["radius_quantile"],
             0.25,
         )
+        self.assertEqual(primitive_config.radius_support_body_level, 1.05)
+        self.assertEqual(
+            primitive_config.radius_support_max_distance_factor, 1.5
+        )
         self.assertEqual(
             primitive_config.crypt_tube_kwargs["fixed_taper_position"], 0.85
         )
@@ -148,7 +152,33 @@ class ShapeExportV4Test(unittest.TestCase):
             primitive_config.crypt_tube_kwargs["outside_volume_weight"], 2.0
         )
         self.assertEqual(
+            primitive_config.crypt_tube_kwargs["radius_control_s"],
+            [0.0, 0.10, 0.20, 0.30, 0.45, 0.60, 0.75, 0.85],
+        )
+        self.assertEqual(
+            primitive_config.crypt_tube_kwargs[
+                "radius_profile_smoothness_weight"
+            ],
+            0.05,
+        )
+        self.assertEqual(
             primitive_config.crypt_tube_kwargs["centerline_n_contours"], 10
+        )
+        self.assertEqual(
+            primitive_config.crypt_tube_kwargs["radius_n_contours"], 19
+        )
+        self.assertTrue(
+            primitive_config.crypt_tube_kwargs[
+                "exclude_attachment_radius_observation"
+            ]
+        )
+        self.assertEqual(
+            primitive_config.crypt_tube_kwargs["centerline_curvature_weight"],
+            0.01,
+        )
+        self.assertEqual(
+            primitive_config.crypt_tube_kwargs["centerline_reference_length"],
+            4.0,
         )
         self.assertNotIn("centerline_n_bands", primitive_config.crypt_tube_kwargs)
         self.assertNotIn("tangent_cone_degrees", primitive_config.crypt_tube_kwargs)
@@ -159,7 +189,7 @@ class ShapeExportV4Test(unittest.TestCase):
         result = _shape_result()
         payload = shape_export_payload(result)
 
-        self.assertEqual(payload["schema_version"], "organograph_shape_v5")
+        self.assertEqual(payload["schema_version"], "organograph_shape_v6")
         self.assertEqual(set(payload), {
             "schema_version",
             "sample",
@@ -186,10 +216,18 @@ class ShapeExportV4Test(unittest.TestCase):
             original_tube.parameters["centerline_points"],
             atol=1e-12,
         )
-        self.assertEqual(reconstructed_tube.parameters["r_neck"], 0.2)
-        self.assertEqual(
-            payload["primitives"][1]["parameters"]["r_attachment"], 0.2
+        np.testing.assert_allclose(
+            reconstructed_tube.parameters["radius_control_radii"],
+            [0.2, 0.25, 0.32, 0.4, 0.45, 0.4, 0.25, 0.15],
         )
+        tube_parameters = payload["primitives"][1]["parameters"]
+        np.testing.assert_allclose(
+            tube_parameters["radius_control_radii"],
+            [0.2, 0.25, 0.32, 0.4, 0.45, 0.4, 0.25, 0.15],
+        )
+        self.assertNotIn("r_attachment", tube_parameters)
+        self.assertNotIn("r_constriction", tube_parameters)
+        self.assertNotIn("crypt_node_s", tube_parameters)
         self.assertNotIn("s_body", payload["primitives"][1]["parameters"])
         np.testing.assert_allclose(
             payload["primitives"][1]["parameters"]["opening_normal"],
@@ -252,7 +290,10 @@ class ShapeExportV4Test(unittest.TestCase):
         expected_rotation = matrix[:3, :3] / 2.0
         np.testing.assert_allclose(body.parameters["orientation"], expected_rotation)
         tube = source_graph.primitive_attachments["crypt_9_tube"]
-        self.assertAlmostEqual(tube.parameters["r_body"], 0.9)
+        np.testing.assert_allclose(
+            tube.parameters["radius_control_radii"],
+            2.0 * np.array([0.2, 0.25, 0.32, 0.4, 0.45, 0.4, 0.25, 0.15]),
+        )
         np.testing.assert_allclose(
             tube.parameters["opening_normal"], [0.0, -1.0, 0.0], atol=1e-12
         )
@@ -265,10 +306,13 @@ class ShapeExportV4Test(unittest.TestCase):
         payload["schema_version"] = "organograph_shape_v2"
         tube = next(item for item in payload["primitives"] if item["role"] == "crypt")
         parameters = tube["parameters"]
-        parameters["r_neck"] = parameters.pop("r_attachment")
-        parameters["r_body"] = parameters.pop("r_center")
-        parameters["r_tip"] = parameters.pop("r_distal")
-        parameters["s_body"] = parameters.pop("s_center")
+        parameters.pop("radius_control_s")
+        parameters.pop("radius_control_radii")
+        parameters.pop("radius_profile")
+        parameters["r_neck"] = 0.2
+        parameters["r_body"] = 0.45
+        parameters["r_tip"] = 0.15
+        parameters["s_body"] = 0.45
 
         graph = graph_from_shape_export_payload(payload)
         reconstructed = graph.primitive_attachments["crypt_9_tube"].parameters

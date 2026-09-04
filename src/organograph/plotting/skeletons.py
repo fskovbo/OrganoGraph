@@ -6,8 +6,8 @@ import numpy as np
 
 from organograph.skeleton.blending import blend_tube_radius
 from organograph.skeleton.primitive_geometry import (
-    capped_tube_radius,
     polyline_lengths,
+    tube_radius_from_parameters,
 )
 
 
@@ -113,11 +113,10 @@ def plot_crypt_primitive_diagnostics(
     graph,
     *,
     title=None,
-    curvature_radius_guides=(0.6, 0.8),
     width=1200,
     height=390,
 ):
-    """Plot centerline curvature, tube radius, and their product for each crypt."""
+    """Plot curvature, fitted radius, and centerline-aligned radii per crypt."""
     import plotly.graph_objects as go
     from plotly.subplots import make_subplots
 
@@ -131,8 +130,8 @@ def plot_crypt_primitive_diagnostics(
         cols=3,
         subplot_titles=(
             "Centerline curvature",
-            "Radius profile",
-            "Curvature x radius",
+            "Fitted radius profile",
+            "Observed transverse radii",
         ),
         horizontal_spacing=0.07,
     )
@@ -152,21 +151,7 @@ def plot_crypt_primitive_diagnostics(
         centerline = np.asarray(parameters.get("centerline_points"), dtype=float)
         try:
             s, curvature = _centerline_curvature_profile(centerline)
-            radius = capped_tube_radius(
-                s,
-                float(parameters["r_neck"]),
-                float(parameters["r_body"]),
-                float(parameters.get("r_taper", parameters["r_tip"])),
-                body_s=float(parameters.get("s_body", 0.5)),
-                taper_start=float(
-                    parameters.get(
-                        "s_taper",
-                        parameters.get("distal_taper_start", 0.85),
-                    )
-                ),
-                constriction_s=parameters.get("s_constriction"),
-                r_constriction=parameters.get("r_constriction"),
-            )
+            radius = tube_radius_from_parameters(parameters, s)
         except (KeyError, TypeError, ValueError):
             continue
 
@@ -204,34 +189,84 @@ def plot_crypt_primitive_diagnostics(
             row=1,
             col=2,
         )
-        fig.add_trace(
-            go.Scatter(
-                **common,
-                y=curvature * radius,
-                showlegend=False,
-                hovertemplate=(
-                    f"{attachment_id}<br>s=%{{x:.3f}}"
-                    "<br>curvature x radius=%{y:.4g}<extra></extra>"
-                ),
+        contours = dict(
+            attachment.metadata.get("centerline_radius_contours")
+            or attachment.metadata.get("ratio_contours")
+            or {}
+        )
+        observed_s = np.asarray(
+            contours.get("s", []), dtype=float
+        ).reshape(-1)
+        observed_radius = np.asarray(
+            contours.get(
+                "mean_radii",
+                contours.get("diagnostic_radii", contours.get("radii", [])),
             ),
-            row=1,
-            col=3,
+            dtype=float,
+        ).reshape(-1)
+        valid = (
+            np.isfinite(observed_s) & np.isfinite(observed_radius)
+            if observed_s.size == observed_radius.size
+            else np.zeros(0, dtype=bool)
         )
-
-    for guide in curvature_radius_guides or ():
-        fig.add_hline(
-            y=float(guide),
-            line_dash="dash",
-            line_width=1,
-            line_color="#777777",
-            row=1,
-            col=3,
-        )
-    for col in range(1, 4):
+        if np.any(valid):
+            fig.add_trace(
+                go.Scatter(
+                    x=observed_s[valid],
+                    y=observed_radius[valid],
+                    mode="lines+markers",
+                    line=dict(color=color, width=2.5),
+                    marker=dict(size=6, symbol="circle"),
+                    name=f"{attachment_id} mean",
+                    legendgroup=attachment_id,
+                    showlegend=False,
+                    hovertemplate=(
+                        f"{attachment_id}<br>s=%{{x:.3f}}"
+                        "<br>mean transverse radius=%{y:.4g}<extra></extra>"
+                    ),
+                ),
+                row=1,
+                col=3,
+            )
+        minimum_radius = np.asarray(
+            contours.get(
+                "min_radii",
+                contours.get("diagnostic_min_radii", []),
+            ),
+            dtype=float,
+        ).reshape(-1)
+        if minimum_radius.size == observed_s.size:
+            valid_minimum = np.isfinite(observed_s) & np.isfinite(minimum_radius)
+            if np.any(valid_minimum):
+                fig.add_trace(
+                    go.Scatter(
+                        x=observed_s[valid_minimum],
+                        y=minimum_radius[valid_minimum],
+                        mode="lines+markers",
+                        line=dict(color=color, width=2.0, dash="dash"),
+                        marker=dict(size=6, symbol="x"),
+                        name=f"{attachment_id} minimum",
+                        legendgroup=attachment_id,
+                        showlegend=False,
+                        hovertemplate=(
+                            f"{attachment_id}<br>s=%{{x:.3f}}"
+                            "<br>minimum radius=%{y:.4g}<extra></extra>"
+                        ),
+                    ),
+                    row=1,
+                    col=3,
+                )
+    for col in (1, 2):
         fig.update_xaxes(title_text="Normalized arc length s", range=[0, 1], row=1, col=col)
+    fig.update_xaxes(
+        title_text="Normalized centerline arc length s",
+        range=[0, 1],
+        row=1,
+        col=3,
+    )
     fig.update_yaxes(title_text="1 / mesh unit", row=1, col=1)
     fig.update_yaxes(title_text="Mesh units", row=1, col=2)
-    fig.update_yaxes(title_text="Dimensionless", rangemode="tozero", row=1, col=3)
+    fig.update_yaxes(title_text="Mesh units", rangemode="tozero", row=1, col=3)
     fig.update_layout(
         title=title,
         width=int(width),
@@ -707,15 +742,6 @@ def _tube_section_axis(parameters, tangent, s):
 
 def _tube_surface(parameters, *, n_s=32, n_theta=16):
     centerline = np.asarray(parameters["centerline_points"], dtype=float)
-    radii = (
-        float(parameters["r_neck"]),
-        float(parameters["r_body"]),
-        float(parameters.get("r_taper", parameters["r_tip"])),
-    )
-    body_s = float(parameters.get("s_body", 0.5))
-    taper_start = float(
-        parameters.get("s_taper", parameters.get("distal_taper_start", 0.85))
-    )
     n_s = max(6, int(n_s))
     s_values = np.linspace(0.0, 1.0, n_s, endpoint=False)
     theta = np.linspace(0.0, 2.0 * np.pi, int(n_theta), endpoint=False)
@@ -738,16 +764,7 @@ def _tube_surface(parameters, *, n_s=32, n_theta=16):
         binormal = np.cross(section_axis, normal)
         binormal = binormal / max(np.linalg.norm(binormal), 1e-12)
         previous_normal = normal
-        radius = float(
-            capped_tube_radius(
-                np.array([s]),
-                *radii,
-                body_s=body_s,
-                taper_start=taper_start,
-                constriction_s=parameters.get("s_constriction"),
-                r_constriction=parameters.get("r_constriction"),
-            )[0]
-        )
+        radius = float(tube_radius_from_parameters(parameters, np.array([s]))[0])
         ring = [
             center + radius * (np.cos(a) * normal + np.sin(a) * binormal)
             for a in theta

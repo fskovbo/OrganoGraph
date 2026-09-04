@@ -17,8 +17,8 @@ from organograph.skeleton.primitive.barriers import (
     host_mask_from_barrier,
 )
 from organograph.skeleton.detection.attachments import (
+    assign_crypt_attachments,
     attachment_projection_diagnostics,
-    assign_crypt_attachments_from_projected_boundaries,
 )
 from organograph.skeleton.results import BarrierStageResult, DetectionResult
 
@@ -34,6 +34,7 @@ def _profile_crypt_patches(
     candidate_config,
     hks,
     hks_times,
+    search_interval=None,
 ):
     """Compute initial tips, circumference-normalized axes, and final HKS tips."""
     from organograph.crypts.axis import compute_crypt_axis, normalize_crypt_axis_to_neckline
@@ -43,13 +44,20 @@ def _profile_crypt_patches(
         patches,
         geodesic_fn,
         geodesic_kwargs=geodesic_kwargs,
+        # Skeleton topology must not depend on a random subset of an opening
+        # boundary. The axis helper interprets zero as the complete boundary.
+        bottom_n_boundary_samples=0,
     )
     initial_tips = np.asarray(initial_tips, dtype=np.int64)
     circumference, distance_fields, lengths = normalize_crypt_axis_to_neckline(
         mesh,
         distance_fields,
         d_levels,
-        search_interval=neck_config.search_interval,
+        search_interval=(
+            neck_config.search_interval
+            if search_interval is None
+            else tuple(search_interval)
+        ),
         L_crypt=lengths,
         window_length=9,
         polyorder=3,
@@ -71,6 +79,7 @@ def _profile_crypt_patches(
             "strategy": "boundary_distance",
             "bottom_vertex_id": int(tip),
             "n_patch_vertices": int(len(patch)),
+            "boundary_sampling": "all_vertices",
         }
         for tip, patch in zip(initial_tips, patches)
     ]
@@ -85,6 +94,22 @@ def _profile_crypt_patches(
     }
 
 
+def _profile_search_interval(neck_config, barrier_config) -> tuple[float, float]:
+    """Return the axis window used to refine the selected attachment strategy."""
+    if barrier_config.attachment_strategy != "embedded_boundary_plane":
+        return tuple(neck_config.search_interval)
+    upper = min(
+        float(neck_config.max_axis_level),
+        float(barrier_config.boundary_refinement_max_distance_factor),
+    )
+    if upper <= 1.0:
+        raise ValueError(
+            "Embedded boundary refinement needs max_axis_level and "
+            "boundary_refinement_max_distance_factor greater than 1"
+        )
+    return (1.0, upper)
+
+
 def detect_crypts_for_skeleton(
     mesh,
     vocab,
@@ -94,10 +119,11 @@ def detect_crypts_for_skeleton(
 ) -> DetectionResult:
     """Detect barrier-bounded crypt and branch components.
 
-    The body barrier is fitted before HKS detection. Circumference profiles are
-    used only to classify transition versus constriction; host-side component
-    openings are projected directly to fitted body or branch barriers. This is
-    the sole supported skeletonization path.
+    The body barrier is fitted before HKS detection. The host-surface strategy
+    projects candidate openings directly to fitted body or branch barriers.
+    The embedded strategy instead grows candidates to a circumference-selected
+    boundary and, if needed, onward until its planar center reaches the host.
+    This is the sole supported skeletonization path.
     """
     from organograph.crypts.filters import apply_filters
     from organograph.crypts.vocab import detect_crypts_by_encoding, subdivide_crypts_by_encoding
@@ -124,6 +150,7 @@ def detect_crypts_for_skeleton(
     neck_polyorder = 3
     neck_min_prominence = neck_config.min_prominence
     neck_min_length = neck_config.min_length
+    profile_search_interval = _profile_search_interval(neck_config, barrier_config)
 
     split_growth_smooth_perimeter = True
     split_growth_smoothing_tolerance = 0.0
@@ -241,6 +268,7 @@ def detect_crypts_for_skeleton(
         candidate_config=candidate_config,
         hks=seg_vars.get("hks"),
         hks_times=seg_vars.get("ts_mesh"),
+        search_interval=profile_search_interval,
     )
     dnorm_parent = parent_profiles["distance_fields"]
     L_parent = parent_profiles["lengths"]
@@ -278,6 +306,7 @@ def detect_crypts_for_skeleton(
                 candidate_config=candidate_config,
                 hks=seg_vars.get("hks"),
                 hks_times=seg_vars.get("ts_mesh"),
+                search_interval=profile_search_interval,
             )
             dnorm_child = child_profiles["distance_fields"]
             L_child = child_profiles["lengths"]
@@ -470,12 +499,16 @@ def detect_crypts_for_skeleton(
             )
         detections.append(det)
 
-    detections = assign_crypt_attachments_from_projected_boundaries(
+    detections = assign_crypt_attachments(
         detection_mesh.v,
         detection_mesh.f,
         detections,
         body_barrier_fit,
         grid_resolution=barrier_config.opening_grid_resolution,
+        boundary_refinement_max_mesh_fraction=(
+            barrier_config.boundary_refinement_max_mesh_fraction
+        ),
+        strategy=barrier_config.attachment_strategy,
         assign_body_roots=True,
         assign_branch_daughters=False,
     )
@@ -511,13 +544,17 @@ def detect_crypts_for_skeleton(
             metadata_key="branch_barrier_region_filter",
         )
 
-    detections = assign_crypt_attachments_from_projected_boundaries(
+    detections = assign_crypt_attachments(
         detection_mesh.v,
         detection_mesh.f,
         detections,
         body_barrier_fit,
         branch_fits=branch_fits,
         grid_resolution=barrier_config.opening_grid_resolution,
+        boundary_refinement_max_mesh_fraction=(
+            barrier_config.boundary_refinement_max_mesh_fraction
+        ),
+        strategy=barrier_config.attachment_strategy,
         assign_body_roots=False,
         assign_branch_daughters=True,
     )
@@ -533,6 +570,13 @@ def detect_crypts_for_skeleton(
             ),
             "protected_mask": protected_mask,
             "opening_grid_resolution": int(barrier_config.opening_grid_resolution),
+            "attachment_strategy": barrier_config.attachment_strategy,
+            "boundary_refinement_max_distance_factor": float(
+                barrier_config.boundary_refinement_max_distance_factor
+            ),
+            "boundary_refinement_max_mesh_fraction": float(
+                barrier_config.boundary_refinement_max_mesh_fraction
+            ),
         }
     )
 

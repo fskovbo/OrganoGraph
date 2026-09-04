@@ -50,8 +50,13 @@ from organograph.skeleton.primitives import (
 )
 from organograph.skeleton.primitive.crypt_geometry import (
     CryptGeometryFit,
+    HermiteCenterlineFit,
     boundary_tip_ratio_field,
+    centerline_radius_observations,
     fit_crypt_geometry,
+    hermite_curvature_diagnostics,
+    minimum_contour_radius,
+    monotonic_project_points_to_polyline,
     sample_tangent_hermite,
 )
 from organograph.skeleton.primitive_qc import (
@@ -85,6 +90,7 @@ __all__ = [
     "CandidateDetectionConfig",
     "CryptOverlapConfig",
     "CryptGeometryFit",
+    "HermiteCenterlineFit",
     "CryptPrimitiveQCConfig",
     "DetectionConfig",
     "DetectionResult",
@@ -107,9 +113,11 @@ __all__ = [
     "SkeletonizationResult",
     "blend_primitives_for_visualization",
     "boundary_tip_ratio_field",
+    "centerline_radius_observations",
     "crypt_primitive_qc_records",
     "fit_primitives_for_skeletonization_result",
     "fit_crypt_geometry",
+    "hermite_curvature_diagnostics",
     "definitive_filter_options",
     "definitive_mesh_preparation",
     "definitive_primitive_fit_config",
@@ -121,6 +129,8 @@ __all__ = [
     "load_shape_export_graph",
     "load_shape_export_json",
     "load_skeleton_json",
+    "minimum_contour_radius",
+    "monotonic_project_points_to_polyline",
     "save_shape_export",
     "pair_crypt_primitive_qc",
     "save_skeleton_json",

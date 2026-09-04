@@ -20,6 +20,7 @@ from organograph.skeleton.primitive.overlap import (
     merge_overlapping_crypt_detections,
     recompute_merged_crypt_geometry,
 )
+from organograph.skeleton.primitive.barriers import host_mask_from_barrier
 from organograph.skeleton.results import BlendResult, PrimitiveFitResult, SkeletonizationResult
 from organograph.skeleton.primitives import PrimitiveAttachment
 
@@ -162,6 +163,13 @@ def _fit_primitives_once(
             branch_attachments[branch_id] = attachment
     crypt_attachments = {}
     if components["crypts"]:
+        radius_support_protected = host_mask_from_barrier(
+            mesh.v,
+            result.barriers.body_fit,
+            relative_height_threshold=config.radius_support_body_level,
+        )
+        for branch_mask in result.barriers.branch_masks.values():
+            radius_support_protected |= branch_mask
         crypt_attachments = attach_crypt_tube_primitives(
             graph,
             mesh.v,
@@ -171,6 +179,10 @@ def _fit_primitives_once(
             geodesic_fn=result.geodesic_fn,
             geodesic_kwargs=dict(
                 result.config.detection.candidates.geodesic_kwargs
+            ),
+            radius_support_protected_mask=radius_support_protected,
+            radius_support_max_distance_factor=(
+                config.radius_support_max_distance_factor
             ),
             **dict(config.crypt_tube_kwargs),
         )

@@ -62,7 +62,7 @@ DATA_ROOT = (PROJECT_ROOT.parent / "NicoleData").resolve()
 # }
 
 DATASET_TIMEPOINTS = {
-    "20250929": ["day4", "day4p5"],
+    "20250929": ["day3p5", "day4", "day4p5", "day4p5-more"],
     "20251201": ["day4p5"],
 }
 
@@ -78,7 +78,7 @@ OVERWRITE = False
 VERBOSE = True
 DRY_RUN = False
 STRICT = True
-MAX_MESHES = 300
+MAX_MESHES = None
 
 MESH_PREPARATION = definitive_mesh_preparation()
 NORMALIZE_MESH = MESH_PREPARATION["normalize_mesh"]
@@ -90,8 +90,76 @@ SMOOTH_EIGEN_K = MESH_PREPARATION["smooth_eigen_k"]
 
 FILTER_KWARGS = definitive_filter_options()
 FILTER_NAMES = ["filter_crypts_by_hks_percent", "filter_crypts_by_size"]
+ATTACHMENT_STRATEGY = "host_surface"  # "host_surface" or "embedded_boundary_plane"
+BOUNDARY_REFINEMENT_MAX_DISTANCE_FACTOR = 1.5
+BOUNDARY_REFINEMENT_MAX_MESH_FRACTION = 0.35
+
+# Crypt centerline fit. The compact export stores the two endpoints and both
+# Hermite tangent vectors, from which this sampled centerline is reconstructed.
+CENTERLINE_N_CONTOURS = 10
+CENTERLINE_N_SAMPLES = 64
+CENTERLINE_CURVATURE_WEIGHT = 0.01
+CENTERLINE_REFERENCE_LENGTH = 4.0
+CENTERLINE_OPENING_FRAME_BLEND_FRACTION = 0.15
+
+# Crypt radius measurements and fixed-width VAE representation.
+RADIUS_N_CONTOURS = 19
+RADIUS_SUPPORT_BODY_LEVEL = 1.00
+RADIUS_SUPPORT_MAX_DISTANCE_FACTOR = 2.5
+EXCLUDE_ATTACHMENT_RADIUS_OBSERVATION = True
+RADIUS_CONTROL_S = [0.0, 0.10, 0.20, 0.30, 0.45, 0.60, 0.75, 0.85]
+RADIUS_TAPER_POSITION = RADIUS_CONTROL_S[-1]
+RADIUS_PROFILE_SMOOTHNESS_WEIGHT = 0.05
+RADIUS_OUTSIDE_VOLUME_WEIGHT = 2.0
+RADIUS_PROFILE_N_BINS = 20
+RADIUS_PROFILE_MIN_POINTS_PER_BIN = 2
+RADIUS_PROFILE_MIN_SUPPORTED_BINS = 6
+RADIUS_TIP_PROJECTION_TOLERANCE = 1e-6
+
+# Final post-fit overlap merge.
+CRYPT_OVERLAP_THRESHOLD = 0.30
+CRYPT_OVERLAP_SAMPLES = 8192
+CRYPT_OVERLAP_MAX_HOST_ATTACHMENT_ANGLE = np.pi / 3
+
 SKELETONIZATION_CONFIG = definitive_skeletonization_config()
+SKELETONIZATION_CONFIG.detection.barriers.attachment_strategy = ATTACHMENT_STRATEGY
+SKELETONIZATION_CONFIG.detection.barriers.boundary_refinement_max_distance_factor = (
+    BOUNDARY_REFINEMENT_MAX_DISTANCE_FACTOR
+)
+SKELETONIZATION_CONFIG.detection.barriers.boundary_refinement_max_mesh_fraction = (
+    BOUNDARY_REFINEMENT_MAX_MESH_FRACTION
+)
 PRIMITIVE_FIT_CONFIG = definitive_primitive_fit_config()
+PRIMITIVE_FIT_CONFIG.radius_support_body_level = RADIUS_SUPPORT_BODY_LEVEL
+PRIMITIVE_FIT_CONFIG.radius_support_max_distance_factor = (
+    RADIUS_SUPPORT_MAX_DISTANCE_FACTOR
+)
+PRIMITIVE_FIT_CONFIG.crypt_tube_kwargs.update(
+    {
+        "centerline_n_contours": CENTERLINE_N_CONTOURS,
+        "centerline_n_samples": CENTERLINE_N_SAMPLES,
+        "centerline_curvature_weight": CENTERLINE_CURVATURE_WEIGHT,
+        "centerline_reference_length": CENTERLINE_REFERENCE_LENGTH,
+        "opening_frame_blend_fraction": CENTERLINE_OPENING_FRAME_BLEND_FRACTION,
+        "radius_n_contours": RADIUS_N_CONTOURS,
+        "exclude_attachment_radius_observation": (
+            EXCLUDE_ATTACHMENT_RADIUS_OBSERVATION
+        ),
+        "radius_control_s": RADIUS_CONTROL_S,
+        "fixed_taper_position": RADIUS_TAPER_POSITION,
+        "radius_profile_smoothness_weight": RADIUS_PROFILE_SMOOTHNESS_WEIGHT,
+        "outside_volume_weight": RADIUS_OUTSIDE_VOLUME_WEIGHT,
+        "profile_n_bins": RADIUS_PROFILE_N_BINS,
+        "profile_min_points_per_bin": RADIUS_PROFILE_MIN_POINTS_PER_BIN,
+        "profile_min_supported_bins": RADIUS_PROFILE_MIN_SUPPORTED_BINS,
+        "tip_projection_tolerance": RADIUS_TIP_PROJECTION_TOLERANCE,
+    }
+)
+PRIMITIVE_FIT_CONFIG.crypt_overlap.threshold = CRYPT_OVERLAP_THRESHOLD
+PRIMITIVE_FIT_CONFIG.crypt_overlap.samples = CRYPT_OVERLAP_SAMPLES
+PRIMITIVE_FIT_CONFIG.crypt_overlap.max_host_attachment_angle = (
+    CRYPT_OVERLAP_MAX_HOST_ATTACHMENT_ANGLE
+)
 
 
 # =============================================================================

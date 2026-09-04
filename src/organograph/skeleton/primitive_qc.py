@@ -22,7 +22,7 @@ from organograph.skeleton.legacy_curves import (
     sample_quadratic_bezier,
     sample_sinusoidal_bend,
 )
-from organograph.skeleton.primitive_geometry import capped_tube_radius
+from organograph.skeleton.primitive_geometry import tube_radius_from_parameters
 from organograph.skeleton.primitive.crypt_geometry import sample_tangent_hermite
 from organograph.skeleton.legacy_curves import sample_circular_arc
 
@@ -140,6 +140,22 @@ def _safe_ratio(numerator: float | None, denominator: float | None) -> float:
 
 
 def _profile_diagnostics(parameters: dict[str, Any], config: CryptPrimitiveQCConfig):
+    if "radius_control_s" in parameters:
+        control_s = np.asarray(parameters["radius_control_s"], dtype=float)
+        control_radii = np.asarray(parameters["radius_control_radii"], dtype=float)
+        if control_s.size < 3 or control_radii.shape != control_s.shape:
+            return float("nan"), float("nan"), False
+        interior = np.arange(1, control_radii.size - 1)
+        minima = interior[
+            (control_radii[interior] < control_radii[interior - 1])
+            & (control_radii[interior] < control_radii[interior + 1])
+        ]
+        if minima.size == 0:
+            return float("nan"), float("nan"), False
+        index = int(minima[np.argmin(control_radii[minima])])
+        neighbors = min(control_radii[index - 1], control_radii[index + 1])
+        depth = _safe_ratio(neighbors - control_radii[index], neighbors)
+        return float(control_s[index]), depth, True
     r_constriction = parameters.get("r_constriction")
     s_constriction = parameters.get("s_constriction")
     if r_constriction is None or s_constriction is None:
@@ -150,16 +166,7 @@ def _profile_diagnostics(parameters: dict[str, Any], config: CryptPrimitiveQCCon
         r_distal = float(parameters.get("r_distal", parameters.get("r_tip")))
         s_center = float(parameters.get("s_center", parameters.get("s_body")))
         s = np.linspace(0.0, 1.0, max(32, int(config.profile_samples)))
-        radii = capped_tube_radius(
-            s,
-            r_attachment,
-            r_center,
-            r_distal,
-            center_s=s_center,
-            taper_start=float(parameters["s_taper"]),
-            constriction_s=float(s_constriction),
-            r_constriction=float(r_constriction),
-        )
+        radii = tube_radius_from_parameters(parameters, s)
     except (KeyError, TypeError, ValueError):
         return float("nan"), float("nan"), False
 
@@ -185,7 +192,7 @@ def crypt_primitive_qc_records(
     config: CryptPrimitiveQCConfig | None = None,
     quality_payload: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Extract one QC record per crypt primitive from a v5 or legacy v2-v4 payload."""
+    """Extract one QC record per crypt primitive from v6 or a legacy payload."""
     config = config or CryptPrimitiveQCConfig()
     sample = dict(payload.get("sample") or {})
     node_types = {
@@ -208,12 +215,32 @@ def crypt_primitive_qc_records(
         residuals = dict(quality.get("residuals") or {})
         target_ids = [str(value) for value in primitive.get("target_node_ids") or []]
         target_types = [node_types.get(value, "unknown") for value in target_ids]
-        r_neck = float(parameters.get("r_attachment", parameters.get("r_neck", np.nan)))
-        r_body = float(parameters.get("r_center", parameters.get("r_body", np.nan)))
-        r_distal = float(parameters.get("r_distal", parameters.get("r_tip", np.nan)))
+        if "radius_control_s" in parameters:
+            radius_positions = np.asarray(parameters["radius_control_s"], dtype=float)
+            radius_controls = np.asarray(
+                parameters.get("radius_control_radii"), dtype=float
+            )
+            r_neck = float(radius_controls[0])
+            r_body = float(np.max(radius_controls))
+            r_distal = float(radius_controls[-1])
+            dense_s = np.linspace(0.0, 1.0, max(65, int(config.profile_samples)))
+            dense_radii = tube_radius_from_parameters(parameters, dense_s)
+            area = dense_radii**2
+            mass = float(np.trapezoid(area, dense_s))
+            s_body = (
+                float(np.trapezoid(dense_s * area, dense_s) / mass)
+                if mass > 1e-12
+                else float(radius_positions[len(radius_positions) // 2])
+            )
+        else:
+            r_neck = float(
+                parameters.get("r_attachment", parameters.get("r_neck", np.nan))
+            )
+            r_body = float(parameters.get("r_center", parameters.get("r_body", np.nan)))
+            r_distal = float(parameters.get("r_distal", parameters.get("r_tip", np.nan)))
+            s_body = float(parameters.get("s_center", parameters.get("s_body", np.nan)))
         r_constriction = parameters.get("r_constriction")
         s_constriction = parameters.get("s_constriction")
-        s_body = float(parameters.get("s_center", parameters.get("s_body", np.nan)))
         s_taper = float(parameters.get("s_taper", np.nan))
         centerline = _sample_centerline(parameters)
         centerline_length = _centerline_length(centerline)
@@ -240,9 +267,9 @@ def crypt_primitive_qc_records(
                     np.max(np.linalg.norm(centerline - baseline, axis=1)) / chord_length
                 )
         subtype = (
-            "budded"
-            if "constriction" in target_types
-            else "bulged"
+            "unclassified"
+            if "radius_control_s" in parameters
+            else ("budded" if "constriction" in target_types else "bulged")
         )
         has_constriction = r_constriction is not None and s_constriction is not None
         minimum_s, constriction_depth, minimum_near = _profile_diagnostics(

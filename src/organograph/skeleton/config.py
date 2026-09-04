@@ -99,7 +99,7 @@ def _default_branch_barrier_options() -> dict[str, Any]:
 
 @dataclass
 class BarrierConfig:
-    """Body/branch barrier fitting, ownership, and opening projection settings."""
+    """Body/branch barrier fitting, ownership, and attachment settings."""
 
     body_fit_options: dict[str, Any] = field(default_factory=_default_body_barrier_options)
     branch_fit_options: dict[str, Any] = field(default_factory=_default_branch_barrier_options)
@@ -110,6 +110,27 @@ class BarrierConfig:
     sample_fraction: float = 1.0
     sample_seed: int | None = 0
     opening_grid_resolution: int = 31
+    attachment_strategy: str = "host_surface"
+    boundary_refinement_max_distance_factor: float = 1.5
+    boundary_refinement_max_mesh_fraction: float = 0.35
+
+    def __post_init__(self):
+        if self.attachment_strategy not in {
+            "host_surface",
+            "embedded_boundary_plane",
+        }:
+            raise ValueError(
+                "attachment_strategy must be 'host_surface' or "
+                "'embedded_boundary_plane'"
+            )
+        if float(self.boundary_refinement_max_distance_factor) <= 1.0:
+            raise ValueError(
+                "boundary_refinement_max_distance_factor must be greater than 1"
+            )
+        if not 0.0 < float(self.boundary_refinement_max_mesh_fraction) <= 1.0:
+            raise ValueError(
+                "boundary_refinement_max_mesh_fraction must lie in (0, 1]"
+            )
 
 
 @dataclass
@@ -188,6 +209,8 @@ class PrimitiveFitConfig:
     """Settings for crypt/neck fitting and optional host-primitive refinement."""
 
     refine_host_primitives: bool = False
+    radius_support_body_level: float = 1.05
+    radius_support_max_distance_factor: float = 1.5
     component_kwargs: dict[str, Any] = field(default_factory=dict)
     body_kwargs: dict[str, Any] = field(default_factory=dict)
     branch_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -197,6 +220,12 @@ class PrimitiveFitConfig:
 
     def __post_init__(self):
         self.crypt_overlap = _coerce(CryptOverlapConfig, self.crypt_overlap)
+        if float(self.radius_support_body_level) <= 0.0:
+            raise ValueError("radius_support_body_level must be positive")
+        if float(self.radius_support_max_distance_factor) <= 0.0:
+            raise ValueError(
+                "radius_support_max_distance_factor must be positive"
+            )
 
     def to_dict(self) -> dict[str, Any]:
         return _plain(self)

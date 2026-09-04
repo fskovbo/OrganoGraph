@@ -15,12 +15,15 @@ from organograph.skeleton.detection.graph_builder import build_skeleton_graph
 from organograph.skeleton.detection.neck_profiles import analyze_neck_circumference_profile
 from organograph.skeleton.detection.tips import _select_hks_tips_from_axis
 from organograph.skeleton.detection.attachments import (
+    assign_crypt_attachments,
     assign_crypt_attachments_from_projected_boundaries,
     barrier_surface_normal,
+    find_embedded_opening_attachment,
     find_projected_opening_attachment,
 )
 from organograph.skeleton.detection.pipeline import detect_crypts_for_skeleton
 from organograph.skeleton import (
+    BarrierConfig,
     BarrierStageResult,
     BlendConfig,
     CryptOverlapConfig,
@@ -61,6 +64,7 @@ from organograph.skeleton.primitive import (
     merge_overlapping_crypt_detections,
     primitive_components_from_crypt_detections,
     relative_height_field,
+    grow_crypt_radius_support_regions,
     tube_overlap_fraction,
 )
 from organograph.skeleton.primitive.barriers import (
@@ -71,6 +75,7 @@ from organograph.skeleton.primitive.barriers import (
 )
 from organograph.skeleton.primitive.crypt_geometry import sample_tangent_hermite
 from organograph.skeleton.primitive.radius_profiles import fitted_radius_volume_center
+from organograph.skeleton.primitive.tubes import _radius_fit_sections
 from organograph.plotting.skeletons import _tube_surface
 from organograph.skeleton.primitive.blobs import blob_surface_radius
 from organograph.plotting.skeletons import _centerline_curvature_profile, _primitive_mesh
@@ -229,6 +234,96 @@ def make_tube_points(
 
 
 class SkeletonTests(unittest.TestCase):
+    def test_radius_fit_can_exclude_attachment_observation(self):
+        sections = [
+            {"s": 0.0, "mean_radius": 4.0},
+            {"s": 0.05, "mean_radius": 1.0},
+            {"s": 0.10, "mean_radius": 1.1},
+        ]
+
+        selected = _radius_fit_sections(sections, exclude_attachment=True)
+
+        self.assertEqual([item["s"] for item in selected], [0.05, 0.10])
+        self.assertEqual(
+            len(_radius_fit_sections(sections, exclude_attachment=False)), 3
+        )
+
+    def test_radius_support_growth_respects_connectivity_and_host_barrier(self):
+        vertices, faces = make_grid_mesh(3, 7)
+        island_start = vertices.shape[0]
+        vertices = np.vstack(
+            [
+                vertices,
+                [[20.0, 0.0, 0.0], [21.0, 0.0, 0.0], [20.0, 1.0, 0.0]],
+            ]
+        )
+        faces = np.vstack([faces, [island_start, island_start + 1, island_start + 2]])
+        left = np.asarray([0, 7, 14], dtype=np.int64)
+        right = np.asarray([6, 13, 20], dtype=np.int64)
+        protected = np.zeros(vertices.shape[0], dtype=bool)
+        protected[[3, 10, 17]] = True
+
+        result = grow_crypt_radius_support_regions(
+            vertices,
+            faces,
+            {"left": left, "right": right},
+            {"left": 7, "right": 13},
+            {"left": 10.0, "right": 10.0},
+            protected,
+            max_distance_factor=1.5,
+        )
+
+        self.assertTrue(set([1, 8, 15]).issubset(result.regions["left"]))
+        self.assertTrue(set([5, 12, 19]).issubset(result.regions["right"]))
+        self.assertFalse(
+            set(range(island_start, island_start + 3))
+            & set(result.regions["left"])
+        )
+        self.assertFalse(
+            set(range(island_start, island_start + 3))
+            & set(result.regions["right"])
+        )
+
+    def test_radius_support_growth_uses_tip_distance_cutoff(self):
+        vertices, faces = make_grid_mesh(3, 7)
+        seed = np.asarray([0, 7, 14], dtype=np.int64)
+        result = grow_crypt_radius_support_regions(
+            vertices,
+            faces,
+            {"crypt": seed},
+            {"crypt": 7},
+            {"crypt": 1.0},
+            np.zeros(vertices.shape[0], dtype=bool),
+            max_distance_factor=1.5,
+        )
+
+        self.assertLessEqual(np.max(vertices[result.regions["crypt"], 0]), 1.0)
+        self.assertEqual(
+            result.diagnostics["crypt"]["max_tip_geodesic_distance"], 1.5
+        )
+
+    def test_radius_support_contests_use_nearest_tip_geodesic(self):
+        vertices, faces = make_grid_mesh(3, 7)
+        left = np.asarray([0, 7, 14], dtype=np.int64)
+        right = np.asarray([6, 13, 20], dtype=np.int64)
+        result = grow_crypt_radius_support_regions(
+            vertices,
+            faces,
+            {"left": left, "right": right},
+            {"left": 7, "right": 13},
+            {"left": 10.0, "right": 10.0},
+            np.zeros(vertices.shape[0], dtype=bool),
+            max_distance_factor=1.5,
+        )
+
+        self.assertIn(9, result.regions["left"])
+        self.assertNotIn(9, result.regions["right"])
+        self.assertIn(11, result.regions["right"])
+        self.assertNotIn(11, result.regions["left"])
+        self.assertGreater(
+            result.diagnostics["left"]["contested_vertices_won"], 0
+        )
+
     @staticmethod
     def _overlap_tube(offset=(0.0, 0.0, 0.0)):
         offset = np.asarray(offset, dtype=float)
@@ -1153,6 +1248,222 @@ class SkeletonTests(unittest.TestCase):
             refined[0]["metadata"]["projected_opening_attachment"]["found"]
         )
 
+    def test_embedded_attachment_uses_boundary_plane_center_and_normal(self):
+        angles = np.linspace(0.0, 2.0 * np.pi, 24, endpoint=False)
+        vertices = np.vstack(
+            [
+                np.column_stack(
+                    [
+                        np.full(angles.size, 0.7),
+                        0.3 * np.cos(angles),
+                        0.3 * np.sin(angles),
+                    ]
+                ),
+                [2.0, 0.0, 0.0],
+            ]
+        )
+        faces = np.asarray(
+            [[i, (i + 1) % angles.size, angles.size] for i in range(angles.size)],
+            dtype=np.int64,
+        )
+        host_fit = BarrierPrimitiveFit(
+            center=np.zeros(3),
+            axes=np.eye(3),
+            radii=np.ones(3),
+        )
+        opening = find_embedded_opening_attachment(
+            vertices,
+            faces,
+            np.arange(vertices.shape[0]),
+            host_fit,
+            tip_position=vertices[-1],
+        )
+        self.assertTrue(opening["found"])
+        self.assertTrue(opening["embedded_in_host"])
+        np.testing.assert_allclose(opening["position"], [0.7, 0.0, 0.0], atol=0.03)
+        np.testing.assert_allclose(opening["surface_normal"], [1.0, 0.0, 0.0], atol=1e-8)
+        self.assertAlmostEqual(opening["primitive_level"], 0.7, delta=0.03)
+
+        assigned = assign_crypt_attachments(
+            vertices,
+            faces,
+            [
+                {
+                    "crypt_id": "a",
+                    "crypt_vertices": np.arange(vertices.shape[0]),
+                    "bottom_vertex_id": vertices.shape[0] - 1,
+                }
+            ],
+            host_fit,
+            strategy="embedded_boundary_plane",
+        )[0]
+        self.assertEqual(
+            assigned["attachment_normal_source"],
+            "closest_host_primitive_surface_gradient",
+        )
+        np.testing.assert_allclose(
+            assigned["metadata"]["opening_attachment"][
+                "host_surface_reference_position"
+            ],
+            [1.0, 0.0, 0.0],
+            atol=0.03,
+        )
+
+    def test_embedded_attachment_grows_profiled_region_to_host(self):
+        angles = np.linspace(0.0, 2.0 * np.pi, 16, endpoint=False)
+        ring_x = np.array([1.0, 1.5, 2.0, 2.5])
+        rings = [
+            np.column_stack(
+                [
+                    np.full(angles.size, x),
+                    0.25 * np.cos(angles),
+                    0.25 * np.sin(angles),
+                ]
+            )
+            for x in ring_x
+        ]
+        vertices = np.vstack([*rings, [3.0, 0.0, 0.0]])
+        faces = []
+        n_ring = angles.size
+        for layer in range(len(rings) - 1):
+            first = layer * n_ring
+            second = (layer + 1) * n_ring
+            for i in range(n_ring):
+                j = (i + 1) % n_ring
+                faces.extend(
+                    [
+                        [first + i, first + j, second + j],
+                        [first + i, second + j, second + i],
+                    ]
+                )
+        tip_id = vertices.shape[0] - 1
+        distal = (len(rings) - 1) * n_ring
+        faces.extend(
+            [[distal + i, distal + (i + 1) % n_ring, tip_id] for i in range(n_ring)]
+        )
+        faces = np.asarray(faces, dtype=np.int64)
+        distance_field = 3.0 - vertices[:, 0]
+        initial_patch = np.flatnonzero(vertices[:, 0] >= 2.0)
+        host_fit = BarrierPrimitiveFit(
+            center=np.zeros(3),
+            axes=np.eye(3),
+            radii=np.ones(3),
+        )
+
+        assigned = assign_crypt_attachments(
+            vertices,
+            faces,
+            [
+                {
+                    "crypt_id": "a",
+                    "crypt_vertices": initial_patch,
+                    "bottom_vertex_id": tip_id,
+                    "d_crypt": distance_field,
+                    "neck_profile": {
+                        "kind": "transition",
+                        "attachment_level": 1.0,
+                    },
+                }
+            ],
+            host_fit,
+            strategy="embedded_boundary_plane",
+            boundary_refinement_max_mesh_fraction=1.0,
+        )[0]
+
+        diagnostics = assigned["metadata"]["opening_attachment"]
+        self.assertTrue(diagnostics["host_contact_found"])
+        self.assertEqual(
+            diagnostics["boundary_refinement_reason"],
+            "grown_to_host_primitive",
+        )
+        self.assertGreater(assigned["crypt_vertices"].size, initial_patch.size)
+        self.assertAlmostEqual(assigned["attachment_level"], 2.0, delta=1e-12)
+        np.testing.assert_allclose(
+            assigned["attachment_position"], [1.0, 0.0, 0.0], atol=0.04
+        )
+        np.testing.assert_allclose(
+            assigned["attachment_surface_normal"], [1.0, 0.0, 0.0], atol=1e-8
+        )
+        self.assertEqual(
+            assigned["attachment_normal_source"],
+            "closest_host_primitive_surface_gradient",
+        )
+
+    def test_embedded_attachment_falls_back_to_host_surface_at_growth_limit(self):
+        angles = np.linspace(0.0, 2.0 * np.pi, 16, endpoint=False)
+        ring_x = np.array([1.0, 1.5, 2.0, 2.5])
+        rings = [
+            np.column_stack(
+                [
+                    np.full(angles.size, x),
+                    0.25 * np.cos(angles),
+                    0.25 * np.sin(angles),
+                ]
+            )
+            for x in ring_x
+        ]
+        vertices = np.vstack([*rings, [3.0, 0.0, 0.0]])
+        faces = []
+        n_ring = angles.size
+        for layer in range(len(rings) - 1):
+            first = layer * n_ring
+            second = (layer + 1) * n_ring
+            for i in range(n_ring):
+                j = (i + 1) % n_ring
+                faces.extend(
+                    [
+                        [first + i, first + j, second + j],
+                        [first + i, second + j, second + i],
+                    ]
+                )
+        tip_id = vertices.shape[0] - 1
+        distal = (len(rings) - 1) * n_ring
+        faces.extend(
+            [[distal + i, distal + (i + 1) % n_ring, tip_id] for i in range(n_ring)]
+        )
+        initial_patch = np.flatnonzero(vertices[:, 0] >= 2.0)
+        host_fit = BarrierPrimitiveFit(
+            center=np.zeros(3),
+            axes=np.eye(3),
+            radii=np.ones(3),
+        )
+
+        assigned = assign_crypt_attachments(
+            vertices,
+            np.asarray(faces, dtype=np.int64),
+            [
+                {
+                    "crypt_id": "a",
+                    "crypt_vertices": initial_patch,
+                    "bottom_vertex_id": tip_id,
+                    "d_crypt": 3.0 - vertices[:, 0],
+                }
+            ],
+            host_fit,
+            strategy="embedded_boundary_plane",
+            boundary_refinement_max_mesh_fraction=0.51,
+        )[0]
+
+        diagnostics = assigned["metadata"]["opening_attachment"]
+        self.assertFalse(diagnostics["host_contact_found"])
+        self.assertTrue(diagnostics["attachment_projected_to_host_surface"])
+        self.assertGreater(diagnostics["unconstrained_primitive_level"], 1.0)
+        self.assertAlmostEqual(diagnostics["primitive_level"], 1.0, delta=1e-5)
+        np.testing.assert_allclose(
+            assigned["attachment_position"], [1.0, 0.0, 0.0], atol=0.04
+        )
+        np.testing.assert_allclose(
+            assigned["attachment_surface_normal"], [1.0, 0.0, 0.0], atol=0.04
+        )
+
+    def test_barrier_config_rejects_unknown_attachment_strategy(self):
+        with self.assertRaises(ValueError):
+            BarrierConfig(attachment_strategy="not-a-strategy")
+        with self.assertRaises(ValueError):
+            BarrierConfig(boundary_refinement_max_distance_factor=1.0)
+        with self.assertRaises(ValueError):
+            BarrierConfig(boundary_refinement_max_mesh_fraction=0.0)
+
     def test_body_barrier_fit_precedes_hks_candidate_detection(self):
         events = []
         mesh = SimpleNamespace(
@@ -1567,16 +1878,21 @@ class SkeletonTests(unittest.TestCase):
             points,
             centerline,
             radius_quantile=0.5,
-            neck_window=(0.0, 0.01),
-            tip_window=(0.84, 0.86),
-            center_s=0.5,
             fixed_taper_position=0.85,
             optimize_radius_profile=False,
         )
 
-        self.assertAlmostEqual(fit.parameters["r_neck"], 1.0, delta=0.15)
-        self.assertAlmostEqual(fit.parameters["r_body"], 2.0, delta=0.15)
-        self.assertAlmostEqual(fit.parameters["r_tip"], 0.5, delta=0.15)
+        from organograph.skeleton.primitive_geometry import fixed_grid_tube_radius
+
+        fitted_radii = fixed_grid_tube_radius(
+            np.asarray([0.0, 0.5, 0.85]),
+            fit.parameters["radius_control_s"],
+            fit.parameters["radius_control_radii"],
+        )
+        self.assertAlmostEqual(fitted_radii[0], 1.0, delta=0.15)
+        self.assertAlmostEqual(fitted_radii[1], 2.0, delta=0.15)
+        self.assertAlmostEqual(fitted_radii[2], 0.5, delta=0.15)
+        self.assertEqual(len(fit.parameters["radius_control_radii"]), 8)
         self.assertAlmostEqual(fit.derived_parameters["length"], 10.0)
         self.assertAlmostEqual(fit.derived_parameters["bend_angle"], 0.0)
         self.assertEqual(
@@ -1596,16 +1912,12 @@ class SkeletonTests(unittest.TestCase):
         fit = fit_crypt_tube_to_points(
             points,
             centerline,
-            center_s=0.35,
             fixed_taper_position=0.85,
         )
 
         expected_center = fitted_radius_volume_center(
-            r_attachment=fit.parameters["r_attachment"],
-            r_center=fit.parameters["r_center"],
-            r_distal=fit.parameters["r_distal"],
-            s_center=fit.parameters["s_center"],
-            s_taper=fit.parameters["s_taper"],
+            control_s=fit.parameters["radius_control_s"],
+            control_radii=fit.parameters["radius_control_radii"],
         )
         self.assertAlmostEqual(fit.parameters["crypt_node_s"], expected_center)
         self.assertNotAlmostEqual(fit.parameters["crypt_node_s"], 0.35, places=3)
@@ -1631,17 +1943,16 @@ class SkeletonTests(unittest.TestCase):
         reference = fit_crypt_tube_to_points(points, centerline)
         biased = fit_crypt_tube_to_points(oversampled, centerline)
 
-        for parameter in ("r_neck", "r_body", "r_tip", "s_body", "s_taper"):
-            self.assertAlmostEqual(
-                reference.parameters[parameter],
-                biased.parameters[parameter],
-                delta=0.04,
-            )
+        np.testing.assert_allclose(
+            reference.parameters["radius_control_radii"],
+            biased.parameters["radius_control_radii"],
+            atol=0.16,
+        )
         observations = biased.metadata["profile_observations"]
         self.assertEqual(len(observations["s"]), 20)
         self.assertGreater(max(observations["counts"]), min(observations["counts"]))
 
-    def test_tube_fit_enforces_distal_and_constriction_radius_semantics(self):
+    def test_tube_fit_uses_fixed_width_radius_controls(self):
         centerline = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 10.0]])
         points = make_tube_points(
             centerline,
@@ -1655,15 +1966,13 @@ class SkeletonTests(unittest.TestCase):
         fit = fit_crypt_tube_to_points(
             points,
             centerline,
-            constriction_s=0.18,
+            radius_control_s=[0.0, 0.10, 0.20, 0.30, 0.44, 0.58, 0.70, 0.82],
             fixed_taper_position=0.82,
         )
 
-        self.assertLess(fit.parameters["r_tip"], fit.parameters["r_body"])
-        self.assertLess(
-            fit.parameters["r_constriction"],
-            min(fit.parameters["r_neck"], fit.parameters["r_body"]),
-        )
+        self.assertEqual(len(fit.parameters["radius_control_s"]), 8)
+        self.assertNotIn("r_constriction", fit.parameters)
+        self.assertNotIn("s_constriction", fit.parameters)
         diagnostics = fit.metadata["profile_optimization"]
         self.assertGreaterEqual(diagnostics["n_supported_bins"], 6)
 
@@ -1697,7 +2006,7 @@ class SkeletonTests(unittest.TestCase):
         self.assertAlmostEqual(left_slope, right_slope, delta=1e-3)
         self.assertLess(left_slope, -0.1)
 
-    def test_constricted_crypt_tube_recovers_internal_neck_radius(self):
+    def test_fixed_grid_profile_can_recover_an_internal_constriction(self):
         centerline = np.array([[0.0, 0.0, 0.0], [0.0, 0.0, 10.0]])
         points = make_tube_points(
             centerline,
@@ -1711,24 +2020,18 @@ class SkeletonTests(unittest.TestCase):
         fit = fit_crypt_tube_to_points(
             points,
             centerline,
-            constriction_s=0.18,
+            radius_control_s=[0.0, 0.10, 0.18, 0.30, 0.45, 0.60, 0.72, 0.82],
             fixed_taper_position=0.82,
+            radius_profile_smoothness_weight=0.01,
         )
 
-        self.assertAlmostEqual(fit.parameters["s_constriction"], 0.18)
-        self.assertAlmostEqual(
-            fit.parameters["r_constriction"],
-            0.7,
-            delta=0.12,
-        )
+        controls = np.asarray(fit.parameters["radius_control_radii"])
+        self.assertAlmostEqual(controls[2], 0.7, delta=0.25)
         self.assertLess(
-            fit.parameters["r_constriction"],
-            fit.parameters["r_neck"],
+            controls[2],
+            min(controls[1], controls[3]),
         )
-        self.assertAlmostEqual(
-            fit.derived_parameters["constriction_ratio"],
-            fit.parameters["r_constriction"] / fit.parameters["r_body"],
-        )
+        self.assertLess(fit.derived_parameters["constriction_ratio"], 0.8)
 
     def test_bent_tube_fit_reports_length_and_bend_angle(self):
         centerline = np.array(

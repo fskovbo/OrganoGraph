@@ -13,6 +13,7 @@ from organograph.skeleton.blending.geometry import (
     unit_vector,
 )
 from organograph.skeleton.config import BlendConfig
+from organograph.skeleton.primitive_geometry import tube_radius_from_parameters
 
 
 def _incoming_edges(graph, node_id: str):
@@ -57,11 +58,11 @@ def _host_local_radius(host_attachment, point, axis_direction, *, fallback: floa
 
 
 def _crypt_start_radius(tube_attachment) -> float:
-    params = tube_attachment.parameters
-    radius = params.get("r_neck", params.get("r_attachment", None))
-    if radius is None:
-        radius = params.get("r_constriction", 0.0)
-    radius = float(radius)
+    radius = float(
+        tube_radius_from_parameters(
+            tube_attachment.parameters, np.asarray([0.0], dtype=float)
+        )[0]
+    )
     return max(radius, 1e-8)
 
 

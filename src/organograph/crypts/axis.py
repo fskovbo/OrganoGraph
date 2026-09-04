@@ -271,6 +271,9 @@ def compute_crypt_axis(
     crypt_patches,
     geodesic_fn,
     geodesic_kwargs=None,
+    *,
+    bottom_n_boundary_samples: int = 256,
+    bottom_seed: int | None = None,
 ):
     """
     Compute per-feature (crypt) distance fields from feature bottoms.
@@ -290,6 +293,12 @@ def compute_crypt_axis(
         Must return (S,V) or (V,) distances.
     geodesic_kwargs : dict or None
         Extra keyword args forwarded to geodesic_fn.
+    bottom_n_boundary_samples : int
+        Number of candidate-boundary vertices used to locate each
+        boundary-distance bottom. Values less than or equal to zero use the
+        complete boundary.
+    bottom_seed : int or None
+        Random seed used only when the candidate boundary is subsampled.
 
     Returns
     -------
@@ -308,7 +317,12 @@ def compute_crypt_axis(
     K = len(crypt_patches)
     V = mesh.v.shape[0]
 
-    bottom_vertex_ids = compute_crypt_bottoms(mesh, crypt_patches)
+    bottom_vertex_ids = compute_crypt_bottoms(
+        mesh,
+        crypt_patches,
+        n_boundary_samples=bottom_n_boundary_samples,
+        seed=bottom_seed,
+    )
     bottom_vertex_ids = np.asarray(bottom_vertex_ids)
     valid_js = np.where(bottom_vertex_ids >= 0)[0]
 

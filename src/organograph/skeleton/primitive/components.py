@@ -118,6 +118,9 @@ def primitive_components_from_crypt_detections(
                         "attachment_surface_normal": daughter.get(
                             "attachment_surface_normal"
                         ),
+                        "attachment_normal_source": daughter.get(
+                            "attachment_normal_source"
+                        ),
                         "candidate_boundary_vertices": daughter.get(
                             "candidate_boundary_vertices"
                         ),
@@ -184,6 +187,9 @@ def primitive_components_from_crypt_detections(
                 "neck_profile": detection.get("neck_profile"),
                 "attachment_surface_normal": detection.get(
                     "attachment_surface_normal"
+                ),
+                "attachment_normal_source": detection.get(
+                    "attachment_normal_source"
                 ),
                 "candidate_boundary_vertices": detection.get(
                     "candidate_boundary_vertices"

@@ -141,6 +141,9 @@ def definitive_skeletonization_config(
                 branch_ownership_level=1.1,
                 sample_fraction=1.0,
                 sample_seed=0,
+                attachment_strategy="host_surface",
+                boundary_refinement_max_distance_factor=1.5,
+                boundary_refinement_max_mesh_fraction=0.35,
             ),
             mesh=MeshPreparationConfig(smooth=False),
         ),
@@ -151,6 +154,8 @@ def definitive_primitive_fit_config() -> PrimitiveFitConfig:
     """Return the maintained primitive fit shown in the skeleton tutorial."""
     return PrimitiveFitConfig(
         refine_host_primitives=False,
+        radius_support_body_level=1.05,
+        radius_support_max_distance_factor=1.5,
         body_branch_neck_kwargs={
             "radius_quantile": 0.25,
             "expansion_factor": 1.35,
@@ -159,17 +164,26 @@ def definitive_primitive_fit_config() -> PrimitiveFitConfig:
         },
         crypt_tube_kwargs={
             "centerline_n_contours": 10,
+            "radius_n_contours": 19,
+            "exclude_attachment_radius_observation": True,
             "centerline_n_samples": 64,
+            # Provisional regularization; use the lambda-scan notebook to tune
+            # this against one fixed reference length for the target dataset.
+            "centerline_curvature_weight": 0.01,
+            "centerline_reference_length": 4.0,
             "opening_frame_blend_fraction": 0.15,
             "update_crypt_nodes": True,
             "radius_quantile": 0.5,
             "optimize_radius_profile": True,
+            "radius_control_s": [
+                0.0, 0.10, 0.20, 0.30, 0.45, 0.60, 0.75, 0.85
+            ],
             "fixed_taper_position": 0.85,
+            "radius_profile_smoothness_weight": 0.05,
             "outside_volume_weight": 2.0,
             "profile_n_bins": 20,
             "profile_min_points_per_bin": 2,
             "profile_min_supported_bins": 6,
-            "max_constriction_to_neighbor_fraction": 0.98,
             "tip_projection_tolerance": 1e-6,
         },
         crypt_overlap=CryptOverlapConfig(

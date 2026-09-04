@@ -11,9 +11,9 @@ from scipy.stats import qmc
 
 from organograph.skeleton.config import CryptOverlapConfig
 from organograph.skeleton.primitive_geometry import (
-    capped_tube_radius,
     polyline_lengths,
     project_points_to_polyline,
+    tube_radius_from_parameters,
 )
 
 
@@ -69,18 +69,7 @@ class CryptDetectionMergeResult:
 
 
 def _tube_radius(parameters, s) -> np.ndarray:
-    return capped_tube_radius(
-        np.asarray(s, dtype=float),
-        float(parameters["r_neck"]),
-        float(parameters["r_body"]),
-        float(parameters.get("r_taper", parameters["r_tip"])),
-        body_s=float(parameters.get("s_body", 0.5)),
-        taper_start=float(
-            parameters.get("s_taper", parameters.get("distal_taper_start", 0.85))
-        ),
-        constriction_s=parameters.get("s_constriction"),
-        r_constriction=parameters.get("r_constriction"),
-    )
+    return tube_radius_from_parameters(parameters, np.asarray(s, dtype=float))
 
 
 def _tube_volume(parameters, *, samples: int = 512) -> float:
@@ -585,6 +574,7 @@ _STALE_GEOMETRY_KEYS = (
     "attachment_level",
     "attachment_position",
     "attachment_surface_normal",
+    "attachment_normal_source",
     "candidate_boundary_vertices",
     "neck_position",
     "constriction_position",
@@ -618,13 +608,16 @@ def recompute_merged_crypt_geometry(
         normalize_crypt_axis_to_neckline,
     )
     from organograph.skeleton.detection.attachments import (
-        assign_crypt_attachments_from_projected_boundaries,
+        assign_crypt_attachments,
         attachment_projection_diagnostics,
     )
     from organograph.skeleton.detection.neck_profiles import (
         _add_neck_profile_geometry,
     )
-    from organograph.skeleton.detection.pipeline import _profile_crypt_patches
+    from organograph.skeleton.detection.pipeline import (
+        _profile_crypt_patches,
+        _profile_search_interval,
+    )
 
     if barriers is None:
         raise ValueError("Barrier fits are required to recompute merged crypt geometry")
@@ -632,6 +625,11 @@ def recompute_merged_crypt_geometry(
     geodesic_fn = geodesic_fn or compute_geodesics_dijkstra
     candidate_config = detection_config.candidates
     neck_config = detection_config.necks
+    barrier_config = detection_config.barriers
+    profile_search_interval = _profile_search_interval(
+        neck_config,
+        barrier_config,
+    )
     levels = np.linspace(
         0.01,
         float(neck_config.max_axis_level),
@@ -666,7 +664,7 @@ def recompute_merged_crypt_geometry(
             mesh,
             normalized,
             levels,
-            search_interval=neck_config.search_interval,
+            search_interval=profile_search_interval,
             L_crypt=length,
             window_length=9,
             polyorder=3,
@@ -704,6 +702,7 @@ def recompute_merged_crypt_geometry(
                             candidate_config=candidate_config,
                             hks=hks,
                             hks_times=hks_times,
+                            search_interval=profile_search_interval,
                         )
                         final_tip = int(profile["final_tips"][0])
                         circumference, distance_field, crypt_length = (
@@ -767,22 +766,30 @@ def recompute_merged_crypt_geometry(
         return current
 
     refreshed = [refresh(detection, relation="body_crypt") for detection in detections]
-    refreshed = assign_crypt_attachments_from_projected_boundaries(
+    refreshed = assign_crypt_attachments(
         mesh.v,
         mesh.f,
         refreshed,
         barriers.body_fit,
         grid_resolution=detection_config.barriers.opening_grid_resolution,
+        boundary_refinement_max_mesh_fraction=(
+            detection_config.barriers.boundary_refinement_max_mesh_fraction
+        ),
+        strategy=detection_config.barriers.attachment_strategy,
         assign_body_roots=True,
         assign_branch_daughters=False,
     )
-    refreshed = assign_crypt_attachments_from_projected_boundaries(
+    refreshed = assign_crypt_attachments(
         mesh.v,
         mesh.f,
         refreshed,
         barriers.body_fit,
         branch_fits=barriers.branch_fits,
         grid_resolution=detection_config.barriers.opening_grid_resolution,
+        boundary_refinement_max_mesh_fraction=(
+            detection_config.barriers.boundary_refinement_max_mesh_fraction
+        ),
+        strategy=detection_config.barriers.attachment_strategy,
         assign_body_roots=False,
         assign_branch_daughters=True,
     )

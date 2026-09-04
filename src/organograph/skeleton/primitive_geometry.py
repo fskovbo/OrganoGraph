@@ -10,6 +10,12 @@ from scipy.interpolate import PchipInterpolator
 from organograph.skeleton.geometry import as_points
 
 
+DEFAULT_CRYPT_RADIUS_CONTROL_S = np.array(
+    [0.0, 0.10, 0.20, 0.30, 0.45, 0.60, 0.75, 0.85], dtype=float
+)
+CRYPT_RADIUS_PROFILE_TYPE = "fixed_grid_shape_preserving_squared_radius_v1"
+
+
 def component_points(vertices, component) -> np.ndarray:
     """Return component points from either coordinates or vertex indices."""
     if component is None:
@@ -133,6 +139,77 @@ def capped_tube_radius(
     output = np.sqrt(np.maximum(squared, 0.0))
     output[values >= 1.0] = 0.0
     return output
+
+
+def fixed_grid_tube_radius(
+    s,
+    control_s,
+    control_radii,
+    *,
+    tip_s: float = 1.0,
+) -> np.ndarray:
+    """Evaluate a fixed-grid crypt radius profile with smooth tip closure.
+
+    The supplied radii describe the learnable profile before the distal cap.
+    A zero-radius tip control is appended deterministically. Interpolation is
+    performed on squared radius, which corresponds to cross-sectional area,
+    using a shape-preserving cubic interpolant.
+    """
+    values = np.asarray(s, dtype=float)
+    positions = np.asarray(control_s, dtype=float).reshape(-1)
+    radii = np.asarray(control_radii, dtype=float).reshape(-1)
+    tip = float(tip_s)
+    if positions.size < 2 or radii.size != positions.size:
+        raise ValueError("control_s and control_radii must have the same length >= 2")
+    if not np.all(np.isfinite(positions)) or not np.all(np.diff(positions) > 0.0):
+        raise ValueError("radius control positions must be finite and strictly increasing")
+    if positions[0] < 0.0 or positions[-1] >= tip:
+        raise ValueError("radius controls must satisfy 0 <= s_control < tip_s")
+    if not np.all(np.isfinite(radii)) or np.any(radii <= 0.0):
+        raise ValueError("radius controls must be finite and positive")
+
+    interpolation_s = np.concatenate([positions, [tip]])
+    squared_radii = np.concatenate([radii**2, [0.0]])
+    clipped = np.clip(values, positions[0], tip)
+    squared = PchipInterpolator(
+        interpolation_s, squared_radii, extrapolate=False
+    )(clipped)
+    output = np.sqrt(np.maximum(squared, 0.0))
+    output[values >= tip] = 0.0
+    return output
+
+
+def tube_radius_from_parameters(parameters: dict[str, Any], s) -> np.ndarray:
+    """Evaluate either the maintained fixed-grid or a legacy tube profile."""
+    if "radius_control_s" in parameters and "radius_control_radii" in parameters:
+        return fixed_grid_tube_radius(
+            s,
+            parameters["radius_control_s"],
+            parameters["radius_control_radii"],
+        )
+    r_attachment = (
+        parameters["r_attachment"]
+        if "r_attachment" in parameters
+        else parameters["r_neck"]
+    )
+    r_center = (
+        parameters["r_center"] if "r_center" in parameters else parameters["r_body"]
+    )
+    r_distal = parameters.get("r_distal")
+    if r_distal is None:
+        r_distal = parameters.get("r_taper", parameters.get("r_tip"))
+    return capped_tube_radius(
+        s,
+        float(r_attachment),
+        float(r_center),
+        float(r_distal),
+        center_s=float(parameters.get("s_center", parameters.get("s_body", 0.5))),
+        taper_start=float(
+            parameters.get("s_taper", parameters.get("distal_taper_start", 0.85))
+        ),
+        constriction_s=parameters.get("s_constriction"),
+        r_constriction=parameters.get("r_constriction"),
+    )
 
 
 def bend_angles_for_polyline(points) -> list[float]:

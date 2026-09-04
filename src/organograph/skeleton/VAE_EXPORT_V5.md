@@ -1,8 +1,8 @@
 # OrganoGraph Shape Export v5
 
-This document describes the compact reconstruction contract consumed by the
-OrganoidVAE project. Shape files use schema `organograph_shape_v5`. Historical
-v2-v4 files remain readable, but newly fitted data should be exported as v5.
+This document describes the historical `organograph_shape_v5` contract.
+Current fitting writes v6; see `VAE_EXPORT_V6.md` for the maintained
+OrganoidVAE integration contract.
 
 ## Pipeline
 
@@ -12,14 +12,23 @@ v2-v4 files remain readable, but newly fitted data should be exported as v5.
 4. Measure cross-sectional contour centers and radii.
 5. Fit one cubic Hermite centerline from attachment to tip. Its start tangent
    is the outward host-primitive normal and its end tangent is the distal
-   tip-plane normal. Only one shared tangent length is fitted.
-6. Fit the interpretable radius profile and place the crypt skeleton node at
+   tip-plane normal. Proximal and distal tangent lengths are fitted independently
+   against ordered contour centers with physical bending-energy regularization.
+6. Competitively grow each crypt into connected, non-host mesh vertices using
+   restricted tip-geodesic distance, then project this radius-only support mesh
+   onto the fitted centerline. Extract transverse iso-contours at fixed
+   centerline arc-length coordinates and fit the interpretable radius profile
+   against their arc-length-weighted radial samples. This expanded support is
+   not part of the compact VAE record.
+7. Place the crypt skeleton node at
    the fitted tube volume centroid, where volume density is proportional to
    `r(s)^2`.
 
 The Hermite construction is deliberately restrictive. It preserves the two
 biological endpoint directions without exporting free spline control points
-that can oscillate or fold.
+that can oscillate or fold. Conditional on the measured endpoint directions,
+the proximal and distal tangent lengths are the two scalar centerline shape
+degrees of freedom.
 
 ## Crypt Primitive
 

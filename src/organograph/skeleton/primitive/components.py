@@ -91,6 +91,7 @@ def primitive_components_from_crypt_detections(
             if parent_region.size:
                 body_excluded.update(map(int, parent_region.tolist()))
 
+            branch_node_id = f"crypt_{crypt_id}_branch"
             daughter_regions = []
             for j, daughter in enumerate(daughters):
                 daughter_region = component_region_from_detection(daughter, n_vertices)
@@ -99,6 +100,7 @@ def primitive_components_from_crypt_detections(
                     tip_node_id = f"crypt_{crypt_id}_tip_{j}"
                     crypts[tip_node_id] = sorted(map(int, daughter_region.tolist()))
                     crypt_centerlines[tip_node_id] = {
+                        "host_id": branch_node_id,
                         "vertex_indices": crypts[tip_node_id],
                         "boundary_tip_vertex_id": daughter.get(
                             "boundary_distance_bottom_vertex_id"
@@ -139,7 +141,6 @@ def primitive_components_from_crypt_detections(
                 )
                 branch_region = sorted(map(int, stem.tolist()))
 
-            branch_node_id = f"crypt_{crypt_id}_branch"
             if branch_region and (graph is None or branch_node_id in graph.nodes):
                 branches[branch_node_id] = sorted(set(branch_region))
             neck_node_id = f"crypt_{crypt_id}_neck"
@@ -169,6 +170,7 @@ def primitive_components_from_crypt_detections(
             body_excluded.update(map(int, region.tolist()))
             crypts[crypt_id] = sorted(map(int, region.tolist()))
             crypt_centerlines[crypt_id] = {
+                "host_id": "body",
                 "vertex_indices": crypts[crypt_id],
                 "boundary_tip_vertex_id": detection.get(
                     "boundary_distance_bottom_vertex_id"

@@ -696,7 +696,11 @@ def fit_tangent_constrained_hermite(
             message="degenerate zero-length centerline",
         )
     chord_direction = chord / length
-    start_direction = _oriented_unit_vector(start_normal, chord_direction)
+    # The proximal normal is supplied by the host level-set gradient and is
+    # already oriented outward. Reorienting it to the endpoint chord can flip
+    # a valid host normal inward when the current attachment is imperfect.
+    start_direction = np.asarray(start_normal, dtype=float).reshape(3)
+    start_direction /= max(float(np.linalg.norm(start_direction)), 1e-12)
     end_direction = _oriented_unit_vector(end_normal, chord_direction)
     valid = np.isfinite(parameters)
     centers = centers[valid]
@@ -854,9 +858,14 @@ def fit_crypt_geometry(
     tip_normal = _normal_from_contour(distal["points"], tip - np.asarray(attachment))
     chord = tip - np.asarray(attachment, dtype=float)
     chord_direction = chord / max(float(np.linalg.norm(chord)), 1e-12)
+    supplied_opening_normal = opening_normal is not None
     if opening_normal is None:
         opening_normal = np.asarray(attachment) - np.mean(vertices[boundary], axis=0)
-    opening_normal = _oriented_unit_vector(opening_normal, chord_direction)
+    if supplied_opening_normal:
+        opening_normal = np.asarray(opening_normal, dtype=float).reshape(3)
+        opening_normal /= max(float(np.linalg.norm(opening_normal)), 1e-12)
+    else:
+        opening_normal = _oriented_unit_vector(opening_normal, chord_direction)
     if tip_normal is None:
         tip_normal = chord_direction.copy()
     centerline_fit = fit_tangent_constrained_hermite(

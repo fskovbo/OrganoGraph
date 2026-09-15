@@ -131,6 +131,31 @@ class CryptGeometryTests(unittest.TestCase):
         self.assertLess(fit.fit_rmse, 0.06)
         self.assertTrue(np.all(np.diff(fit.centerline_points[:, 0]) > 0.0))
 
+    def test_hermite_fit_does_not_flip_outward_start_normal_to_chord(self):
+        start = np.array([1.0, 0.0, 0.0])
+        end = np.array([0.5, 1.5, 0.0])
+        outward_normal = np.array([1.0, 0.0, 0.0])
+        end_normal = np.array([-0.5, 1.5, 0.0])
+        centers = np.array(
+            [[0.95, 0.3, 0.0], [0.8, 0.8, 0.0], [0.6, 1.2, 0.0]]
+        )
+
+        fit = fit_tangent_constrained_hermite(
+            start,
+            end,
+            centers,
+            np.array([0.2, 0.5, 0.8]),
+            outward_normal,
+            end_normal,
+            n_samples=101,
+        )
+
+        self.assertGreater(float(np.dot(fit.start_tangent, outward_normal)), 0.0)
+        self.assertGreater(
+            float(np.dot(fit.centerline_points[1] - start, outward_normal)),
+            0.0,
+        )
+
     def test_monotonic_projection_preserves_contour_order(self):
         centerline = np.column_stack(
             [np.linspace(0.0, 4.0, 21), np.zeros(21), np.zeros(21)]

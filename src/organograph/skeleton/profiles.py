@@ -163,6 +163,7 @@ def definitive_primitive_fit_config() -> PrimitiveFitConfig:
             "min_extent_radius_fraction": 0.35,
         },
         crypt_tube_kwargs={
+            "select_attachment_candidates": True,
             "centerline_n_contours": 10,
             "radius_n_contours": 19,
             "exclude_attachment_radius_observation": True,

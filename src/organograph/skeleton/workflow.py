@@ -184,6 +184,10 @@ def _fit_primitives_once(
             radius_support_max_distance_factor=(
                 config.radius_support_max_distance_factor
             ),
+            host_barrier_fits={
+                "body": result.barriers.body_fit,
+                **dict(result.barriers.branch_fits),
+            },
             **dict(config.crypt_tube_kwargs),
         )
 

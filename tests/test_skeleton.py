@@ -67,6 +67,10 @@ from organograph.skeleton.primitive import (
     grow_crypt_radius_support_regions,
     tube_overlap_fraction,
 )
+from organograph.skeleton.primitive.attachment_candidates import (
+    crypt_attachment_candidates,
+    first_tangent_surface_crossing,
+)
 from organograph.skeleton.primitive.barriers import (
     exclude_host_vertices_from_detections,
     exclude_host_vertices_from_patches,
@@ -234,6 +238,52 @@ def make_tube_points(
 
 
 class SkeletonTests(unittest.TestCase):
+    def test_tip_tangent_candidate_uses_first_host_surface_crossing(self):
+        host = BarrierPrimitiveFit(
+            center=np.zeros(3),
+            axes=np.eye(3),
+            radii=np.array([2.0, 1.0, 1.0]),
+            success=True,
+        )
+
+        crossing = first_tangent_surface_crossing(
+            [4.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            host,
+            reference_attachment=[2.0, 0.0, 0.0],
+        )
+
+        np.testing.assert_allclose(crossing, [2.0, 0.0, 0.0], atol=1e-7)
+
+    def test_attachment_candidates_include_requested_three_surface_points(self):
+        host = BarrierPrimitiveFit(
+            center=np.zeros(3),
+            axes=np.eye(3),
+            radii=np.ones(3),
+            success=True,
+        )
+
+        candidates = crypt_attachment_candidates(
+            [0.0, 1.0, 0.0],
+            [2.0, 0.5, 0.0],
+            [-1.0, 0.0, 0.0],
+            host,
+        )
+
+        self.assertEqual(
+            [candidate.name for candidate in candidates],
+            ["current", "tip_tangent_crossing", "closest_surface_to_tip"],
+        )
+        np.testing.assert_allclose(
+            candidates[1].position,
+            [np.sqrt(0.75), 0.5, 0.0],
+            atol=1e-7,
+        )
+        self.assertGreater(
+            float(np.linalg.norm(candidates[1].position - candidates[2].position)),
+            0.05,
+        )
+
     def test_radius_fit_can_exclude_attachment_observation(self):
         sections = [
             {"s": 0.0, "mean_radius": 4.0},

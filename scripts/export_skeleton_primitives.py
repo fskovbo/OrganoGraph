@@ -34,6 +34,7 @@ from organograph.io_utils.blacklist import (
 from organograph.io_utils.dataset_config import load_mesh_dataset_config
 from organograph.io_utils.path_parsing import discover_mesh_paths, parse_mesh_path
 from organograph.io_utils.run_metadata import write_run_settings
+from organograph.skeleton.cell_counts import CellCountLookup, update_export_cell_counts
 from organograph.skeleton import (
     SHAPE_EXPORT_SCHEMA_VERSION,
     definitive_filter_options,
@@ -56,10 +57,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR.parent
 
 DATA_ROOT = (PROJECT_ROOT.parent / "NicoleData").resolve()
-# DATASET_TIMEPOINTS = {
-#     "20250929": ["day3p5", "day4", "day4p5", "day4p5-more"],
-#     "20251201": ["day4p5"],
-# }
+CELL_GRAPHS_SUBDIR = "graphs_preprocessed"
 
 DATASET_TIMEPOINTS = {
     "20250929": ["day3p5", "day4", "day4p5", "day4p5-more"],
@@ -69,15 +67,15 @@ DATASET_TIMEPOINTS = {
 
 # All configured datasets are written into this one VAE-ready export dataset.
 # Dataset names remain part of each sample path to avoid label collisions.
-EXPORT_ROOT = (DATA_ROOT / "combined_skeleton_primitive_exports_fixed").resolve()
+EXPORT_ROOT = (DATA_ROOT / "combined_skeleton_primitive_exports_fixed2").resolve()
 
 VOCAB_PATH = PROJECT_ROOT / "sim" / "vocab_with_meta.npz"
 WHITELIST_PATH = None
 
-OVERWRITE = False
+OVERWRITE = True
 VERBOSE = True
 DRY_RUN = False
-STRICT = True
+STRICT = False
 MAX_MESHES = None
 
 MESH_PREPARATION = definitive_mesh_preparation()
@@ -96,6 +94,7 @@ BOUNDARY_REFINEMENT_MAX_MESH_FRACTION = 0.35
 
 # Crypt centerline fit. The compact export stores the two endpoints and both
 # Hermite tangent vectors, from which this sampled centerline is reconstructed.
+SELECT_ATTACHMENT_CANDIDATES = True
 CENTERLINE_N_CONTOURS = 10
 CENTERLINE_N_SAMPLES = 64
 CENTERLINE_CURVATURE_WEIGHT = 0.01
@@ -136,6 +135,7 @@ PRIMITIVE_FIT_CONFIG.radius_support_max_distance_factor = (
 )
 PRIMITIVE_FIT_CONFIG.crypt_tube_kwargs.update(
     {
+        "select_attachment_candidates": SELECT_ATTACHMENT_CANDIDATES,
         "centerline_n_contours": CENTERLINE_N_CONTOURS,
         "centerline_n_samples": CENTERLINE_N_SAMPLES,
         "centerline_curvature_weight": CENTERLINE_CURVATURE_WEIGHT,
@@ -311,6 +311,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--data-root", default=str(DATA_ROOT))
+    parser.add_argument("--cell-graphs-subdir", default=CELL_GRAPHS_SUBDIR)
+    parser.add_argument(
+        "--update-cell-counts-only",
+        action="store_true",
+        help="Update cell counts in existing exports and manifest without fitting shapes.",
+    )
     parser.add_argument(
         "--mesh-data-dir",
         default=None,
@@ -375,6 +381,26 @@ def main(argv: list[str] | None = None) -> int:
     timepoint_override = parse_csv_values(args.timepoints)
     shared_paths = resolve_shared_paths(args)
     output_root = shared_paths["output_root"]
+    cell_counts = CellCountLookup(shared_paths["data_root"], args.cell_graphs_subdir)
+    if args.update_cell_counts_only:
+        report = update_export_cell_counts(
+            output_root,
+            cell_counts,
+            datasets=parse_csv_values(args.datasets),
+            timepoints=timepoint_override,
+            max_meshes=args.max_meshes,
+            dry_run=args.dry_run,
+            strict=args.strict,
+        )
+        print(
+            f"[cell-counts] samples={report['samples']} updated={report['updated']} "
+            f"unchanged={report['unchanged']} missing_graph={report['missing_graph']} "
+            f"failed={report['failed']} dry_run={report['dry_run']}"
+        )
+        for record in report["records"]:
+            if "error" in record:
+                print(f"[cell-counts] {record['dataset']}/{record['label_uid']}: {record['error']}")
+        return int(bool(report["missing_graph"] or report["failed"]))
     output_root.mkdir(parents=True, exist_ok=True)
     failure_log = output_root / "failures.log"
     if failure_log.exists() and args.overwrite:
@@ -462,6 +488,7 @@ def main(argv: list[str] | None = None) -> int:
         "skipped_whitelist": 0,
         "skipped_existing": 0,
         "skipped_branched": 0,
+        "missing_cell_graph": 0,
         "failed": 0,
         "dry_run": bool(args.dry_run),
     }
@@ -516,6 +543,13 @@ def main(argv: list[str] | None = None) -> int:
                 "mesh_path": str(mesh_path),
                 "vocab_path": str(shared_paths["vocab_path"]),
             }
+            try:
+                metadata["cell_count"] = cell_counts.count(dataset, timepoint, label_uid)
+            except FileNotFoundError as exc:
+                if args.strict:
+                    raise
+                stats["missing_cell_graph"] += 1
+                print(f"[warn] {exc}; exporting without cell_count")
             t0 = time.perf_counter()
             skeleton_result = skeletonize_organoid(
                 mesh,
@@ -554,6 +588,7 @@ def main(argv: list[str] | None = None) -> int:
                     "output_dir": str(organoid_dir),
                     "json_path": export_paths.get("json", ""),
                     "quality_json_path": export_paths.get("quality_json", ""),
+                    "cell_count": metadata.get("cell_count"),
                     "has_branches": has_branches,
                     "vae_eligible": not has_branches,
                     **summary,
@@ -607,6 +642,7 @@ def main(argv: list[str] | None = None) -> int:
                 "strict": bool(args.strict),
                 "max_meshes": args.max_meshes,
                 "unbranched_only": bool(args.unbranched_only),
+                "cell_graphs_subdir": args.cell_graphs_subdir,
                 "mesh_preparation": {
                     "normalize_mesh": NORMALIZE_MESH,
                     "normalize_scale": NORMALIZE_SCALE,

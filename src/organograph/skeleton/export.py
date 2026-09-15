@@ -955,6 +955,9 @@ def shape_quality_payload(
                 "opening_normal_source": attachment.metadata.get(
                     "opening_normal_source"
                 ),
+                "attachment_candidate_selection": dict(
+                    attachment.metadata.get("attachment_candidate_selection") or {}
+                ),
                 "tip_normal": attachment.metadata.get("tip_normal"),
                 "ratio_contours": dict(
                     attachment.metadata.get("ratio_contours") or {}

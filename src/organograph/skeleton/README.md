@@ -26,6 +26,16 @@ medial-axis extractor.
    boundary-to-tip distance-ratio field, measures ten cross-sectional contours,
    and fits one endpoint-normal cubic Hermite centerline with independently
    fitted proximal/distal tangent lengths and physical curvature regularization.
+   Before the definitive centerline is accepted, the primitive stage compares
+   three proximal endpoints on the fitted host: the detection-stage attachment,
+   the first host crossing along the tip tangent, and the host-surface point
+   closest to the tip. Each candidate receives the same preliminary centerline
+   and radius-profile score; only the winner proceeds to shared support-region
+   growth and the final radius fit. Set
+   `crypt_tube_kwargs["select_attachment_candidates"] = False` to retain only
+   the detection-stage attachment. Candidate diagnostics are written to
+   `quality.json`, while the selected endpoint is naturally part of the compact
+   reconstructive shape.
    After the centerline is fixed, each crypt grows competitively into connected
    mesh vertices not protected by a body/branch support mask. Growth is limited
    to 1.5 times the centerline length in restricted tip-geodesic distance, and
@@ -41,8 +51,10 @@ medial-axis extractor.
    transverse observations with asymmetric area error and mild log-radius
    smoothing. A deterministic squared-radius interpolation closes to zero at
    `s=1`. The crypt node is the volume center of this fitted profile. With
-   both attachment strategies, the opening tangent uses the host normal at the
-   closest primitive-surface point. An embedded attachment remains in place;
+   both attachment strategies, the opening tangent uses the outward host normal
+   at the closest primitive-surface point and its sign is preserved, even when
+   the endpoint chord initially points back through the host. An embedded
+   attachment remains in place;
    the closest surface point supplies only its tangent frame.
    As a final topology check, same-host tubes whose intersection exceeds
    `PrimitiveFitConfig.crypt_overlap.threshold` of the smaller tube are merged;
@@ -101,6 +113,27 @@ limit prevents a failed host-contact search from consuming most of an organoid.
 datasets and timepoints declared in its `DATASET_TIMEPOINTS` configuration. It
 writes one combined export beneath its configurable `EXPORT_ROOT`, retaining
 the source dataset in every sample path and manifest row.
+
+The exporter also loads each corresponding preprocessed cell graph from
+`DATA_ROOT/<dataset>/graphs_preprocessed/<timepoint>/`. Its node count is saved
+as the integer `sample.cell_count` in `shape.json` and `quality.json`, and as
+`cell_count` in the manifest. This counts cells retained in the preprocessed
+graph, including isolated nodes. Timepoint graph indices support remapped
+`label_uid`/`parsed_label_uid` aliases. A missing graph produces a warning and
+omits the count; `--strict` makes it an error.
+
+To add or refresh counts in an existing export without rerunning fitting:
+
+```bash
+python scripts/export_skeleton_primitives.py --update-cell-counts-only \
+    --output-root ../NicoleData/skeleton_primitives
+```
+
+Use `--dry-run` to check availability first. This mode scans existing
+`shape.json` files, preserves fitted geometry and other metadata, and writes
+`cell_count_update_report.json` with any missing graphs or failures. Optional
+`--datasets`, `--timepoints`, and `--max-meshes` restrict the update. Graphs can
+be relocated with `--data-root` and `--cell-graphs-subdir`.
 
 `notebooks/audit_crypt_primitive_fits.ipynb` audits an existing export and can
 compare it with a complete or partial candidate export using matched organoids.

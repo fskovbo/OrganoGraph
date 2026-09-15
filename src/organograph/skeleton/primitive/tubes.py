@@ -13,6 +13,11 @@ from organograph.skeleton.primitive.blobs import (
     constrain_blob_fit_surface_radius,
     fit_blob_primitive_to_points,
 )
+from organograph.skeleton.primitive.attachment_candidates import (
+    crypt_attachment_candidates,
+)
+from organograph.skeleton.detection.attachments import barrier_surface_normal
+from organograph.skeleton.primitive.barriers import barrier_primitive_level
 from organograph.skeleton.primitive.common import _residual_summary
 from organograph.skeleton.primitive.crypt_geometry import (
     centerline_radius_observations,
@@ -621,6 +626,214 @@ def _radius_observation_metadata(sections):
     }
 
 
+def _host_id_for_crypt_path(graph: SkeletonGraph, path: list[str]) -> str | None:
+    """Return the body or branch node immediately hosting a crypt path."""
+    attachment_id = str(path[0])
+    for edge in graph.edges.values():
+        if edge.target != attachment_id:
+            continue
+        source = graph.node(edge.source)
+        if source.node_type in {"body", "branch"}:
+            return source.node_id
+    return None
+
+
+def _candidate_fit_score(
+    points,
+    geometry,
+    host_fit,
+    *,
+    opening_frame_blend_fraction: float,
+    fit_kwargs: dict[str, Any],
+) -> tuple[float, dict[str, Any]]:
+    """Score one attachment using centerline and preliminary tube objectives."""
+    preliminary = fit_crypt_tube_to_points(
+        points,
+        geometry.centerline_points,
+        opening_normal=geometry.opening_normal,
+        opening_frame_blend_fraction=opening_frame_blend_fraction,
+        metadata={"fit_stage": "attachment_candidate_selection"},
+        **fit_kwargs,
+    )
+    centerline_score = float(geometry.metadata["centerline_objective"])
+    profile_score = float(
+        preliminary.metadata["profile_optimization"].get(
+            "candidate_score", preliminary.fit_error
+        )
+    )
+    sampled = np.asarray(geometry.centerline_points, dtype=float)
+    proximal_count = max(2, int(np.ceil(0.2 * sampled.shape[0])))
+    proximal_levels = np.asarray(
+        barrier_primitive_level(sampled[:proximal_count], host_fit), dtype=float
+    )
+    penetration = np.maximum(1.0 - proximal_levels, 0.0)
+    host_penetration_score = 10.0 * float(np.mean(penetration**2))
+    first_step = sampled[1] - sampled[0]
+    outward_progress = float(np.dot(first_step, geometry.opening_normal))
+    outward_penalty = 0.0 if outward_progress > 0.0 else 1000.0
+    total = centerline_score + profile_score + host_penetration_score + outward_penalty
+    return total, {
+        "score": total,
+        "centerline_score": centerline_score,
+        "radius_profile_score": profile_score,
+        "host_penetration_score": host_penetration_score,
+        "first_step_outward_progress": outward_progress,
+        "preliminary_radius_fit_error": preliminary.fit_error,
+    }
+
+
+def _select_crypt_attachment_geometry(
+    vertices,
+    faces,
+    region,
+    current_attachment,
+    tip_vertex_id,
+    boundary_vertices,
+    current_opening_normal,
+    host_fit,
+    *,
+    enabled: bool,
+    centerline_n_contours: int,
+    radius_n_contours: int,
+    centerline_n_samples: int,
+    centerline_curvature_weight: float,
+    centerline_reference_length: float | None,
+    opening_frame_blend_fraction: float,
+    fit_kwargs: dict[str, Any],
+):
+    """Fit and select among the three deterministic attachment candidates."""
+    geometry_kwargs = {
+        "boundary_vertices": boundary_vertices,
+        "n_contours": centerline_n_contours,
+        "radius_n_contours": radius_n_contours,
+        "n_samples": centerline_n_samples,
+        "curvature_weight": centerline_curvature_weight,
+        "reference_length": centerline_reference_length,
+    }
+    if host_fit is not None:
+        current_opening_normal = barrier_surface_normal(
+            current_attachment, host_fit
+        )
+    current_geometry = fit_crypt_geometry(
+        vertices,
+        faces,
+        region,
+        current_attachment,
+        tip_vertex_id,
+        opening_normal=current_opening_normal,
+        **geometry_kwargs,
+    )
+    if not enabled or host_fit is None:
+        return (
+            np.asarray(current_attachment, dtype=float),
+            current_geometry,
+            {
+                "enabled": bool(enabled),
+                "selected": "current",
+                "reason": "disabled" if not enabled else "missing_host_barrier",
+                "candidates": [],
+            },
+        )
+
+    tip = np.asarray(vertices[int(tip_vertex_id)], dtype=float)
+    tip_normal = np.asarray(current_geometry.tip_normal, dtype=float)
+    candidates = crypt_attachment_candidates(
+        current_attachment,
+        tip,
+        -tip_normal,
+        host_fit,
+    )
+    points = component_points(vertices, region)
+    evaluations = []
+    for candidate in candidates:
+        try:
+            if candidate.name == "current":
+                geometry = current_geometry
+            else:
+                geometry = fit_crypt_geometry(
+                    vertices,
+                    faces,
+                    region,
+                    candidate.position,
+                    tip_vertex_id,
+                    opening_normal=candidate.outward_normal,
+                    **geometry_kwargs,
+                )
+            score, diagnostics = _candidate_fit_score(
+                points,
+                geometry,
+                host_fit,
+                opening_frame_blend_fraction=opening_frame_blend_fraction,
+                fit_kwargs=fit_kwargs,
+            )
+            evaluations.append(
+                {
+                    "candidate": candidate,
+                    "geometry": geometry,
+                    "valid": bool(np.isfinite(score)),
+                    **diagnostics,
+                }
+            )
+        except (FloatingPointError, RuntimeError, ValueError) as exc:
+            evaluations.append(
+                {
+                    "candidate": candidate,
+                    "geometry": None,
+                    "valid": False,
+                    "score": float("inf"),
+                    "error": str(exc),
+                }
+            )
+
+    valid = [item for item in evaluations if item["valid"]]
+    if not valid:
+        return (
+            np.asarray(current_attachment, dtype=float),
+            current_geometry,
+            {
+                "enabled": True,
+                "selected": "current",
+                "reason": "all_candidate_fits_failed",
+                "candidates": [
+                    {
+                        key: value
+                        for key, value in item.items()
+                        if key not in {"candidate", "geometry"}
+                    }
+                    | {"name": item["candidate"].name}
+                    for item in evaluations
+                ],
+            },
+        )
+    selected = min(valid, key=lambda item: item["score"])
+    diagnostics = {
+        "enabled": True,
+        "selected": selected["candidate"].name,
+        "reason": "minimum_combined_centerline_radius_score",
+        "candidates": [],
+    }
+    for item in evaluations:
+        candidate_diagnostics = {
+            key: value
+            for key, value in item.items()
+            if key not in {"candidate", "geometry"}
+        }
+        candidate_diagnostics.update(
+            {
+                "name": item["candidate"].name,
+                "position": item["candidate"].position,
+                "outward_normal": item["candidate"].outward_normal,
+                "metadata": item["candidate"].metadata,
+            }
+        )
+        diagnostics["candidates"].append(candidate_diagnostics)
+    return (
+        selected["candidate"].position.copy(),
+        selected["geometry"],
+        diagnostics,
+    )
+
+
 def attach_crypt_tube_primitives(
     graph: SkeletonGraph,
     vertices,
@@ -637,6 +850,8 @@ def attach_crypt_tube_primitives(
     centerline_reference_length: float | None = None,
     radius_support_protected_mask=None,
     radius_support_max_distance_factor: float = 1.5,
+    host_barrier_fits: dict[str, Any] | None = None,
+    select_attachment_candidates: bool = True,
     exclude_attachment_radius_observation: bool = True,
     opening_frame_blend_fraction: float = 0.15,
     update_crypt_nodes: bool = True,
@@ -644,18 +859,17 @@ def attach_crypt_tube_primitives(
 ) -> dict[str, PrimitiveAttachment]:
     """Fit one ratio-contour/Hermite tube for each terminal crypt.
 
-    Tip selection is already final at detection time. The primitive stage has
-    no competing tip or spline candidates: it derives one boundary-to-tip
-    coordinate, measures its contours, and fits one endpoint-normal constrained
-    curve. ``geodesic_fn`` and ``geodesic_kwargs`` are accepted only so callers
-    can pass a shared workflow context; restricted mesh distances are computed
-    internally and cannot shortcut outside the crypt component.
+    Tip selection is final at detection time. When host barriers are supplied,
+    the primitive stage compares the existing attachment, the first host
+    crossing along the distal tangent, and the host point closest to the tip.
+    The winning attachment is selected before shared radius-support growth.
     """
     vertices = as_points(vertices)
     if mesh is None or not hasattr(mesh, "f"):
         raise ValueError("mesh with triangular faces is required for crypt contour fitting")
     faces = np.asarray(mesh.f, dtype=np.int64)
     centerline_data = dict(centerline_data or {})
+    host_barrier_fits = dict(host_barrier_fits or {})
     records = []
     for key, component in crypt_components.items():
         for attachment_id, path in _resolve_crypt_paths(graph, key):
@@ -674,23 +888,33 @@ def attach_crypt_tube_primitives(
                 tip_vertex_id = int(
                     np.argmin(np.linalg.norm(vertices - tip_node.position[None, :], axis=1))
                 )
-            geometry = fit_crypt_geometry(
-                vertices,
-                faces,
-                data.get("vertex_indices", component),
-                graph.node(path[0]).position,
-                tip_vertex_id,
-                boundary_vertices=data.get("candidate_boundary_vertices"),
-                opening_normal=data.get("attachment_surface_normal"),
-                n_contours=centerline_n_contours,
-                radius_n_contours=radius_n_contours,
-                n_samples=centerline_n_samples,
-                curvature_weight=centerline_curvature_weight,
-                reference_length=centerline_reference_length,
-            )
             region = np.unique(
                 np.asarray(data.get("vertex_indices", component), dtype=np.int64).reshape(-1)
             )
+            host_id = data.get("host_id") or _host_id_for_crypt_path(graph, path)
+            selected_attachment, geometry, attachment_selection = (
+                _select_crypt_attachment_geometry(
+                    vertices,
+                    faces,
+                    region,
+                    graph.node(path[0]).position,
+                    tip_vertex_id,
+                    data.get("candidate_boundary_vertices"),
+                    data.get("attachment_surface_normal"),
+                    host_barrier_fits.get(str(host_id)),
+                    enabled=select_attachment_candidates,
+                    centerline_n_contours=centerline_n_contours,
+                    radius_n_contours=radius_n_contours,
+                    centerline_n_samples=centerline_n_samples,
+                    centerline_curvature_weight=centerline_curvature_weight,
+                    centerline_reference_length=centerline_reference_length,
+                    opening_frame_blend_fraction=opening_frame_blend_fraction,
+                    fit_kwargs=dict(fit_kwargs),
+                )
+            )
+            graph.node(path[0]).position = selected_attachment.copy()
+            data["attachment_position"] = selected_attachment.copy()
+            data["attachment_surface_normal"] = geometry.opening_normal.copy()
             records.append(
                 {
                     "key": key,
@@ -702,6 +926,8 @@ def attach_crypt_tube_primitives(
                     "tip_vertex_id": int(tip_vertex_id),
                     "geometry": geometry,
                     "region": region,
+                    "host_id": host_id,
+                    "attachment_candidate_selection": attachment_selection,
                 }
             )
 
@@ -751,6 +977,9 @@ def attach_crypt_tube_primitives(
         tip_node = record["tip_node"]
         tip_vertex_id = record["tip_vertex_id"]
         geometry = record["geometry"]
+        attachment_candidate_selection = record[
+            "attachment_candidate_selection"
+        ]
         support_region = support_regions[attachment_id]
         points = component_points(vertices, support_region)
         radius_sections, _ = centerline_radius_observations(
@@ -851,6 +1080,7 @@ def attach_crypt_tube_primitives(
                     "attachment_normal_source",
                     "host_primitive_surface_gradient",
                 ),
+                "attachment_candidate_selection": attachment_candidate_selection,
                 "tip_normal": geometry.tip_normal,
                 "ratio_contours": {
                     "s": geometry.contour_s,

@@ -322,11 +322,13 @@ class ShapeExportV4Test(unittest.TestCase):
     def test_save_and_load_use_strict_json(self):
         result = _shape_result()
         with tempfile.TemporaryDirectory() as tmp:
-            paths = save_shape_export(result, tmp)
+            paths = save_shape_export(result, tmp, metadata={"cell_count": 123})
             raw = Path(paths["json"]).read_text(encoding="utf-8")
+            self.assertEqual(json.loads(raw)["sample"]["cell_count"], 123)
             self.assertNotIn("NaN", raw)
             self.assertNotIn("Infinity", raw)
             quality_raw = Path(paths["quality_json"]).read_text(encoding="utf-8")
+            self.assertEqual(json.loads(quality_raw)["sample"]["cell_count"], 123)
             self.assertNotIn("NaN", quality_raw)
             self.assertNotIn("Infinity", quality_raw)
             loaded = load_shape_export_graph(paths["json"])

@@ -114,6 +114,21 @@ datasets and timepoints declared in its `DATASET_TIMEPOINTS` configuration. It
 writes one combined export beneath its configurable `EXPORT_ROOT`, retaining
 the source dataset in every sample path and manifest row.
 
+The exporter currently defaults to `perturbations2`, using its `mesh_config.json`
+to discover the `normal` and `small` folder groups and six configured wells.
+Treatments from `CONDITIONS_BY_DATASET` are exported as `sample.condition` in
+both JSON files and as `condition` in the manifest. The folder group remains
+in `sample.timepoint`; it is not a biological age. Run it with:
+
+```bash
+python scripts/export_skeleton_primitives.py --datasets perturbations2 --no-overwrite
+```
+
+Outputs go under `NicoleData/skeleton_primitives/perturbations2/`. Existing
+shapes are skipped by default, and new manifest entries are merged with previous
+datasets. `--dry-run` previews paths and conditions without writing files.
+Use `--datasets 20250929,20251201` to select the earlier datasets explicitly.
+
 The exporter also loads each corresponding preprocessed cell graph from
 `DATA_ROOT/<dataset>/graphs_preprocessed/<timepoint>/`. Its node count is saved
 as the integer `sample.cell_count` in `shape.json` and `quality.json`, and as

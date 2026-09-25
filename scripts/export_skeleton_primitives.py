@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import tempfile
 import time
 import traceback
 from pathlib import Path
@@ -62,17 +63,35 @@ CELL_GRAPHS_SUBDIR = "graphs_preprocessed"
 DATASET_TIMEPOINTS = {
     "20250929": ["day3p5", "day4", "day4p5", "day4p5-more"],
     "20251201": ["day4p5"],
+    "perturbations2": ["normal", "small"],
 }
 
+# Datasets processed when --datasets is omitted. Folder groups normal/small
+# occupy the timepoint field for perturbations2, as in mesh_config.json.
+DATASETS = ["perturbations2"]
+CONDITIONS_BY_DATASET = {
+    "perturbations2": {
+        "normal": {
+            "B02": "ta-Yapa",
+            "B03": "ta-Yapa",
+            "C06": "stem-ChirVpaD1",
+        },
+        "small": {
+            "F02": "sec-DaptHi",
+            "C04": "sec-DaptIwp2iMekD1",
+            "G06": "abs-Iwp2",
+        },
+    },
+}
 
 # All configured datasets are written into this one VAE-ready export dataset.
 # Dataset names remain part of each sample path to avoid label collisions.
-EXPORT_ROOT = (DATA_ROOT / "combined_skeleton_primitive_exports_fixed2").resolve()
+EXPORT_ROOT = (DATA_ROOT / "skeleton_primitives").resolve()
 
 VOCAB_PATH = PROJECT_ROOT / "sim" / "vocab_with_meta.npz"
 WHITELIST_PATH = None
 
-OVERWRITE = True
+OVERWRITE = False
 VERBOSE = True
 DRY_RUN = False
 STRICT = False
@@ -177,7 +196,22 @@ def parse_csv_values(value: str | None):
 
 def selected_datasets(args) -> list[str]:
     requested = parse_csv_values(args.datasets)
-    return requested if requested is not None else list(DATASET_TIMEPOINTS)
+    if args.datasets is not None and requested is None:
+        return list(DATASET_TIMEPOINTS)
+    return requested if requested is not None else list(DATASETS)
+
+
+def condition_for_organoid(dataset: str, timepoint: str, well: str | None):
+    """Return the treatment for a configured dataset/group/well combination."""
+    conditions = CONDITIONS_BY_DATASET.get(dataset)
+    if conditions is None:
+        return None
+    try:
+        return conditions[timepoint][well]
+    except KeyError as exc:
+        raise ValueError(
+            f"No perturbation condition configured for {dataset}/{timepoint}/{well}"
+        ) from exc
 
 
 def resolve_shared_paths(args) -> dict[str, Path]:
@@ -274,8 +308,19 @@ def output_exists(organoid_dir: Path) -> bool:
 
 
 def write_manifest(path: Path, rows: list[dict]) -> None:
+    """Merge this run into the existing manifest using dataset-scoped identity."""
     if not rows:
         return
+    fields = ("dataset", "timepoint", "label_uid")
+    existing = []
+    if path.exists():
+        with path.open(newline="", encoding="utf-8") as handle:
+            existing = list(csv.DictReader(handle))
+    merged = {tuple(str(row[key]) for key in fields): row for row in existing}
+    for row in rows:
+        key = tuple(str(row[field]) for field in fields)
+        merged[key] = {**merged.get(key, {}), **row}
+    rows = list(merged.values())
     fieldnames: list[str] = []
     seen = set()
     for row in rows:
@@ -283,10 +328,21 @@ def write_manifest(path: Path, rows: list[dict]) -> None:
             if key not in seen:
                 fieldnames.append(key)
                 seen.add(key)
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", newline="", encoding="utf-8", dir=path.parent, delete=False
+        ) as handle:
+            temporary = Path(handle.name)
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        if path.exists():
+            os.chmod(temporary, path.stat().st_mode)
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def append_failure(path: Path, *, label_uid: str, mesh_path: str, error: BaseException) -> None:
@@ -306,8 +362,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--datasets",
         default=None,
         help=(
-            "Comma-separated datasets. By default, process every dataset in "
-            "DATASET_TIMEPOINTS using its configured timepoints."
+            "Comma-separated datasets (default: DATASETS in the config section). "
+            "Use 'all' for every dataset in DATASET_TIMEPOINTS."
         ),
     )
     parser.add_argument("--data-root", default=str(DATA_ROOT))
@@ -344,7 +400,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--whitelist-path", default=WHITELIST_PATH)
     parser.add_argument("--max-meshes", type=int, default=MAX_MESHES)
-    parser.add_argument("--overwrite", action="store_true", default=OVERWRITE)
+    parser.add_argument("--overwrite", action=argparse.BooleanOptionalAction, default=OVERWRITE)
     parser.add_argument("--dry-run", action="store_true", default=DRY_RUN)
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--strict", action="store_true", default=STRICT)
@@ -401,10 +457,9 @@ def main(argv: list[str] | None = None) -> int:
             if "error" in record:
                 print(f"[cell-counts] {record['dataset']}/{record['label_uid']}: {record['error']}")
         return int(bool(report["missing_graph"] or report["failed"]))
-    output_root.mkdir(parents=True, exist_ok=True)
+    if not args.dry_run:
+        output_root.mkdir(parents=True, exist_ok=True)
     failure_log = output_root / "failures.log"
-    if failure_log.exists() and args.overwrite:
-        failure_log.unlink()
 
     if not shared_paths["vocab_path"].exists():
         raise FileNotFoundError(f"VOCAB_PATH not found: {shared_paths['vocab_path']}")
@@ -505,6 +560,7 @@ def main(argv: list[str] | None = None) -> int:
             rec = parse_mesh_path(mesh_path)
             label_uid = rec["label_uid"]
             timepoint = rec["timepoint"]
+            condition = condition_for_organoid(dataset, timepoint, rec.get("well"))
 
             if label_uid in blacklist:
                 stats["skipped_blacklist"] += 1
@@ -528,6 +584,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[DRY_RUN] would export {label_uid}")
                 print(f"          mesh: {mesh_path}")
                 print(f"          out : {organoid_dir}")
+                if condition is not None:
+                    print(f"          condition: {condition}")
                 continue
 
             mesh = OrganoidMesh(str(mesh_path))
@@ -543,6 +601,8 @@ def main(argv: list[str] | None = None) -> int:
                 "mesh_path": str(mesh_path),
                 "vocab_path": str(shared_paths["vocab_path"]),
             }
+            if condition is not None:
+                metadata["condition"] = condition
             try:
                 metadata["cell_count"] = cell_counts.count(dataset, timepoint, label_uid)
             except FileNotFoundError as exc:
@@ -589,6 +649,7 @@ def main(argv: list[str] | None = None) -> int:
                     "json_path": export_paths.get("json", ""),
                     "quality_json_path": export_paths.get("quality_json", ""),
                     "cell_count": metadata.get("cell_count"),
+                    "condition": metadata.get("condition"),
                     "has_branches": has_branches,
                     "vae_eligible": not has_branches,
                     **summary,
@@ -605,14 +666,18 @@ def main(argv: list[str] | None = None) -> int:
 
         except Exception as exc:
             stats["failed"] += 1
-            append_failure(failure_log, label_uid=label_uid, mesh_path=str(mesh_path), error=exc)
+            if not args.dry_run:
+                append_failure(failure_log, label_uid=label_uid, mesh_path=str(mesh_path), error=exc)
             if verbose:
                 print(f"[failed] {label_uid}: {type(exc).__name__}: {exc}")
             if args.strict:
                 raise
 
+    if args.dry_run:
+        return int(stats["failed"] > 0)
     write_manifest(output_root / "manifest.csv", manifest_rows)
-    write_export_readme(output_root / "README.md", dataset=", ".join(datasets))
+    if not (output_root / "README.md").exists():
+        write_export_readme(output_root / "README.md", dataset=", ".join(datasets))
     elapsed_s = time.perf_counter() - t_start
     write_run_settings(
         output_root,
@@ -643,6 +708,10 @@ def main(argv: list[str] | None = None) -> int:
                 "max_meshes": args.max_meshes,
                 "unbranched_only": bool(args.unbranched_only),
                 "cell_graphs_subdir": args.cell_graphs_subdir,
+                "conditions_by_dataset": {
+                    dataset: CONDITIONS_BY_DATASET[dataset]
+                    for dataset in datasets if dataset in CONDITIONS_BY_DATASET
+                },
                 "mesh_preparation": {
                     "normalize_mesh": NORMALIZE_MESH,
                     "normalize_scale": NORMALIZE_SCALE,

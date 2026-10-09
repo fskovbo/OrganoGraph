@@ -87,7 +87,7 @@ DEFAULT_INDEX_CSV_NAME = "index.csv"  # Per-timepoint graph index file used to r
 DEFAULT_TSNE_CSV_NAME = "tsne_results.csv"  # Optional per-dataset table with shape complexity metadata.
 DEFAULT_SEGMENTATION_SUBDIR = "crypt_segmentations_mesh"  # Per-dataset folder with mesh crypt segmentation .npz files.
 
-OUTPUT_DATASET_DIR_NAME = "GNN_training_data_curvature_patchavg_smooth"  # Name of the exported GNN dataset folder.
+OUTPUT_DATASET_DIR_NAME = "perturbations"
 EXPORT_FILE_PREFIX = "organoid"  # Prefix for each exported organoid .npz and sidecar file.
 MANIFEST_CSV_NAME = "manifest.csv"  # Name of the exported manifest table.
 COMMON_MARKERS_JSON_NAME = "common_markers.json"  # Name of the exported common marker list.
@@ -120,27 +120,25 @@ ZERO_AREA_THRESHOLD = 0.0  # Cells with patch area <= this threshold are removed
 
 DATA_SPECS = [
     {
-        "dataset": "20250929",
+        "dataset": "perturbations2",
         "graph_subdir": DEFAULT_GRAPH_SUBDIR,
-        "timepoints": ["day3p5", "day4", "day4p5", "day4p5-more"],
-        "label": "batch 1",
+        "timepoints": ["normal", "small"],
+        "label": "perturbations",
         "index_csv_name": DEFAULT_INDEX_CSV_NAME,
         # optional per-dataset complexity sidecar
         "tsne_csv": DEFAULT_TSNE_CSV_NAME,
         "segmentation_subdir": DEFAULT_SEGMENTATION_SUBDIR,
     },
-    {
-        "dataset": "20251201",
-        "graph_subdir": DEFAULT_GRAPH_SUBDIR,
-        "timepoints": ["day4p5"],
-        "label": "batch 2",
-        "index_csv_name": DEFAULT_INDEX_CSV_NAME,
-        "tsne_csv": DEFAULT_TSNE_CSV_NAME,
-        "segmentation_subdir": DEFAULT_SEGMENTATION_SUBDIR,
-    },
 ]
 
-OUT_DIR = os.path.join(DATA_ROOT, OUTPUT_DATASET_DIR_NAME)
+CONDITIONS_BY_DATASET = {
+    "perturbations2": {
+        "normal": {"B02": "ta-Yapa", "B03": "ta-Yapa", "C06": "stem-ChirVpaD1"},
+        "small": {"F02": "sec-DaptHi", "C04": "sec-DaptIwp2iMekD1", "G06": "abs-Iwp2"},
+    },
+}
+
+OUT_DIR = os.path.abspath(os.path.join(PROJECT_ROOT, "..", "GraphNN", "training_data", OUTPUT_DATASET_DIR_NAME))
 OVERWRITE = True        # Replace existing organoid exports when True.
 VERBOSE = True          # Print progress and skip/failure messages when True.
 STRICT = False          # Raise on first organoid failure when True.
@@ -419,6 +417,20 @@ def iter_selected_graph_paths(data_specs: list[dict], data_root: str, verbose: b
 # -----------------------------------------------------------------------------
 # GRAPH / INDEX / METADATA HELPERS
 # -----------------------------------------------------------------------------
+def condition_for_organoid(dataset: str, folder_group: str, label_uid: str) -> str | None:
+    """Validate the condition prefix against the dataset README's well map."""
+    if dataset not in CONDITIONS_BY_DATASET:
+        return None
+    match = re.fullmatch(r"(.+)_(day\d+(?:p\d+)?)_([A-Z]\d{2})_(\d+)", label_uid)
+    if match is None:
+        raise ValueError(f"Cannot identify perturbation in {label_uid!r}")
+    condition, _, well, _ = match.groups()
+    expected = CONDITIONS_BY_DATASET[dataset].get(folder_group, {}).get(well)
+    if expected is None or condition != expected:
+        raise ValueError(f"Condition mismatch for {dataset}/{folder_group}/{label_uid}: expected {expected!r}")
+    return condition
+
+
 @lru_cache(maxsize=None)
 def load_graph_cached(graph_path: str) -> nx.Graph:
     return load_cell_graph(graph_path)
@@ -861,6 +873,7 @@ def process_one_organoid(item: dict, common_markers: list[str], out_dir: str) ->
         return None
 
     label_uid = _infer_label_uid(G, fallback=os.path.splitext(os.path.basename(graph_path))[0])
+    condition = condition_for_organoid(dataset, timepoint, str(label_uid))
 
     mesh_path = resolve_mesh_path(
         G=G,
@@ -966,6 +979,7 @@ def process_one_organoid(item: dict, common_markers: list[str], out_dir: str) ->
     G.graph["complexity"] = _as_python(complexity)
     G.graph["timepoint"] = str(timepoint)
     G.graph["dataset"] = str(dataset)
+    G.graph["condition"] = condition
     G.graph["num_nodes"] = int(G.number_of_nodes())
     G.graph["original_num_nodes"] = int(pruned["original_num_nodes"])
     G.graph["num_deleted_nodes"] = int(pruned["num_deleted"])
@@ -983,6 +997,11 @@ def process_one_organoid(item: dict, common_markers: list[str], out_dir: str) ->
     aux_meta = {
         "label_uid": str(label_uid),
         "dataset": str(dataset),
+        "condition": condition,
+        "curvature_method": "compute_organoid_curvatures",
+        "curvature_lmax": CURVATURE_LMAX,
+        "curvature_diffusion_smoothen_time": CURVATURE_DIFFUSION_SMOOTHEN_TIME,
+        "generating_script": "scripts/setup_GNN_dataset.py",
         "timepoint": str(timepoint),
         "num_nodes": int(G.number_of_nodes()),
         "original_num_nodes": int(pruned["original_num_nodes"]),
@@ -1045,6 +1064,9 @@ def process_one_organoid(item: dict, common_markers: list[str], out_dir: str) ->
     return {
         "label_uid": str(label_uid),
         "dataset": str(dataset),
+        "condition": condition,
+        "curvature_lmax": CURVATURE_LMAX,
+        "curvature_diffusion_smoothen_time": CURVATURE_DIFFUSION_SMOOTHEN_TIME,
         "timepoint": str(timepoint),
         "num_nodes": int(G.number_of_nodes()),
         "original_num_nodes": int(pruned["original_num_nodes"]),

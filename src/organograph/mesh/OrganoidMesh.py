@@ -95,6 +95,8 @@ class OrganoidMesh:
         Load a mesh file (STL, OBJ, or VTP), geometry only.
 
         IMPORTANT: No rescaling or centering is applied automatically.
+        STL and VTP retain the coordinates in the file and use the same
+        normalize_inplace() method when normalization is explicitly requested.
         """
         if path.endswith(".stl"):
             self._load_stl(path)
@@ -120,6 +122,7 @@ class OrganoidMesh:
     # -------------------------------------------------------------------------
 
     def normalize_inplace(self, scale=10.0, center="mean"):
+        """Center at the vertex mean and divide by scale, identically for all formats."""
         v = np.asarray(self.v, dtype=float)
 
         # warn if already transformed
@@ -380,4 +383,3 @@ class OrganoidMesh:
         for k, v in data.items():
             setattr(self, k, v)
         return self
-

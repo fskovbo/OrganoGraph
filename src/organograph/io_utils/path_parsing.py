@@ -8,7 +8,7 @@ def parse_mesh_path(mesh_path):
     You must adapt this for your folder tree.
 
     Default folder structure assumed:
-        {data_dir}/{timepoint}/{zarr_name}/{well_letter}/{well_field}/{round_name}/meshes/{mesh_name}/{organoid_id}.vtp
+        {data_dir}/{timepoint}/{zarr_name}/{well_letter}/{well_field}/{round_name}/meshes/{mesh_name}/{organoid_id}.{vtp,stl}
 
     Returns a dict with:
         - timepoint (str)  REQUIRED
@@ -30,7 +30,7 @@ def parse_mesh_path(mesh_path):
         raise ValueError(f"'meshes' folder not found in path: {mesh_path}")
 
     # Expected around meshes:
-    # .../<timepoint>/<zarr>/<well_letter>/<well_field>/<round>/meshes/<mesh_name>/<organoid_id>.vtp
+    # .../<timepoint>/<zarr>/<well_letter>/<well_field>/<round>/meshes/<mesh_name>/<organoid_id>.<ext>
     if i_meshes < 5:
         raise ValueError(f"path too short to parse identifiers: {mesh_path}")
 
@@ -63,7 +63,10 @@ def discover_mesh_paths(data_dir, timepoints, zarr_names, rounds, meshes, wells=
     """Discover mesh files using a restrictive glob matching the expected layout.
 
     Expected layout:
-        {data_dir}/{tp}/{zarr}/{well_letter}/{well_field}/{round}/meshes/{mesh_name}/*.vtp
+        {data_dir}/{tp}/{zarr}/{well_letter}/{well_field}/{round}/meshes/{mesh_name}/*.{vtp,stl}
+
+    Prefer VTP for each organoid (same directory and filename stem); use STL
+    only when that organoid has no VTP. Mixed-format directories are supported.
 
     Parameters
     ----------
@@ -87,7 +90,7 @@ def discover_mesh_paths(data_dir, timepoints, zarr_names, rounds, meshes, wells=
     if timepoints is None:
         timepoints = [tp for tp in zarr_names if tp in rounds and tp in meshes]
 
-    found = []
+    found = {}
     for tp in timepoints:
         zarr = zarr_names.get(tp, None)
         rnd = rounds.get(tp, None)
@@ -101,21 +104,27 @@ def discover_mesh_paths(data_dir, timepoints, zarr_names, rounds, meshes, wells=
         tp_wells = wells.get(tp, None)
 
         # If wells are provided, search only those; otherwise glob across any well_letter/well_field
+        folder_patterns = []
         if tp_wells:
             for well in tp_wells:
                 if not well or len(well) < 2:
                     continue
                 wl = well[0]
                 wf = well[1:]
-                pattern = os.path.join(
-                    data_dir, tp, zarr, wl, wf, rnd, "meshes", mesh_name, "*.vtp"
-                )
-                found.extend(glob.glob(pattern))
+                folder_patterns.append(os.path.join(
+                    data_dir, tp, zarr, wl, wf, rnd, "meshes", mesh_name
+                ))
         else:
-            pattern = os.path.join(
-                data_dir, tp, zarr, "*", "*", rnd, "meshes", mesh_name, "*.vtp"
-            )
-            found.extend(glob.glob(pattern))
+            folder_patterns.append(os.path.join(
+                data_dir, tp, zarr, "*", "*", rnd, "meshes", mesh_name
+            ))
+
+        for extension in (".vtp", ".stl"):
+            for folder_pattern in folder_patterns:
+                for path in glob.glob(os.path.join(folder_pattern, "*" + extension)):
+                    if os.path.isfile(path):
+                        path = os.path.normpath(path)
+                        found.setdefault(os.path.splitext(path)[0], path)
 
     # Unique + stable order
-    return sorted(set(os.path.normpath(p) for p in found))
+    return sorted(found.values())

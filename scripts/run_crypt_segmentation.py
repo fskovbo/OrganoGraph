@@ -85,7 +85,7 @@ from organograph.crypts.filters import filter_crypts_by_hks_percent, filter_cryp
 # CONFIG: paths + dataset layout (EDIT THESE)
 # =============================================================================
 
-DATASET         = "20251201" # 20250929 20251201
+DATASET         = "perturbations_day3p5" # 20250929 20251201
 
 _SCRIPT_DIR     = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT    = os.path.dirname(_SCRIPT_DIR)
@@ -101,7 +101,7 @@ WHITELIST_PATH  = None # os.path.join(PROJECT_ROOT, "..", "NicoleData", DATASET,
 
 
 # Optional override. If None, use all timepoints from mesh_config.json
-TIMEPOINTS      = ['day4p5']   
+TIMEPOINTS      = ['day3p5']   
 
 
 OVERWRITE = True
@@ -131,17 +131,27 @@ from organograph.mesh.geodesics import compute_geodesics_dijkstra
 GEODESIC_FN = compute_geodesics_dijkstra
 GEODESIC_KWARGS = None  # or dict(...)
 
+# These values configure the filters and are recorded in the run settings JSON.
+FILTER_KWARGS = {
+    "filter_crypts_by_hks_percent": {
+        "min_percent_greater": 3.0, # 1.5 # 3.0 #4.0
+        "t_min": None,
+        "t_max": 10,
+    },
+    "filter_crypts_by_size": {
+        "min_patch_verts": 25,
+        "min_patch_area": 5,
+    },
+}
 FILTERS = [
     lambda patches, **kw: filter_crypts_by_hks_percent(
         patches,
-        min_percent_greater=2.0, #4.0, # 1.5, 3.0
-        t_max=10,
+        **FILTER_KWARGS["filter_crypts_by_hks_percent"],
         **kw
     ),
     lambda patches, **kw: filter_crypts_by_size(
         patches,
-        min_patch_verts=25,
-        min_patch_area=5,
+        **FILTER_KWARGS["filter_crypts_by_size"],
         **kw
     ),
 ]
@@ -166,7 +176,7 @@ SEGMENT_KWARGS = dict(
     threshold=0.5,
 
     # --- refinement ---
-    refine_crypts=True, #False, # True
+    refine_crypts=False, #False, # True
     refine_threshold=0.0,
     refine_only_if_area_at_least=5.0,
     min_refined_frac_of_parent=0.05,
@@ -428,6 +438,7 @@ def write_crypt_run_settings(*, elapsed_s, stats):
                 "calc_gaussian_curv": CALC_GAUSSIAN_CURV,
                 "tau_gaussian_curv": TAU_GAUSSIAN_CURV,
                 "segment_kwargs": SEGMENT_KWARGS,
+                "filter_kwargs": FILTER_KWARGS,
                 "save_seg_vars": SAVE_SEG_VARS,
             },
             "postprocessing_functions": {

@@ -134,7 +134,7 @@ GEODESIC_KWARGS = None  # or dict(...)
 # These values configure the filters and are recorded in the run settings JSON.
 FILTER_KWARGS = {
     "filter_crypts_by_hks_percent": {
-        "min_percent_greater": 3.0, # 1.5 # 3.0 #4.0
+        "min_percent_greater": 4.0, # 1.5 # 3.0 #4.0
         "t_min": None,
         "t_max": 10,
     },
@@ -182,7 +182,7 @@ SEGMENT_KWARGS = dict(
     min_refined_frac_of_parent=0.05,
 
     # --- neck extension ---
-    extend_max=2.0, #1.5, # 2.0
+    extend_max=1.5, #1.5, # 2.0
     disc_resolution=150,
     remove_nested_features=True,
 )
